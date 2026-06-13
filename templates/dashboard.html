@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <h1>🌸 {{ guild.name if guild else '서버' }} 관리</h1>
+    <p>저장하면 봇의 SQLite DB에 바로 반영돼요.</p>
+  </div>
+  <span class="pill">서버 ID {{ guild_id }}</span>
+</div>
+
+<div class="mini-stats">
+  <div class="stat"><b>👋</b><span>환영 설정</span></div>
+  <div class="stat"><b>✅</b><span>인증 패널</span></div>
+  <div class="stat"><b>🛡️</b><span>보안 설정</span></div>
+</div>
+<br>
+
+<div class="layout">
+  <aside class="sidebar card">
+    <div class="side-title">🎛️ 만능 봇 메뉴</div>
+    <a class="side-link" href="#welcome">👋 환영 메시지</a>
+    <a class="side-link" href="#security">🛡️ 보안 설정</a>
+    <a class="side-link" href="#rules">📌 규칙 임베드</a>
+    <a class="side-link" href="#intro">💬 자기소개 임베드</a>
+    <a class="side-link" href="#verify">✅ 인증 패널</a>
+    <a class="side-link" href="#soon">✨ 추가 예정</a>
+  </aside>
+
+  <div>
+    <section class="card" id="welcome">
+      <h2>👋 환영 메시지</h2>
+      <p class="hint">사용 가능 변수: {user}, {username}, {server}, {member_count}, {rule_channel}</p>
+      <div class="preview"><strong>미리보기 느낌</strong><br>{{ welcome.title }}</div>
+      <form method="post" action="{{ url_for('save_welcome', guild_id=guild_id) }}">
+        <label>제목<input name="title" value="{{ welcome.title }}"></label>
+        <label>내용<textarea name="description">{{ welcome.description }}</textarea></label>
+        <div class="row">
+          <label>색상 HEX<input name="color" value="{{ welcome.color }}"></label>
+          <label>이미지/GIF URL<input name="image_url" value="{{ welcome.image_url }}"></label>
+        </div>
+        <label>하단 문구<input name="footer" value="{{ welcome.footer }}"></label>
+        <button class="btn">환영 메시지 저장</button>
+      </form>
+    </section>
+
+    <section class="card" id="security">
+      <h2>🛡️ 보안 설정</h2>
+      <p class="hint">자동 검열, 악성 유저 감지, 테러 감지를 웹에서 켜고 끌 수 있어요.</p>
+      <form method="post" action="{{ url_for('save_security', guild_id=guild_id) }}">
+        <label class="check"><input type="checkbox" name="malicious_user_detection" {% if security.malicious_user_detection %}checked{% endif %}> 악성 유저 감지</label>
+        <label class="check"><input type="checkbox" name="auto_filter" {% if security.auto_filter %}checked{% endif %}> 자동 검열</label>
+        <label class="check"><input type="checkbox" name="raid_detection" {% if security.raid_detection %}checked{% endif %}> 테러 감지</label>
+        <button class="btn">보안 저장</button>
+      </form>
+    </section>
+
+    {% for key, label in embed_types.items() %}
+    <section class="card" id="{{ key }}">
+      <h2>{{ label }}</h2>
+      <p class="hint">제목, 내용, 색상, GIF/이미지를 원하는 대로 바꿀 수 있어요.</p>
+      <form method="post" action="{{ url_for('save_auto_embed', guild_id=guild_id, embed_type=key) }}">
+        <label>제목<input name="title" value="{{ embeds[key].title }}"></label>
+        <label>내용<textarea name="description">{{ embeds[key].description }}</textarea></label>
+        <div class="row">
+          <label>색상 HEX<input name="color" value="{{ embeds[key].color }}"></label>
+          <label>이미지/GIF URL<input name="image_url" value="{{ embeds[key].image_url }}"></label>
+        </div>
+        <label>하단 문구<input name="footer" value="{{ embeds[key].footer }}"></label>
+        <button class="btn">{{ label }} 저장</button>
+      </form>
+    </section>
+    {% endfor %}
+
+    <section class="card" id="soon">
+      <h2>✨ 추가 예정 메뉴</h2>
+      <div class="menu-grid">
+        <div class="menu-item"><strong>🎟️ 티켓 패널</strong><span class="muted">문의/신고 패널 설정</span></div>
+        <div class="menu-item"><strong>🎮 구인구직</strong><span class="muted">지원 임베드 꾸미기</span></div>
+        <div class="menu-item"><strong>💰 경제/상점</strong><span class="muted">포인트·출석·상점</span></div>
+        <div class="menu-item"><strong>🎵 음악 & TTS</strong><span class="muted">채널/음성 설정</span></div>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

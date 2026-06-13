@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <h1>🌸 서버 선택</h1>
+    <p>{{ user.username if user else '사용자' }}님이 관리자 권한을 가진 서버만 보여요.</p>
+  </div>
+  <span class="pill">관리자 서버 목록</span>
+</div>
+<div class="grid">
+  {% for g in guilds %}
+  <a class="server card" href="{{ url_for('dashboard', guild_id=g.id) }}">
+    <div class="server-icon">{{ g.name[:1] }}</div>
+    <div>
+      <h3>{{ g.name }}</h3>
+      <p class="muted">ID: {{ g.id }}</p>
+    </div>
+  </a>
+  {% else %}
+  <div class="card">관리자 권한이 있는 서버가 없어요.</div>
+  {% endfor %}
+</div>
+{% endblock %}

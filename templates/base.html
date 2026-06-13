@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>🌸 만능 봇 관리센터</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark">🌸</span><span>만능 봇 관리센터</span></a>
+    <nav>
+      <a href="{{ url_for('servers') }}">서버 선택</a>
+      <a href="{{ url_for('logout') }}">로그아웃</a>
+    </nav>
+  </header>
+  <main class="wrap">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+    <p class="footer-note">⭐ 만능 봇 | 친목 서버 관리 · 경제 · 티켓 · 음악 · TTS 통합 관리</p>
+  </main>
+</body>
+</html>

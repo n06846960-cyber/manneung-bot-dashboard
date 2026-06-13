@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero card">
+  <div class="badge">⭐ 친목 서버 관리 봇</div>
+  <h1>🌸 만능 봇 관리센터</h1>
+  <p>환영 메시지, 인증 패널, 규칙 임베드, 자기소개 안내, 보안 설정을 웹에서 편하게 관리해요.</p>
+  <div class="menu-grid">
+    <div class="menu-item"><strong>📌 서버 관리</strong><span class="muted">환영 · 규칙 · 인증</span></div>
+    <div class="menu-item"><strong>🎟️ 티켓 시스템</strong><span class="muted">문의 패널 확장 예정</span></div>
+    <div class="menu-item"><strong>💰 경제 시스템</strong><span class="muted">포인트 · 출석 · 상점</span></div>
+    <div class="menu-item"><strong>🛡️ 보안</strong><span class="muted">검열 · 악성유저 · 테러감지</span></div>
+  </div>
+  <a class="btn big" href="{{ url_for('login') }}">Discord로 로그인</a>
+</section>
+{% endblock %}
