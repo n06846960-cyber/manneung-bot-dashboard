@@ -1,164 +1,105 @@
-
 {% extends "base.html" %}
 {% block content %}
-<div class="title-row">
-  <div>
+<style>
+  .dash-wrap{max-width:1200px;margin:0 auto;padding:10px 0 40px;}
+  .hero{padding:22px;border:1px solid rgba(255,255,255,.12);border-radius:20px;margin-bottom:18px;background:rgba(255,255,255,.04)}
+  .tabs{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 22px}.tabs a{padding:9px 12px;border-radius:999px;text-decoration:none;background:rgba(255,255,255,.08)}
+  .card{padding:18px;border:1px solid rgba(255,255,255,.12);border-radius:18px;margin:16px 0;background:rgba(255,255,255,.035)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  label{display:block;font-weight:700}input,textarea,select{width:100%;box-sizing:border-box;margin-top:6px;margin-bottom:10px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.22);color:inherit}textarea{min-height:100px}button{padding:10px 14px;border-radius:12px;border:0;font-weight:800;cursor:pointer}.mini{font-size:.88em;opacity:.75}.list{padding:10px;border-radius:12px;background:rgba(0,0,0,.16);margin:8px 0}.danger{background:#ff6b6b;color:#111}.ok{background:#9be28f;color:#111}.wide{grid-column:1/-1}.preview{white-space:pre-wrap;padding:12px;border-radius:12px;background:rgba(0,0,0,.22)}
+</style>
+<div class="dash-wrap">
+  <div class="hero">
     <h1>🌸 {{ guild.name if guild else '서버' }} 관리</h1>
     <p>웹에서 저장하면 만능 봇 SQLite DB에 반영돼요. 봇과 대시보드가 같은 DB를 써야 실제 봇에 바로 적용돼요.</p>
+    <p class="mini">서버 ID: {{ guild_id }}</p>
   </div>
-  <span class="pill">서버 ID {{ guild_id }}</span>
-</div>
 
-<div class="mini-stats five">
-  <div class="stat"><b>👋</b><span>서버 관리</span></div>
-  <div class="stat"><b>🎟️</b><span>티켓/임베드</span></div>
-  <div class="stat"><b>💰</b><span>경제/주식</span></div>
-  <div class="stat"><b>🎵</b><span>음악/TTS</span></div>
-  <div class="stat"><b>🛡️</b><span>보안</span></div>
-</div>
-<br>
+  <div class="tabs">
+    <a href="#guild-settings">📦 전체 채널</a><a href="#welcome">🌸 환영</a><a href="#security">🛡️ 보안</a><a href="#embeds">🧩 임베드</a><a href="#recruit">🌸 구인구직</a><a href="#economy">💰 경제</a><a href="#mission">🎯 미션</a><a href="#coupon">🎟️ 쿠폰</a><a href="#title">🏷️ 칭호</a><a href="#devlog">📈 개발로그</a><a href="#support">💬 지원서버</a><a href="#clean">🧹 청소</a><a href="#event">🎉 이벤트</a>
+  </div>
 
-<div class="layout">
-  <aside class="sidebar card">
-    <div class="side-title">🎛️ 만능 봇 메뉴</div>
-    <a class="side-link" href="#guild-settings">📦 서버 채널</a>
-    <a class="side-link" href="#welcome">👋 환영 메시지</a>
-    <a class="side-link" href="#security">🛡️ 보안 설정</a>
-    <a class="side-link" href="#embeds">📌 기본 임베드</a>
-    <a class="side-link" href="#recruit">🎮 구인구직</a>
-    <a class="side-link" href="#economy">💰 경제/주식</a>
-    <a class="side-link" href="#voice">🎵 음악 & TTS</a>
-    <a class="side-link" href="#event">🎁 이벤트</a>
-  </aside>
-
-  <div>
-    <section class="card" id="guild-settings">
-      <h2>📦 서버 채널 연결</h2>
-      <p class="hint">/서버추가 명령어와 같은 DB 테이블(guild_settings)에 저장돼요.</p>
-      <form method="post" action="{{ url_for('save_guild_settings', guild_id=guild_id) }}">
-        <div class="row">
-          <label>환영 채널<select name="welcome_channel_id"><option value="0">미설정</option>{% for c in text_channels %}<option value="{{c.id}}" {% if guild_settings.welcome_channel_id|string == c.id|string %}selected{% endif %}># {{c.name}}</option>{% endfor %}</select></label>
-          <label>퇴장 채널<select name="goodbye_channel_id"><option value="0">미설정</option>{% for c in text_channels %}<option value="{{c.id}}" {% if guild_settings.goodbye_channel_id|string == c.id|string %}selected{% endif %}># {{c.name}}</option>{% endfor %}</select></label>
-        </div>
-        <div class="row">
-          <label>규칙 채널<select name="rule_channel_id"><option value="0">미설정</option>{% for c in text_channels %}<option value="{{c.id}}" {% if guild_settings.rule_channel_id|string == c.id|string %}selected{% endif %}># {{c.name}}</option>{% endfor %}</select></label>
-          <label>게임역할 채널<select name="game_role_channel_id"><option value="0">미설정</option>{% for c in text_channels %}<option value="{{c.id}}" {% if guild_settings.game_role_channel_id|string == c.id|string %}selected{% endif %}># {{c.name}}</option>{% endfor %}</select></label>
-        </div>
-        <label>로그 채널<select name="log_channel_id"><option value="0">미설정</option>{% for c in text_channels %}<option value="{{c.id}}" {% if guild_settings.log_channel_id|string == c.id|string %}selected{% endif %}># {{c.name}}</option>{% endfor %}</select></label>
-        <button class="btn">채널 설정 저장</button>
-      </form>
-    </section>
-
-    <section class="card" id="welcome">
-      <h2>👋 환영 메시지</h2>
-      <p class="hint">사용 가능 변수: {user}, {username}, {server}, {member_count}, {rule_channel}</p>
-      <div class="preview"><strong>미리보기 느낌</strong><br>{{ welcome.title }}</div>
-      <form method="post" action="{{ url_for('save_welcome', guild_id=guild_id) }}">
-        <label>제목<input name="title" value="{{ welcome.title }}"></label>
-        <label>내용<textarea name="description">{{ welcome.description }}</textarea></label>
-        <div class="row"><label>색상 HEX<input name="color" value="{{ welcome.color }}"></label><label>이미지/GIF URL<input name="image_url" value="{{ welcome.image_url }}"></label></div>
-        <label>하단 문구<input name="footer" value="{{ welcome.footer }}"></label>
-        <button class="btn">환영 메시지 저장</button>
-      </form>
-    </section>
-
-    <section class="card" id="security">
-      <h2>🛡️ 보안 설정</h2>
-      <form method="post" action="{{ url_for('save_security', guild_id=guild_id) }}">
-        <label class="check"><input type="checkbox" name="malicious_user_detection" {% if security.malicious_user_detection %}checked{% endif %}> 악성 유저 감지</label>
-        <label class="check"><input type="checkbox" name="auto_filter" {% if security.auto_filter %}checked{% endif %}> 자동 검열</label>
-        <label class="check"><input type="checkbox" name="raid_detection" {% if security.raid_detection %}checked{% endif %}> 테러 감지</label>
-        <button class="btn">보안 저장</button>
-      </form>
-      <div class="row top-gap">
-        <div>
-          <h3>🚫 검열 단어</h3>
-          <form class="inline-form" method="post" action="{{ url_for('save_filter_word', guild_id=guild_id) }}"><input name="word" placeholder="추가할 단어"><button class="btn small">추가</button></form>
-          <div class="chips">{% for w in filter_words %}<form method="post" action="{{ url_for('delete_filter_word', guild_id=guild_id) }}"><input type="hidden" name="word" value="{{w.word}}"><button class="chip">{{w.word}} ✕</button></form>{% else %}<span class="muted">추가된 단어 없음</span>{% endfor %}</div>
-        </div>
-        <div>
-          <h3>⚠️ 악성 유저 등록</h3>
-          <form method="post" action="{{ url_for('save_bad_user', guild_id=guild_id) }}"><input name="user_id" placeholder="유저 ID"><input name="reason" placeholder="사유"><button class="btn small">등록</button></form>
-          <div class="listbox">{% for u in bad_users %}<form method="post" action="{{ url_for('delete_bad_user', guild_id=guild_id) }}"><input type="hidden" name="user_id" value="{{u.user_id}}"><button class="listitem">{{u.user_id}} · {{u.reason}} ✕</button></form>{% else %}<span class="muted">등록된 유저 없음</span>{% endfor %}</div>
+  <section id="guild-settings" class="card">
+    <h2>📦 서버 채널 연결 전체 업그레이드</h2>
+    <p><b>/서버추가</b>가 쓰던 <code>guild_settings</code> 테이블에 모든 기능 채널을 저장해요.</p>
+    <p><a href="{{ url_for('channel_settings_page', guild_id=guild_id) }}">전체 채널 연결 전용 페이지 열기</a></p>
+    <form method="post" action="{{ url_for('save_guild_settings', guild_id=guild_id) }}">
+      {% for group in channel_setting_groups %}
+      <div class="card">
+        <h3>{{ group.name }}</h3>
+        <div class="grid">
+        {% for f in group.fields %}
+          <label>{{ f.label }}
+            <select name="{{ f.key }}">
+              <option value="0">미설정</option>
+              {% for c in channels %}
+                {% if c.type == f.type %}
+                <option value="{{ c.id }}" {% if (guild_settings.get(f.key, 0)|string) == (c.id|string) %}selected{% endif %}>
+                  {% if c.type == 4 %}📁{% elif c.type == 2 %}🔊{% else %}#{% endif %} {{ c.name }}
+                </option>
+                {% endif %}
+              {% endfor %}
+            </select>
+            <span class="mini">{{ f.hint }} · {{ f.key }}</span>
+          </label>
+        {% endfor %}
         </div>
       </div>
-    </section>
-
-    <section class="card" id="embeds">
-      <h2>📌 기본 임베드 / 티켓 / 음악 안내</h2>
-      <p class="hint">규칙, 인증, 티켓, 상점, 포인트, 음악, TTS 안내 임베드를 저장해요.</p>
-      {% for key, label in embed_types.items() %}
-      <details class="fold" id="{{ key }}"><summary>{{ label }}</summary>
-        <form method="post" action="{{ url_for('save_auto_embed', guild_id=guild_id, embed_type=key) }}">
-          <label>제목<input name="title" value="{{ embeds[key].title }}"></label>
-          <label>내용<textarea name="description">{{ embeds[key].description }}</textarea></label>
-          <div class="row"><label>색상 HEX<input name="color" value="{{ embeds[key].color }}"></label><label>이미지/GIF URL<input name="image_url" value="{{ embeds[key].image_url }}"></label></div>
-          <label>하단 문구<input name="footer" value="{{ embeds[key].footer }}"></label>
-          <button class="btn">{{ label }} 저장</button>
-        </form>
-      </details>
       {% endfor %}
-    </section>
+      <button class="ok" type="submit">✅ 전체 채널 설정 저장</button>
+    </form>
+  </section>
 
-    <section class="card" id="recruit">
-      <h2>🎮 구인구직 임베드</h2>
-      <p class="hint">bot.py의 recruit_embeds 테이블과 연결돼요. /구인구직생성 실행 시 저장값을 사용해요.</p>
-      {% for key, label in recruit_items.items() %}
-      <details class="fold"><summary>{{ label }}</summary>
-        <form method="post" action="{{ url_for('save_recruit', guild_id=guild_id, recruit_key=key) }}">
-          <label>제목<input name="title" value="{{ recruit[key].title }}"></label>
-          <label>내용<textarea name="description">{{ recruit[key].description }}</textarea></label>
-          <div class="row"><label>색상 HEX<input name="color" value="{{ recruit[key].color }}"></label><label>이미지/GIF URL<input name="image_url" value="{{ recruit[key].image_url }}"></label></div>
-          <label>하단 문구<input name="footer" value="{{ recruit[key].footer }}"></label>
-          <button class="btn">{{ label }} 저장</button>
-        </form>
-      </details>
+  <section id="welcome" class="card">
+    <h2>🌸 환영 메시지</h2>
+    <p class="mini">사용 가능 변수: {user}, {username}, {server}, {member_count}, {rule_channel}</p>
+    <div class="preview"><b>{{ welcome.title }}</b>\n{{ welcome.description }}</div>
+    <form method="post" action="{{ url_for('save_welcome', guild_id=guild_id) }}" class="grid">
+      <label>제목<input name="title" value="{{ welcome.title }}"></label>
+      <label>색상 HEX<input name="color" value="{{ welcome.color }}"></label>
+      <label class="wide">내용<textarea name="description">{{ welcome.description }}</textarea></label>
+      <label>이미지/GIF URL<input name="image_url" value="{{ welcome.image_url }}"></label>
+      <label>하단 문구<input name="footer" value="{{ welcome.footer }}"></label>
+      <button class="ok" type="submit">환영 메시지 저장</button>
+    </form>
+  </section>
+
+  <section id="security" class="card">
+    <h2>🛡️ 보안 설정</h2>
+    <form method="post" action="{{ url_for('save_security', guild_id=guild_id) }}" class="grid">
+      {% for key in security_fields %}
+      <label><input style="width:auto" type="checkbox" name="{{ key }}" {% if security.get(key) %}checked{% endif %}> {{ security_labels[key] }}</label>
       {% endfor %}
-    </section>
+      <button class="ok" type="submit">보안 저장</button>
+    </form>
+    <div class="grid2">
+      <div><h3>검열 단어</h3><form method="post" action="{{ url_for('save_filter_word', guild_id=guild_id) }}"><input name="word" placeholder="단어"><button>추가</button></form>{% for w in filter_words %}<div class="list">{{w.word}} <form style="display:inline" method="post" action="{{ url_for('delete_filter_word', guild_id=guild_id) }}"><input type="hidden" name="word" value="{{w.word}}"><button class="danger">✕</button></form></div>{% else %}<p class="mini">추가된 단어 없음</p>{% endfor %}</div>
+      <div><h3>악성 유저</h3><form method="post" action="{{ url_for('save_bad_user', guild_id=guild_id) }}"><input name="user_id" placeholder="유저 ID"><input name="reason" placeholder="사유"><button>등록</button></form>{% for u in bad_users %}<div class="list">{{u.user_id}} · {{u.reason}} <form style="display:inline" method="post" action="{{ url_for('delete_bad_user', guild_id=guild_id) }}"><input type="hidden" name="user_id" value="{{u.user_id}}"><button class="danger">✕</button></form></div>{% else %}<p class="mini">등록된 유저 없음</p>{% endfor %}</div>
+    </div>
+  </section>
 
-    <section class="card" id="economy">
-      <h2>💰 경제 / 주식 설정</h2>
-      <div class="row">
-        <div>
-          <h3>포인트 지급/설정</h3>
-          <form method="post" action="{{ url_for('save_points', guild_id=guild_id) }}"><input name="user_id" placeholder="유저 ID"><input name="amount" placeholder="포인트 숫자"><select name="mode"><option value="add">더하기/빼기</option><option value="set">값으로 설정</option></select><button class="btn small">적용</button></form>
-          <h3>포인트 TOP 10</h3>
-          <div class="listbox">{% for p in top_points %}<div class="listitem">{{p.user_id}} · {{p.point}}P · 출석 {{p.attendance_count}}</div>{% else %}<span class="muted">기록 없음</span>{% endfor %}</div>
-        </div>
-        <div>
-          <h3>가상 주식 추가/수정</h3>
-          <form method="post" action="{{ url_for('save_stock', guild_id=guild_id) }}"><input name="stock_code" placeholder="코드 예: LIZE"><input name="stock_name" placeholder="이름 예: 리제전자"><input name="price" placeholder="현재가"><button class="btn small">저장</button></form>
-          <div class="listbox">{% for s in stocks %}<form method="post" action="{{ url_for('delete_stock', guild_id=guild_id) }}"><input type="hidden" name="stock_code" value="{{s.stock_code}}"><button class="listitem">{{s.stock_code}} · {{s.stock_name}} · {{s.price}}P ✕</button></form>{% else %}<span class="muted">등록된 주식 없음</span>{% endfor %}</div>
-        </div>
-      </div>
-    </section>
+  <section id="embeds" class="card"><h2>🧩 기본 임베드</h2><div class="grid2">{% for key, label in embed_types.items() %}<form class="card" method="post" action="{{ url_for('save_auto_embed', guild_id=guild_id, embed_type=key) }}"><h3>{{ label }}</h3><input name="title" value="{{ embeds[key].title }}"><textarea name="description">{{ embeds[key].description }}</textarea><input name="color" value="{{ embeds[key].color }}"><input name="image_url" value="{{ embeds[key].image_url }}" placeholder="이미지/GIF URL"><input name="footer" value="{{ embeds[key].footer }}"><button class="ok">저장</button></form>{% endfor %}</div></section>
 
-    <section class="card" id="voice">
-      <h2>🎵 음악 & TTS</h2>
-      <p class="hint">음악 안내 임베드는 위 기본 임베드에서 수정하고, TTS 언어는 여기서 바꿔요.</p>
-      <form method="post" action="{{ url_for('save_tts', guild_id=guild_id) }}">
-        <label>TTS 기본 언어<select name="lang">{% for code, name in tts_langs.items() %}<option value="{{code}}" {% if tts.lang == code %}selected{% endif %}>{{name}}</option>{% endfor %}</select></label>
-        <button class="btn">TTS 저장</button>
-      </form>
-    </section>
+  <section id="recruit" class="card"><h2>🌸 구인구직 임베드</h2><div class="grid2">{% for key, label in recruit_items.items() %}<form class="card" method="post" action="{{ url_for('save_recruit', guild_id=guild_id, recruit_key=key) }}"><h3>{{ label }}</h3><input name="title" value="{{ recruit[key].title }}"><textarea name="description">{{ recruit[key].description }}</textarea><input name="color" value="{{ recruit[key].color }}"><input name="image_url" value="{{ recruit[key].image_url }}"><input name="footer" value="{{ recruit[key].footer }}"><button class="ok">저장</button></form>{% endfor %}</div></section>
 
-    <section class="card" id="event">
-      <h2>🎁 예약 이벤트</h2>
-      <p class="hint">bot.py의 scheduled_events 테이블에 저장돼요.</p>
-      <form method="post" action="{{ url_for('save_event', guild_id=guild_id) }}">
-        <div class="row"><label>이벤트 채널<select name="channel_id"><option value="0">미설정</option>{% for c in text_channels %}<option value="{{c.id}}"># {{c.name}}</option>{% endfor %}</select></label><label>시간<input name="event_time" placeholder="예: 2026-06-14 20:00"></label></div>
-        <label>제목<input name="title" placeholder="이벤트 제목"></label>
-        <label>내용<textarea name="description" placeholder="이벤트 설명"></textarea></label>
-        <div class="row"><label>기본 보상 포인트<input name="reward_point" placeholder="1000"></label><label>색상 HEX<input name="embed_color" value="FFB6C1"></label></div>
-        <div class="row"><label>1등 보상<input name="reward_1"></label><label>2등 보상<input name="reward_2"></label></div>
-        <div class="row"><label>3등 보상<input name="reward_3"></label><label>이미지 URL<input name="image_url"></label></div>
-        <div class="row"><label>승리팀 보상<input name="win_reward"></label><label>패배팀 보상<input name="lose_reward"></label></div>
-        <label>하단 문구<input name="footer" value="🌸 만능 봇 이벤트"></label>
-        <button class="btn">예약 이벤트 추가</button>
-      </form>
-      <h3>예약 목록</h3>
-      <div class="listbox">{% for e in events %}<form method="post" action="{{ url_for('delete_event', guild_id=guild_id) }}"><input type="hidden" name="event_id" value="{{e.event_id}}"><button class="listitem">#{{e.event_id}} · {{e.event_time}} · {{e.title}} ✕</button></form>{% else %}<span class="muted">예약 이벤트 없음</span>{% endfor %}</div>
-    </section>
-  </div>
+  <section id="economy" class="card"><h2>💰 경제 / 주식</h2><div class="grid2"><div class="card"><h3>포인트 변경</h3><form method="post" action="{{ url_for('save_points', guild_id=guild_id) }}"><input name="user_id" placeholder="유저 ID"><input name="amount" placeholder="포인트"><select name="mode"><option value="add">더하기/빼기</option><option value="set">값으로 설정</option></select><button>적용</button></form><h3>TOP 10</h3>{% for p in top_points %}<div class="list">{{p.user_id}} · {{p.point}}P · 출석 {{p.attendance_count}}</div>{% else %}<p class="mini">기록 없음</p>{% endfor %}</div><div class="card"><h3>가상 주식</h3><form method="post" action="{{ url_for('save_stock', guild_id=guild_id) }}"><input name="stock_code" placeholder="코드"><input name="stock_name" placeholder="이름"><input name="price" placeholder="가격"><button>저장</button></form>{% for s in stocks %}<div class="list">{{s.stock_code}} · {{s.stock_name}} · {{s.price}}P <form style="display:inline" method="post" action="{{ url_for('delete_stock', guild_id=guild_id) }}"><input type="hidden" name="stock_code" value="{{s.stock_code}}"><button class="danger">✕</button></form></div>{% else %}<p class="mini">등록된 주식 없음</p>{% endfor %}</div></div></section>
+
+  <section id="mission" class="card"><h2>🎯 일일미션</h2><form method="post" action="{{ url_for('save_mission_settings', guild_id=guild_id) }}" class="grid"><label>채팅 목표<input name="chat_target" value="{{ mission_settings.chat_target }}"></label><label>보상 포인트<input name="reward_point" value="{{ mission_settings.reward_point }}"></label><label>랜덤박스 보상<input name="reward_box" value="{{ mission_settings.reward_box }}"></label><button class="ok">미션 저장</button></form></section>
+
+  <section id="coupon" class="card"><h2>🎟️ 쿠폰</h2><form method="post" action="{{ url_for('save_coupon', guild_id=guild_id) }}" class="grid"><input name="code" placeholder="쿠폰 코드"><input name="reward_point" placeholder="보상 포인트"><input name="item_name" placeholder="아이템 이름"><input name="item_amount" placeholder="아이템 수량"><input name="max_uses" placeholder="총 사용 가능 횟수"><input name="expires_at" placeholder="만료일 YYYY-MM-DD"><button>쿠폰 저장</button></form>{% for co in coupons %}<div class="list">{{co.code}} · {{co.reward_point}}P · {{co.item_name}} x{{co.item_amount}} · {{co.used_count}}/{{co.max_uses}} <form style="display:inline" method="post" action="{{ url_for('delete_coupon', guild_id=guild_id) }}"><input type="hidden" name="code" value="{{co.code}}"><button class="danger">비활성화</button></form></div>{% else %}<p class="mini">쿠폰 없음</p>{% endfor %}</section>
+
+  <section id="title" class="card"><h2>🏷️ 칭호</h2><div class="grid2"><form class="card" method="post" action="{{ url_for('save_title_shop', guild_id=guild_id) }}"><h3>칭호 상점 추가</h3><input name="title_name" placeholder="칭호"><input name="emoji" placeholder="이모지"><input name="price" placeholder="가격"><input name="description" placeholder="설명"><button>저장</button></form><div class="card"><h3>칭호 지급/회수</h3><form method="post" action="{{ url_for('give_user_title', guild_id=guild_id) }}"><input name="user_id" placeholder="유저 ID"><input name="title_name" placeholder="칭호"><button>지급</button></form><form method="post" action="{{ url_for('remove_user_title', guild_id=guild_id) }}"><input name="user_id" placeholder="유저 ID"><input name="title_name" placeholder="칭호"><button class="danger">회수</button></form></div></div>{% for t in title_shop %}<div class="list">{{t.emoji}} {{t.title_name}} · {{t.price}}P</div>{% endfor %}</section>
+
+  <section id="achievement" class="card"><h2>🏆 커스텀 업적</h2><form method="post" action="{{ url_for('save_custom_achievement', guild_id=guild_id) }}" class="grid"><input name="achievement_key" placeholder="업적 키"><input name="name" placeholder="업적 이름"><input name="emoji" placeholder="이모지"><input name="condition_text" placeholder="조건 설명"><input name="reward_point" placeholder="보상 포인트"><input name="reward_item" placeholder="보상 아이템"><input name="reward_item_amount" placeholder="아이템 수량"><input name="reward_title" placeholder="보상 칭호"><button>업적 저장</button></form>{% for a in custom_achievements %}<div class="list">{{a.emoji}} {{a.name}} · {{a.condition_text}}</div>{% else %}<p class="mini">커스텀 업적 없음</p>{% endfor %}</section>
+
+  <section id="devlog" class="card"><h2>📈 개발로그</h2><form method="post" action="{{ url_for('save_devlog_settings', guild_id=guild_id) }}" class="grid"><input name="category_id" placeholder="카테고리 ID" value="{{ devlog.get('category_id',0) }}"><input name="update_channel_id" placeholder="업데이트 채널 ID" value="{{ devlog.get('update_channel_id',0) }}"><input name="patch_channel_id" placeholder="패치노트 채널 ID" value="{{ devlog.get('patch_channel_id',0) }}"><input name="status_channel_id" placeholder="봇상태 채널 ID" value="{{ devlog.get('status_channel_id',0) }}"><input name="diary_channel_id" placeholder="개발일지 채널 ID" value="{{ devlog.get('diary_channel_id',0) }}"><input name="notify_role_id" placeholder="알림 역할 ID" value="{{ devlog.get('notify_role_id',0) }}"><button>개발로그 저장</button></form><form method="post" action="{{ url_for('send_devlog_notice', guild_id=guild_id) }}" class="grid"><select name="notice_type"><option value="update">업데이트</option><option value="patch">패치노트</option><option value="status">봇상태</option><option value="diary">개발일지</option></select><input name="title" placeholder="제목"><textarea name="description" placeholder="내용"></textarea><input name="color" value="FFB6C1"><button class="ok">알림 발송</button></form></section>
+
+  <section id="support" class="card"><h2>💬 지원 서버 환영</h2><form method="post" action="{{ url_for('save_support_settings', guild_id=guild_id) }}" class="grid"><input name="support_invite" value="{{ support.get('support_invite','') }}"><input name="dashboard_url" value="{{ support.get('dashboard_url','') }}"><input name="welcome_channel_id" value="{{ support.get('welcome_channel_id',0) }}"><input class="wide" name="welcome_title" value="{{ support.get('welcome_title','🎉 만능 봇 공식 지원 서버에 오신 것을 환영합니다!') }}"><textarea class="wide" name="welcome_description">{{ support.get('welcome_description','') }}</textarea><button>지원 설정 저장</button></form><form method="post" action="{{ url_for('send_support_welcome', guild_id=guild_id) }}" class="grid"><input name="channel_id" placeholder="발송 채널 ID"><input name="title" placeholder="제목"><textarea name="description" placeholder="내용"></textarea><input name="color" value="FFB6C1"><button class="ok">환영 메시지 발송</button></form></section>
+
+  <section id="clean" class="card"><h2>🧹 청소 설정</h2><form method="post" action="{{ url_for('save_clean_settings', guild_id=guild_id) }}" class="grid"><label>최대 삭제 수<input name="max_delete" value="{{ clean.get('max_delete',0) }}"></label><label>묶음 삭제 수<input name="batch_size" value="{{ clean.get('batch_size',100) }}"></label><label>딜레이 초<input name="delay_seconds" value="{{ clean.get('delay_seconds',1.0) }}"></label><label><input style="width:auto" type="checkbox" name="log_enabled" {% if clean.get('log_enabled',1) %}checked{% endif %}> 로그 남기기</label><button class="ok">청소 저장</button></form></section>
+
+  <section id="event" class="card"><h2>🎉 예약 이벤트</h2><form method="post" action="{{ url_for('save_event', guild_id=guild_id) }}" class="grid"><select name="channel_id"><option value="0">이벤트 채널 미설정</option>{% for c in text_channels %}<option value="{{c.id}}"># {{c.name}}</option>{% endfor %}</select><input name="event_time" placeholder="YYYY-MM-DD HH:MM"><input name="title" placeholder="제목"><textarea name="description" placeholder="내용"></textarea><input name="reward_point" placeholder="기본 보상 포인트"><input name="embed_color" value="FFB6C1"><input name="reward_1" placeholder="1등 보상"><input name="reward_2" placeholder="2등 보상"><input name="reward_3" placeholder="3등 보상"><input name="win_reward" placeholder="승리팀 보상"><input name="lose_reward" placeholder="패배팀 보상"><input name="image_url" placeholder="이미지 URL"><input name="footer" placeholder="하단 문구"><button>예약 이벤트 추가</button></form>{% for e in events %}<div class="list">#{{e.event_id}} · {{e.event_time}} · {{e.title}} <form style="display:inline" method="post" action="{{ url_for('delete_event', guild_id=guild_id) }}"><input type="hidden" name="event_id" value="{{e.event_id}}"><button class="danger">✕</button></form></div>{% else %}<p class="mini">예약 이벤트 없음</p>{% endfor %}</section>
+
+  <section id="notice" class="card"><h2>📢 임베드 바로 발송</h2><form method="post" action="{{ url_for('send_embed_message', guild_id=guild_id) }}" class="grid"><select name="channel_id"><option value="0">채널 선택</option>{% for c in text_channels %}<option value="{{c.id}}"># {{c.name}}</option>{% endfor %}</select><input name="title" placeholder="제목"><textarea name="description" placeholder="내용"></textarea><input name="color" value="FFB6C1"><input name="image_url" placeholder="이미지/GIF URL"><input name="footer" value="⭐ 만능 봇"><input name="content" placeholder="멘션/일반 메시지"><button class="ok">발송</button></form></section>
 </div>
 {% endblock %}

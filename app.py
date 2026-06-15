@@ -3,7 +3,7 @@ import os
 import sqlite3
 import requests
 from functools import wraps
-from flask import Flask, redirect, request, session, render_template, url_for, flash, jsonify
+from flask import Flask, redirect, request, session, render_template, render_template_string, url_for, flash, jsonify
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -92,6 +92,136 @@ WELCOME_DEFAULT = {
 
 TTS_LANGS = {"ko":"한국어", "en":"영어", "ja":"일본어"}
 
+
+# =========================
+# 서버 채널 연결 전체 설정
+# =========================
+# /서버추가가 쓰던 guild_settings 테이블을 확장해서
+# 봇의 주요 기능 채널/카테고리/음성방까지 웹에서 연결할 수 있게 합니다.
+# type: 0=text, 2=voice, 4=category
+CHANNEL_SETTING_GROUPS = [
+    {
+        "name": "📌 기본 / 입퇴장 / 인증",
+        "fields": [
+            {"key": "welcome_channel_id", "label": "👋 환영 채널", "type": 0, "hint": "입장 환영 메시지"},
+            {"key": "goodbye_channel_id", "label": "👋 퇴장 채널", "type": 0, "hint": "퇴장 메시지"},
+            {"key": "rule_channel_id", "label": "📌 규칙 채널", "type": 0, "hint": "규칙/필독 안내"},
+            {"key": "intro_channel_id", "label": "💬 자기소개 채널", "type": 0, "hint": "자기소개 안내"},
+            {"key": "verify_channel_id", "label": "✅ 인증 채널", "type": 0, "hint": "인증 패널"},
+            {"key": "role_select_channel_id", "label": "🎭 역할선택 채널", "type": 0, "hint": "프로필/크리에이터/게임 역할"},
+            {"key": "game_role_channel_id", "label": "🎮 게임역할 채널", "type": 0, "hint": "게임 역할 선택"},
+            {"key": "notice_channel_id", "label": "📢 공지 채널", "type": 0, "hint": "중요 공지"},
+        ],
+    },
+    {
+        "name": "📁 로그 채널",
+        "fields": [
+            {"key": "log_channel_id", "label": "📋 대표 로그 채널", "type": 0, "hint": "기본 로그"},
+            {"key": "general_log_channel_id", "label": "📋 일반로그", "type": 0, "hint": "일반 기록"},
+            {"key": "warning_log_channel_id", "label": "⚠️ 경고로그", "type": 0, "hint": "경고/도배"},
+            {"key": "punishment_log_channel_id", "label": "⛔ 처벌로그", "type": 0, "hint": "킥/밴/타임아웃"},
+            {"key": "chat_log_channel_id", "label": "💬 채팅로그", "type": 0, "hint": "메시지 삭제/수정"},
+            {"key": "voice_log_channel_id", "label": "🔊 음성로그", "type": 0, "hint": "입장/퇴장"},
+            {"key": "nickname_log_channel_id", "label": "👤 닉네임로그", "type": 0, "hint": "닉네임 변경"},
+            {"key": "level_log_channel_id", "label": "📈 레벨로그", "type": 0, "hint": "레벨업 알림"},
+            {"key": "security_log_channel_id", "label": "🛡️ 보안로그", "type": 0, "hint": "보안패널 감지 기록"},
+            {"key": "clean_log_channel_id", "label": "🧹 청소로그", "type": 0, "hint": "청소 명령어 기록"},
+        ],
+    },
+    {
+        "name": "💰 경제 / 상점 / 성장",
+        "fields": [
+            {"key": "shop_channel_id", "label": "🛒 상점 채널", "type": 0, "hint": "통합상점"},
+            {"key": "point_channel_id", "label": "💰 포인트 채널", "type": 0, "hint": "잔액/송금"},
+            {"key": "stock_channel_id", "label": "📈 주식 채널", "type": 0, "hint": "가상 주식"},
+            {"key": "attendance_channel_id", "label": "📅 출석 채널", "type": 0, "hint": "출석체크"},
+            {"key": "attendance_reward_channel_id", "label": "🎁 출석보상 채널", "type": 0, "hint": "출석 보상"},
+            {"key": "level_channel_id", "label": "📈 레벨 채널", "type": 0, "hint": "랭크/레벨 안내"},
+            {"key": "enhance_channel_id", "label": "⚒️ 강화 채널", "type": 0, "hint": "강화 시스템"},
+            {"key": "coupon_channel_id", "label": "🎟️ 쿠폰 채널", "type": 0, "hint": "쿠폰 사용/안내"},
+            {"key": "mission_channel_id", "label": "🎯 일일미션 채널", "type": 0, "hint": "미션/보상"},
+            {"key": "title_channel_id", "label": "🏷️ 칭호 채널", "type": 0, "hint": "칭호 패널"},
+            {"key": "achievement_channel_id", "label": "🏆 업적 채널", "type": 0, "hint": "업적/보상"},
+        ],
+    },
+    {
+        "name": "🎟️ 티켓 / 관리자 / 이벤트",
+        "fields": [
+            {"key": "ticket_channel_id", "label": "🎟️ 티켓 채널", "type": 0, "hint": "문의/신고/티켓 패널"},
+            {"key": "ticket_log_channel_id", "label": "📁 티켓로그 채널", "type": 0, "hint": "티켓 닫기 기록"},
+            {"key": "report_channel_id", "label": "🚨 신고 채널", "type": 0, "hint": "신고 접수"},
+            {"key": "admin_panel_channel_id", "label": "🛠️ 관리자패널 채널", "type": 0, "hint": "관리 버튼/패널"},
+            {"key": "bot_command_channel_id", "label": "🤖 봇명령어 채널", "type": 0, "hint": "명령어 전용"},
+            {"key": "event_channel_id", "label": "🎉 이벤트 채널", "type": 0, "hint": "예약 이벤트 발송"},
+            {"key": "event_list_channel_id", "label": "📋 이벤트목록 채널", "type": 0, "hint": "이벤트 목록"},
+            {"key": "vote_channel_id", "label": "🗳️ 투표 채널", "type": 0, "hint": "투표 패널"},
+            {"key": "giveaway_channel_id", "label": "🎁 추첨 채널", "type": 0, "hint": "추첨/랜덤박스"},
+        ],
+    },
+    {
+        "name": "🎵 음악 / 🔊 TTS",
+        "fields": [
+            {"key": "music_command_channel_id", "label": "🎵 음악명령어 채널", "type": 0, "hint": "재생/스킵/대기열"},
+            {"key": "music_now_playing_channel_id", "label": "🎶 현재재생 채널", "type": 0, "hint": "현재 재생곡"},
+            {"key": "music_queue_channel_id", "label": "📜 재생목록 채널", "type": 0, "hint": "대기열"},
+            {"key": "tts_text_channel_id", "label": "🔊 TTS 텍스트 채널", "type": 0, "hint": "채팅을 음성으로 읽기"},
+            {"key": "music_voice_channel_id", "label": "🔊 음악 음성채널", "type": 2, "hint": "음악 감상 음성방"},
+            {"key": "tts_voice_channel_id", "label": "🔊 TTS 음성채널", "type": 2, "hint": "TTS 통방"},
+        ],
+    },
+    {
+        "name": "🌸 구인구직 / 면접",
+        "fields": [
+            {"key": "recruit_benefit_channel_id", "label": "📜 혜택안내", "type": 0, "hint": "관리자 혜택"},
+            {"key": "recruit_planning_channel_id", "label": "🎁 기획팀지원", "type": 0, "hint": "기획팀"},
+            {"key": "recruit_newbie_channel_id", "label": "🐣 뉴관팀지원", "type": 0, "hint": "뉴관팀"},
+            {"key": "recruit_guide_channel_id", "label": "📢 안내팀지원", "type": 0, "hint": "안내팀"},
+            {"key": "recruit_promotion_channel_id", "label": "💌 홍보팀지원", "type": 0, "hint": "홍보팀"},
+            {"key": "recruit_security_channel_id", "label": "🛡️ 보안팀지원", "type": 0, "hint": "보안팀"},
+            {"key": "recruit_scrim_channel_id", "label": "🎮 내전팀지원", "type": 0, "hint": "내전팀"},
+            {"key": "recruit_admin_channel_id", "label": "📚 행정팀지원", "type": 0, "hint": "행정팀"},
+            {"key": "recruit_design_channel_id", "label": "🎨 디자인팀지원", "type": 0, "hint": "디자인팀"},
+            {"key": "recruit_fixed_channel_id", "label": "💎 고정멤버", "type": 0, "hint": "고정멤버"},
+            {"key": "interview_waiting_voice_id", "label": "🔎 면접대기실", "type": 2, "hint": "면접 대기 음성방"},
+            {"key": "interview_room_1_voice_id", "label": "🎤 면접실 1", "type": 2, "hint": "면접 음성방"},
+            {"key": "interview_room_2_voice_id", "label": "🎤 면접실 2", "type": 2, "hint": "면접 음성방"},
+        ],
+    },
+    {
+        "name": "📈 개발로그 / 지원 서버",
+        "fields": [
+            {"key": "dev_update_channel_id", "label": "🚀 업데이트", "type": 0, "hint": "업데이트 알림"},
+            {"key": "dev_patch_channel_id", "label": "📝 패치노트", "type": 0, "hint": "패치노트"},
+            {"key": "dev_status_channel_id", "label": "📊 봇상태", "type": 0, "hint": "봇 상태"},
+            {"key": "dev_diary_channel_id", "label": "📅 개발일지", "type": 0, "hint": "개발 기록"},
+            {"key": "support_welcome_channel_id", "label": "💬 지원서버 환영", "type": 0, "hint": "공식 지원 서버 환영"},
+            {"key": "support_notice_channel_id", "label": "📢 지원서버 공지", "type": 0, "hint": "지원 서버 공지"},
+        ],
+    },
+    {
+        "name": "📦 카테고리 연결",
+        "fields": [
+            {"key": "rule_category_id", "label": "📌 필독 카테고리", "type": 4, "hint": "규칙/인증/역할선택"},
+            {"key": "welcome_category_id", "label": "👋 인사퇴장 카테고리", "type": 4, "hint": "입퇴장"},
+            {"key": "log_category_id", "label": "📁 로그 카테고리", "type": 4, "hint": "서버 로그"},
+            {"key": "shop_category_id", "label": "🛒 상점 카테고리", "type": 4, "hint": "경제/상점/주식"},
+            {"key": "bot_command_category_id", "label": "🤖 봇명령어 카테고리", "type": 4, "hint": "명령어/출석/레벨"},
+            {"key": "music_category_id", "label": "🎵 뮤직 카테고리", "type": 4, "hint": "음악"},
+            {"key": "tts_category_id", "label": "🔊 TTS 카테고리", "type": 4, "hint": "TTS"},
+            {"key": "recruit_category_id", "label": "🌸 구인구직 카테고리", "type": 4, "hint": "지원 채널"},
+            {"key": "event_category_id", "label": "🎉 이벤트 카테고리", "type": 4, "hint": "이벤트"},
+            {"key": "devlog_category_id", "label": "📈 개발로그 카테고리", "type": 4, "hint": "업데이트/패치노트"},
+            {"key": "server_stats_category_id", "label": "📊 서버스텟 카테고리", "type": 4, "hint": "서버 통계"},
+            {"key": "temp_voice_category_id", "label": "😴 잠수방 카테고리", "type": 4, "hint": "자동 음성방"},
+            {"key": "enhance_category_id", "label": "⚒️ 강화 카테고리", "type": 4, "hint": "강화방"},
+        ],
+    },
+]
+
+CHANNEL_SETTING_FIELDS = [field for group in CHANNEL_SETTING_GROUPS for field in group["fields"]]
+CHANNEL_SETTING_FIELD_NAMES = [field["key"] for field in CHANNEL_SETTING_FIELDS]
+CHANNEL_SETTING_TYPES = {field["key"]: field["type"] for field in CHANNEL_SETTING_FIELDS}
+
 SECURITY_FIELDS = [
     "malicious_user_detection", "auto_filter", "raid_detection",
     "spam_protection", "mention_spam_detection", "new_account_guard",
@@ -172,6 +302,8 @@ def ensure_tables(con):
     cur.execute("""CREATE TABLE IF NOT EXISTS custom_filter_words (guild_id INTEGER,word TEXT,added_by INTEGER,added_at TEXT,PRIMARY KEY (guild_id, word))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS malicious_users (guild_id INTEGER,user_id INTEGER,reason TEXT,added_by INTEGER,added_at TEXT,PRIMARY KEY (guild_id, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY,welcome_channel_id INTEGER DEFAULT 0,goodbye_channel_id INTEGER DEFAULT 0,rule_channel_id INTEGER DEFAULT 0,game_role_channel_id INTEGER DEFAULT 0,log_channel_id INTEGER DEFAULT 0,updated_at TEXT)""")
+    for col in CHANNEL_SETTING_FIELD_NAMES:
+        ensure_column(cur, "guild_settings", col, "INTEGER DEFAULT 0")
     cur.execute("""CREATE TABLE IF NOT EXISTS tts_settings (guild_id INTEGER PRIMARY KEY,lang TEXT DEFAULT 'ko',voice_profile TEXT DEFAULT 'yeonhong',voice_name TEXT,rate TEXT DEFAULT '+0%',pitch TEXT DEFAULT '+0Hz',updated_at TEXT)""")
     for col, default in {"voice_profile":"TEXT DEFAULT 'yeonhong'","voice_name":"TEXT","rate":"TEXT DEFAULT '+0%'","pitch":"TEXT DEFAULT '+0Hz'"}.items():
         ensure_column(cur, "tts_settings", col, default)
@@ -397,15 +529,92 @@ def dashboard(guild_id):
     security_logs = con.execute("SELECT * FROM security_logs WHERE guild_id=? ORDER BY log_id DESC LIMIT 15", (guild_id,)).fetchall()
     stock_logs = con.execute("SELECT * FROM stock_logs WHERE guild_id=? ORDER BY created_at DESC LIMIT 15", (guild_id,)).fetchall()
     con.close()
-    return render_template("dashboard.html", guild_id=guild_id, guild=guild, welcome=dict(welcome) if welcome else WELCOME_DEFAULT, security=dict(security), security_fields=SECURITY_FIELDS, security_labels=SECURITY_LABELS, embeds=embeds, embed_types=EMBED_TYPES, channels=channels, text_channels=text_channels(channels), guild_settings=dict(guild_settings) if guild_settings else {}, tts=dict(tts) if tts else {"lang":"ko"}, tts_langs=TTS_LANGS, recruit=recruit, recruit_items=RECRUIT_ITEMS, stocks=stocks, events=events, filter_words=filter_words, bad_users=bad_users, top_points=top_points, coupons=coupons, mission_settings=dict(mission_settings), mission_today=dict(mission_today) if mission_today else {}, title_shop=title_shop, custom_achievements=custom_achievements, devlog=dict(devlog) if devlog else {}, support=dict(support) if support else {"support_invite": SUPPORT_SERVER_INVITE, "dashboard_url": PUBLIC_DASHBOARD_URL}, clean=dict(clean) if clean else {"max_delete":0,"batch_size":100,"delay_seconds":1.0,"log_enabled":1}, security_logs=security_logs, stock_logs=stock_logs)
+    return render_template("dashboard.html", guild_id=guild_id, guild=guild, welcome=dict(welcome) if welcome else WELCOME_DEFAULT, security=dict(security), security_fields=SECURITY_FIELDS, security_labels=SECURITY_LABELS, embeds=embeds, embed_types=EMBED_TYPES, channels=channels, text_channels=text_channels(channels), guild_settings=dict(guild_settings) if guild_settings else {}, tts=dict(tts) if tts else {"lang":"ko"}, tts_langs=TTS_LANGS, recruit=recruit, recruit_items=RECRUIT_ITEMS, stocks=stocks, events=events, filter_words=filter_words, bad_users=bad_users, top_points=top_points, coupons=coupons, mission_settings=dict(mission_settings), mission_today=dict(mission_today) if mission_today else {}, title_shop=title_shop, custom_achievements=custom_achievements, devlog=dict(devlog) if devlog else {}, support=dict(support) if support else {"support_invite": SUPPORT_SERVER_INVITE, "dashboard_url": PUBLIC_DASHBOARD_URL}, clean=dict(clean) if clean else {"max_delete":0,"batch_size":100,"delay_seconds":1.0,"log_enabled":1}, security_logs=security_logs, stock_logs=stock_logs, channel_setting_groups=CHANNEL_SETTING_GROUPS)
+
+CHANNEL_SETTINGS_PAGE_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<h1>📦 전체 서버 채널 연결</h1>
+<p>이 페이지는 <b>guild_settings</b> 테이블에 모든 기능 채널을 저장합니다.</p>
+<p><a href="{{ url_for('dashboard', guild_id=guild_id) }}#guild-settings">← 대시보드로 돌아가기</a></p>
+
+<form method="post" action="{{ url_for('save_guild_settings', guild_id=guild_id) }}">
+  {% for group in channel_setting_groups %}
+  <section class="card" style="margin:18px 0;padding:18px;border:1px solid rgba(255,255,255,.12);border-radius:16px;">
+    <h2>{{ group.name }}</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
+      {% for f in group.fields %}
+      <label style="display:block;">
+        <div style="font-weight:700;margin-bottom:6px;">{{ f.label }}</div>
+        <select name="{{ f.key }}" style="width:100%;padding:10px;border-radius:10px;">
+          <option value="0">미설정</option>
+          {% for c in channels %}
+            {% if c.type == f.type %}
+              <option value="{{ c.id }}" {% if (guild_settings.get(f.key, 0)|string) == (c.id|string) %}selected{% endif %}>
+                {% if c.type == 4 %}📁{% elif c.type == 2 %}🔊{% else %}#{% endif %} {{ c.name }}
+              </option>
+            {% endif %}
+          {% endfor %}
+        </select>
+        <small>{{ f.hint }} · DB: {{ f.key }}</small>
+      </label>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <button type="submit" style="padding:12px 18px;border-radius:12px;font-weight:800;">✅ 전체 채널 설정 저장</button>
+</form>
+{% endblock %}
+"""
+
+@app.route("/dashboard/<guild_id>/channels")
+@login_required
+def channel_settings_page(guild_id):
+    if not require_admin_guild(guild_id):
+        flash("이 서버를 설정할 관리자 권한이 없어요.")
+        return redirect(url_for("servers"))
+    channels = fetch_channels(guild_id)
+    con = db()
+    row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    con.close()
+    return render_template_string(
+        CHANNEL_SETTINGS_PAGE_TEMPLATE,
+        guild_id=guild_id,
+        channels=channels,
+        guild_settings=dict(row) if row else {},
+        channel_setting_groups=CHANNEL_SETTING_GROUPS,
+    )
 
 @app.route("/dashboard/<guild_id>/guild_settings", methods=["POST"])
 @login_required
 def save_guild_settings(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
+    if not require_admin_guild(guild_id):
+        return redirect(url_for("servers"))
+
+    submitted_fields = [field for field in CHANNEL_SETTING_FIELD_NAMES if field in request.form]
+
+    # 예전 dashboard.html에서 5개만 보내도 호환되고,
+    # 새 전체 채널 연결 페이지에서는 모든 기능 채널을 한 번에 저장합니다.
+    if not submitted_fields:
+        submitted_fields = ["welcome_channel_id", "goodbye_channel_id", "rule_channel_id", "game_role_channel_id", "log_channel_id"]
+
     con = db()
-    con.execute("""INSERT OR REPLACE INTO guild_settings(guild_id,welcome_channel_id,goodbye_channel_id,rule_channel_id,game_role_channel_id,log_channel_id,updated_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))""", (guild_id, as_int(request.form.get("welcome_channel_id")), as_int(request.form.get("goodbye_channel_id")), as_int(request.form.get("rule_channel_id")), as_int(request.form.get("game_role_channel_id")), as_int(request.form.get("log_channel_id"))))
-    con.commit(); con.close(); flash("서버 채널 설정을 저장했어요.")
+    con.execute(
+        "INSERT OR IGNORE INTO guild_settings(guild_id, updated_at) VALUES (?, datetime('now','localtime'))",
+        (guild_id,)
+    )
+
+    for field in submitted_fields:
+        if field not in CHANNEL_SETTING_FIELD_NAMES:
+            continue
+        con.execute(
+            f"UPDATE guild_settings SET {field}=?, updated_at=datetime('now','localtime') WHERE guild_id=?",
+            (as_int(request.form.get(field)), guild_id),
+        )
+
+    con.commit()
+    con.close()
+    flash(f"서버 채널 설정 {len(submitted_fields)}개를 저장했어요.")
     return redirect(url_for("dashboard", guild_id=guild_id)+"#guild-settings")
 
 @app.route("/dashboard/<guild_id>/welcome", methods=["POST"])
@@ -757,6 +966,22 @@ def api_guild_overview(guild_id):
     }
     con.close()
     return jsonify(data)
+
+
+@app.route("/api/guild/<guild_id>/channel-settings")
+@login_required
+def api_channel_settings(guild_id):
+    if not require_admin_guild(guild_id):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    con = db()
+    row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    con.close()
+    return jsonify({
+        "ok": True,
+        "guild_id": str(guild_id),
+        "settings": dict(row) if row else {},
+        "fields": CHANNEL_SETTING_GROUPS,
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
