@@ -16,6 +16,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "http://127.0.0.1:5000/callback")
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "database.db")
+DASHBOARD_SYNC_TOKEN = os.getenv("DASHBOARD_SYNC_TOKEN", "").strip()
 
 DISCORD_API = "https://discord.com/api/v10"
 OAUTH_SCOPE = "identify guilds"
@@ -982,6 +983,76 @@ def api_channel_settings(guild_id):
         "settings": dict(row) if row else {},
         "fields": CHANNEL_SETTING_GROUPS,
     })
+
+
+# =========================
+# 봇 자동 동기화 API
+# =========================
+# bot.py가 웹 대시보드의 DB 설정을 자동으로 읽어갈 수 있게 하는 전용 API입니다.
+# DASHBOARD_SYNC_TOKEN 환경변수를 설정하면 같은 토큰을 가진 봇만 접근할 수 있습니다.
+def _bot_sync_allowed():
+    if not DASHBOARD_SYNC_TOKEN:
+        return True
+    token = request.headers.get("X-Dashboard-Sync-Token", "") or request.args.get("token", "")
+    return token == DASHBOARD_SYNC_TOKEN
+
+
+def _row_to_dict(row):
+    return dict(row) if row else {}
+
+
+def _fetch_one(con, table, guild_id):
+    try:
+        row = con.execute(f"SELECT * FROM {table} WHERE guild_id=?", (guild_id,)).fetchone()
+        return _row_to_dict(row)
+    except sqlite3.Error:
+        return {}
+
+
+def _fetch_many(con, table, guild_id, order_by=None, limit=None):
+    try:
+        sql = f"SELECT * FROM {table} WHERE guild_id=?"
+        if order_by:
+            sql += f" ORDER BY {order_by}"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return [dict(r) for r in con.execute(sql, (guild_id,)).fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+@app.route("/api/bot-sync/<guild_id>")
+def api_bot_sync(guild_id):
+    if not _bot_sync_allowed():
+        return jsonify({"ok": False, "error": "invalid sync token"}), 403
+
+    con = db()
+    data = {
+        "ok": True,
+        "guild_id": str(guild_id),
+        "channel_setting_fields": CHANNEL_SETTING_FIELD_NAMES,
+        "guild_settings": _fetch_one(con, "guild_settings", guild_id),
+        "welcome_embed": _fetch_one(con, "welcome_embeds", guild_id),
+        "security_settings": _fetch_one(con, "security_settings", guild_id),
+        "tts_settings": _fetch_one(con, "tts_settings", guild_id),
+        "daily_mission_settings": _fetch_one(con, "daily_mission_settings", guild_id),
+        "devlog_settings": _fetch_one(con, "devlog_settings", guild_id),
+        "support_settings": _fetch_one(con, "support_settings", guild_id),
+        "clean_settings": _fetch_one(con, "clean_settings", guild_id),
+        "auto_embeds": _fetch_many(con, "auto_embeds", guild_id, "embed_type"),
+        "recruit_embeds": _fetch_many(con, "recruit_embeds", guild_id, "recruit_key"),
+        "custom_filter_words": _fetch_many(con, "custom_filter_words", guild_id, "word"),
+        "malicious_users": _fetch_many(con, "malicious_users", guild_id, "added_at DESC", 500),
+        "stock_prices": _fetch_many(con, "stock_prices", guild_id, "stock_code"),
+        "scheduled_events": _fetch_many(con, "scheduled_events", guild_id, "event_time DESC", 200),
+        "coupon_codes": _fetch_many(con, "coupon_codes", guild_id, "created_at DESC", 500),
+        "title_shop": _fetch_many(con, "title_shop", guild_id, "title_name"),
+        "user_titles": _fetch_many(con, "user_titles", guild_id, "user_id", 1000),
+        "custom_achievements": _fetch_many(con, "custom_achievements", guild_id, "achievement_key"),
+    }
+    con.close()
+    return jsonify(data)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
