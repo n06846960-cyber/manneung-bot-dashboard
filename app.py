@@ -1,295 +1,520 @@
-
 import os
+import re
+import datetime
 import sqlite3
-import requests
-from functools import wraps
-from flask import Flask, redirect, request, session, render_template, render_template_string, url_for, flash, jsonify
-from dotenv import load_dotenv
+import random
+import shutil
+import tempfile
+import asyncio
+import html
+import json
+import urllib.request
+from collections import deque
 
-load_dotenv()
+import yt_dlp
 
-app = Flask(__name__)
-app.secret_key = os.getenv("WEB_SECRET_KEY", "change-this-secret")
+try:
+    from gtts import gTTS
+except ImportError:
+    gTTS = None
 
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
-DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "http://127.0.0.1:5000/callback")
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "database.db")
-DASHBOARD_SYNC_TOKEN = os.getenv("DASHBOARD_SYNC_TOKEN", "").strip()
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
 
-DISCORD_API = "https://discord.com/api/v10"
-OAUTH_SCOPE = "identify guilds"
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
-EMBED_TYPES = {
-    "rules": "📌 규칙 임베드",
-    "intro": "💬 자기소개 임베드",
-    "verify": "✅ 인증 패널",
-    "ticket": "🎟️ 티켓 패널",
-    "shop": "🛒 상점 안내",
-    "point": "💰 포인트 안내",
-    "level": "📈 레벨 안내",
-    "enhance": "⚒️ 강화 안내",
-    "stock": "📈 주식 안내",
-    "event": "🎉 이벤트 안내",
-    "coupon": "🎟️ 쿠폰 안내",
-    "mission": "🎯 일일미션 안내",
-    "title": "🏷️ 칭호 패널",
-    "achievement": "🏆 업적 패널",
-    "music": "🎵 음악 안내",
-    "tts": "🔊 TTS 안내",
-    "dev_update": "🚀 업데이트 알림",
-    "dev_patch": "📝 패치노트",
-    "bot_status": "📊 봇상태 안내",
-    "dev_diary": "📅 개발일지",
-    "support_welcome": "💬 지원 서버 환영",
-    "clean": "🧹 청소 안내",
-}
-RECRUIT_ITEMS = {
-    "benefit": "📜 관리자 혜택 안내",
-    "planning": "🎁 기획팀 모집",
-    "newbie": "🐣 뉴관팀 모집",
-    "guide": "📢 안내팀 모집",
-    "promotion": "💌 홍보팀 모집",
-    "security": "🛡️ 보안팀 모집",
-    "scrim": "🎮 내전팀 모집",
-    "admin": "📚 행정팀 모집",
-    "design": "🎨 디자인팀 모집",
-    "move": "🚪 이동권한 안내",
-    "fixed": "💎 고정멤버 안내",
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+# =========================
+# 기본 설정
+# =========================
+# 토큰 설정
+# 방법 1) Render/환경변수: DISCORD_TOKEN 에 토큰 넣기
+# 방법 2) 기존 Render 키를 쓰고 있다면 DISCORD_BOT_TOKEN 도 자동으로 읽습니다.
+# 방법 3) 로컬 실행: 아래 DIRECT_BOT_TOKEN 따옴표 안에 새 토큰 붙여넣기
+# 주의: 토큰은 절대 다른 사람에게 보내지 마세요.
+DIRECT_BOT_TOKEN = ""
+TOKEN = (
+    os.getenv("DISCORD_TOKEN", "").strip()
+    or os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    or DIRECT_BOT_TOKEN.strip()
+)
+
+# 봇 소유자 Discord ID를 환경변수로 등록하세요. 예: set BOT_OWNER_IDS=305132904651030528
+BOT_OWNER_IDS = {
+    int(x.strip())
+    for x in os.getenv("BOT_OWNER_IDS", "").split(",")
+    if x.strip().isdigit()
 }
 
-DEFAULT_AUTO_EMBEDS = {
-    "rules": {"title":"📌 만능 봇 서버 규칙","description":"{server} 서버 규칙을 확인해주세요.\n서로 존중하고 즐겁게 활동해주세요!","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 | 친목 서버 관리 봇"},
-    "intro": {"title":"💬 자기소개 안내","description":"닉네임 / 나이대 / 좋아하는 게임을 편하게 적어주세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 | 친목 서버 관리 봇"},
-    "verify": {"title":"✅ 만능 봇 인증 패널","description":"아래 버튼을 눌러 인증을 완료해주세요.\n인증 후 미인증 역할이 제거되고 뉴페이스 역할이 지급됩니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 | 친목 서버 관리 봇"},
-    "ticket": {"title":"🎟️ 문의 티켓","description":"문의가 필요하면 티켓을 열어주세요. 운영진이 확인해드려요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 티켓 시스템"},
-    "shop": {"title":"🛒 만능 봇 통합 상점","description":"포인트로 아이템을 구매할 수 있어요. `/통합상점`을 사용해보세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 경제 시스템"},
-    "point": {"title":"💰 포인트 안내","description":"출석, 이벤트, 활동으로 포인트를 모아보세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 포인트 시스템"},
-    "level": {"title":"📈 레벨 안내","description":"채팅/음성 활동으로 경험치를 얻고 랭킹에 도전해보세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 레벨 시스템"},
-    "enhance": {"title":"⚒️ 강화 안내","description":"아이템을 강화하고 최고 단계에 도전해보세요. 보호권과 확률업권을 활용할 수 있어요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 강화 시스템"},
-    "stock": {"title":"📈 가상 주식 안내","description":"포인트로 서버 전용 가상 주식을 사고팔 수 있어요. 실제 투자가 아닌 서버 게임용입니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 주식 시스템"},
-    "event": {"title":"🎉 이벤트 안내","description":"예약 이벤트, 개인/팀 보상, 승리팀/패배팀 보상을 관리할 수 있어요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 이벤트 시스템"},
-    "coupon": {"title":"🎟️ 쿠폰 안내","description":"쿠폰 코드를 입력하면 포인트나 아이템 보상을 받을 수 있어요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 쿠폰 시스템"},
-    "mission": {"title":"🎯 일일미션 안내","description":"채팅과 출석 미션을 완료하고 매일 보상을 받아보세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 일일미션"},
-    "title": {"title":"🏷️ 칭호 시스템","description":"포인트로 칭호를 구매하고 대표 칭호를 프로필에 표시할 수 있어요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 칭호 시스템"},
-    "achievement": {"title":"🏆 업적 시스템","description":"출석, 포인트, 활동 업적을 달성하고 보상을 받아보세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 업적 시스템"},
-    "music": {"title":"🎵 음악 안내","description":"음악 명령어와 재생목록을 관리하는 공간입니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 음악 시스템"},
-    "tts": {"title":"🔊 TTS 안내","description":"TTS 채널에 메시지를 입력하면 음성으로 읽어줘요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 TTS 시스템"},
-    "dev_update": {"title":"🚀 만능 봇 업데이트","description":"새로운 기능과 개선사항을 알려드립니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 개발로그"},
-    "dev_patch": {"title":"📝 패치노트","description":"수정된 버그와 변경된 기능을 확인하세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 패치노트"},
-    "bot_status": {"title":"📊 봇 상태","description":"만능 봇의 현재 상태와 안내를 확인할 수 있습니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 상태 안내"},
-    "dev_diary": {"title":"📅 개발일지","description":"만능 봇 개발 진행 상황과 예정 기능을 공유합니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 개발일지"},
-    "support_welcome": {"title":"🎉 만능 봇 공식 지원 서버에 오신 것을 환영합니다!","description":"오류 문의, 업데이트 소식, 패치노트, 기능 건의를 이곳에서 확인할 수 있습니다.\n궁금한 점이 있으면 티켓을 열어주세요.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 공식 지원센터"},
-    "clean": {"title":"🧹 청소 명령어 안내","description":"관리자는 `/청소 개수`로 메시지를 삭제할 수 있어요. 많은 개수도 내부적으로 나눠서 처리됩니다.","color":"FFB6C1","image_url":"","footer":"⭐ 만능 봇 관리 시스템"},
-}
-WELCOME_DEFAULT = {
-    "title": "🌸 {username}님, {server}에 오신 걸 환영해요!",
-    "description": "{user}님이 **{member_count}번째 가족**으로 입장했어요.\n규칙을 확인하고 즐겁게 활동해주세요!",
-    "color": "FFB6C1",
-    "image_url": "",
-    "footer": "⭐ 만능 봇 | 친목 서버 관리 봇",
-}
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.voice_states = True
 
-TTS_LANGS = {"ko":"한국어", "en":"영어", "ja":"일본어"}
+bot = commands.Bot(command_prefix=commands.when_mentioned_or(".", "!"), intents=intents)
+
+# =========================
+# 서버 ID 설정
+# =========================
+# 다른 서버에서도 바로 사용할 수 있도록 ID 기본값은 0으로 둡니다.
+# /친목섭 명령어를 실행하면 각 서버에 맞는 채널/역할을 자동 생성하고,
+# 이벤트들은 ID가 없을 때 채널명/역할명으로 자동 탐색합니다.
+
+TICKET_CATEGORY_ID = 0
+TICKET_LOG_CHANNEL_ID = 0
+STAFF_ROLE_ID = 0
+
+WELCOME_CHANNEL_ID = 0
+GOODBYE_CHANNEL_ID = 0
+LOG_CHANNEL_ID = 0
+
+WELCOME_ROLE_ID = 0
+NEWFACE_ROLE_ID = 0
+ADAPT_ROLE_ID = 0
+REPORT_ROLE_ID = 0
+SCRIM_ROLE_ID = 0
+GAME_ROLE_CHANNEL_ID = 0
+RULE_CHANNEL_ID = 0
+
+BOT_COLOR = 0xFFB6C1
+EXP_COOLDOWN = 60
+SPAM_LIMIT = 5
+SPAM_TIME = 7
+
+exp_cooldowns = {}
+spam_tracker = {}
+voice_join_times = {}
+VOICE_EXP_PER_MINUTE = 5
+INVITE_CACHE = {}
+ENHANCE_COOLDOWNS = {}
+ENHANCE_COOLDOWN_SECONDS = 60
+
+# =========================
+# 데이터베이스
+# =========================
+
+conn = sqlite3.connect("database.db")
+c = conn.cursor()
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS warnings (
+    user_id INTEGER,
+    moderator_id INTEGER,
+    reason TEXT,
+    time TEXT
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    guild_id INTEGER DEFAULT 0,
+    user_id INTEGER,
+    point INTEGER DEFAULT 0,
+    attendance_count INTEGER DEFAULT 0,
+    streak INTEGER DEFAULT 0,
+    last_attendance TEXT,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS inventory (
+    user_id INTEGER,
+    item_name TEXT,
+    amount INTEGER DEFAULT 1
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS daily_rewards (
+    guild_id INTEGER DEFAULT 0,
+    user_id INTEGER,
+    last_reward TEXT,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS levels (
+    user_id INTEGER PRIMARY KEY,
+    exp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS voice_levels (
+    user_id INTEGER PRIMARY KEY,
+    exp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1,
+    total_seconds INTEGER DEFAULT 0
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS bot_authorized_users (
+    user_id INTEGER PRIMARY KEY,
+    added_by INTEGER,
+    added_at TEXT
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS default_roles (
+    guild_id INTEGER,
+    role_id INTEGER,
+    added_by INTEGER,
+    added_at TEXT,
+    PRIMARY KEY (guild_id, role_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id INTEGER PRIMARY KEY,
+    welcome_channel_id INTEGER DEFAULT 0,
+    goodbye_channel_id INTEGER DEFAULT 0,
+    rule_channel_id INTEGER DEFAULT 0,
+    game_role_channel_id INTEGER DEFAULT 0,
+    log_channel_id INTEGER DEFAULT 0,
+    updated_at TEXT
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS welcome_embeds (
+    guild_id INTEGER PRIMARY KEY,
+    title TEXT,
+    description TEXT,
+    color TEXT,
+    image_url TEXT,
+    footer TEXT,
+    updated_at TEXT
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS auto_embeds (
+    guild_id INTEGER,
+    embed_type TEXT,
+    title TEXT,
+    description TEXT,
+    color TEXT,
+    image_url TEXT,
+    footer TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, embed_type)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS tts_settings (
+    guild_id INTEGER PRIMARY KEY,
+    lang TEXT DEFAULT 'ko',
+    updated_at TEXT
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS enhance_items (
+    guild_id INTEGER DEFAULT 0,
+    user_id INTEGER,
+    item_name TEXT,
+    level INTEGER DEFAULT 0,
+    success_count INTEGER DEFAULT 0,
+    fail_count INTEGER DEFAULT 0,
+    down_count INTEGER DEFAULT 0,
+    destroy_count INTEGER DEFAULT 0,
+    total_attempts INTEGER DEFAULT 0,
+    best_level INTEGER DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, user_id, item_name)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS enhance_boosts (
+    guild_id INTEGER,
+    role_id INTEGER,
+    success_bonus INTEGER DEFAULT 0,
+    destroy_reduction INTEGER DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, role_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS invite_stats (
+    guild_id INTEGER,
+    inviter_id INTEGER,
+    invite_count INTEGER DEFAULT 0,
+    fake_count INTEGER DEFAULT 0,
+    leave_count INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, inviter_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS invite_joins (
+    guild_id INTEGER,
+    member_id INTEGER,
+    inviter_id INTEGER,
+    invite_code TEXT,
+    joined_at TEXT,
+    left_at TEXT,
+    PRIMARY KEY (guild_id, member_id)
+)
+""")
+conn.commit()
+
+# 기존 database.db가 예전 구조(user_id만 저장)로 되어 있어도
+# 서버별 포인트/출석 기록을 저장할 수 있게 자동 변환합니다.
+def migrate_guild_economy_tables():
+    c.execute("PRAGMA table_info(users)")
+    user_columns = [row[1] for row in c.fetchall()]
+    if "guild_id" not in user_columns:
+        c.execute("ALTER TABLE users RENAME TO users_old")
+        c.execute("""
+        CREATE TABLE users (
+            guild_id INTEGER DEFAULT 0,
+            user_id INTEGER,
+            point INTEGER DEFAULT 0,
+            attendance_count INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            last_attendance TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """)
+        c.execute("""
+        INSERT OR IGNORE INTO users(guild_id, user_id, point, attendance_count, streak, last_attendance)
+        SELECT 0, user_id, point, attendance_count, streak, last_attendance FROM users_old
+        """)
+        c.execute("DROP TABLE users_old")
+
+    c.execute("PRAGMA table_info(daily_rewards)")
+    reward_columns = [row[1] for row in c.fetchall()]
+    if "guild_id" not in reward_columns:
+        c.execute("ALTER TABLE daily_rewards RENAME TO daily_rewards_old")
+        c.execute("""
+        CREATE TABLE daily_rewards (
+            guild_id INTEGER DEFAULT 0,
+            user_id INTEGER,
+            last_reward TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """)
+        c.execute("""
+        INSERT OR IGNORE INTO daily_rewards(guild_id, user_id, last_reward)
+        SELECT 0, user_id, last_reward FROM daily_rewards_old
+        """)
+        c.execute("DROP TABLE daily_rewards_old")
+    conn.commit()
+
+
+migrate_guild_economy_tables()
+
+# 상점 아이템 효과 저장용 테이블
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_effects (
+    user_id INTEGER,
+    effect_name TEXT,
+    amount INTEGER DEFAULT 0,
+    expires_at TEXT,
+    PRIMARY KEY (user_id, effect_name)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS profile_customs (
+    user_id INTEGER PRIMARY KEY,
+    title TEXT,
+    description TEXT,
+    color TEXT,
+    image_url TEXT,
+    updated_at TEXT
+)
+""")
+
+# =========================
+# 가상 주식 시스템 DB
+# =========================
+# 포인트로 사고파는 서버별 가상 주식입니다. 실제 주식/투자가 아니라 서버 게임용입니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS stock_prices (
+    guild_id INTEGER,
+    stock_code TEXT,
+    stock_name TEXT,
+    price INTEGER DEFAULT 1000,
+    last_price INTEGER DEFAULT 1000,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, stock_code)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS stock_holdings (
+    guild_id INTEGER,
+    user_id INTEGER,
+    stock_code TEXT,
+    amount INTEGER DEFAULT 0,
+    avg_price INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id, stock_code)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS stock_logs (
+    guild_id INTEGER,
+    user_id INTEGER,
+    stock_code TEXT,
+    action TEXT,
+    amount INTEGER,
+    price INTEGER,
+    total INTEGER,
+    created_at TEXT
+)
+""")
+conn.commit()
 
 
 # =========================
-# 서버 채널 연결 전체 설정
+# 예약 이벤트 시스템 DB
 # =========================
-# /서버추가가 쓰던 guild_settings 테이블을 확장해서
-# 봇의 주요 기능 채널/카테고리/음성방까지 웹에서 연결할 수 있게 합니다.
-# type: 0=text, 2=voice, 4=category
-CHANNEL_SETTING_GROUPS = [
-    {
-        "name": "📌 기본 / 입퇴장 / 인증",
-        "fields": [
-            {"key": "welcome_channel_id", "label": "👋 환영 채널", "type": 0, "hint": "입장 환영 메시지"},
-            {"key": "goodbye_channel_id", "label": "👋 퇴장 채널", "type": 0, "hint": "퇴장 메시지"},
-            {"key": "rule_channel_id", "label": "📌 규칙 채널", "type": 0, "hint": "규칙/필독 안내"},
-            {"key": "intro_channel_id", "label": "💬 자기소개 채널", "type": 0, "hint": "자기소개 안내"},
-            {"key": "verify_channel_id", "label": "✅ 인증 채널", "type": 0, "hint": "인증 패널"},
-            {"key": "role_select_channel_id", "label": "🎭 역할선택 채널", "type": 0, "hint": "프로필/크리에이터/게임 역할"},
-            {"key": "game_role_channel_id", "label": "🎮 게임역할 채널", "type": 0, "hint": "게임 역할 선택"},
-            {"key": "notice_channel_id", "label": "📢 공지 채널", "type": 0, "hint": "중요 공지"},
-        ],
-    },
-    {
-        "name": "📁 로그 채널",
-        "fields": [
-            {"key": "log_channel_id", "label": "📋 대표 로그 채널", "type": 0, "hint": "기본 로그"},
-            {"key": "general_log_channel_id", "label": "📋 일반로그", "type": 0, "hint": "일반 기록"},
-            {"key": "warning_log_channel_id", "label": "⚠️ 경고로그", "type": 0, "hint": "경고/도배"},
-            {"key": "punishment_log_channel_id", "label": "⛔ 처벌로그", "type": 0, "hint": "킥/밴/타임아웃"},
-            {"key": "chat_log_channel_id", "label": "💬 채팅로그", "type": 0, "hint": "메시지 삭제/수정"},
-            {"key": "voice_log_channel_id", "label": "🔊 음성로그", "type": 0, "hint": "입장/퇴장"},
-            {"key": "nickname_log_channel_id", "label": "👤 닉네임로그", "type": 0, "hint": "닉네임 변경"},
-            {"key": "level_log_channel_id", "label": "📈 레벨로그", "type": 0, "hint": "레벨업 알림"},
-            {"key": "security_log_channel_id", "label": "🛡️ 보안로그", "type": 0, "hint": "보안패널 감지 기록"},
-            {"key": "clean_log_channel_id", "label": "🧹 청소로그", "type": 0, "hint": "청소 명령어 기록"},
-        ],
-    },
-    {
-        "name": "💰 경제 / 상점 / 성장",
-        "fields": [
-            {"key": "shop_channel_id", "label": "🛒 상점 채널", "type": 0, "hint": "통합상점"},
-            {"key": "point_channel_id", "label": "💰 포인트 채널", "type": 0, "hint": "잔액/송금"},
-            {"key": "stock_channel_id", "label": "📈 주식 채널", "type": 0, "hint": "가상 주식"},
-            {"key": "attendance_channel_id", "label": "📅 출석 채널", "type": 0, "hint": "출석체크"},
-            {"key": "attendance_reward_channel_id", "label": "🎁 출석보상 채널", "type": 0, "hint": "출석 보상"},
-            {"key": "level_channel_id", "label": "📈 레벨 채널", "type": 0, "hint": "랭크/레벨 안내"},
-            {"key": "enhance_channel_id", "label": "⚒️ 강화 채널", "type": 0, "hint": "강화 시스템"},
-            {"key": "coupon_channel_id", "label": "🎟️ 쿠폰 채널", "type": 0, "hint": "쿠폰 사용/안내"},
-            {"key": "mission_channel_id", "label": "🎯 일일미션 채널", "type": 0, "hint": "미션/보상"},
-            {"key": "title_channel_id", "label": "🏷️ 칭호 채널", "type": 0, "hint": "칭호 패널"},
-            {"key": "achievement_channel_id", "label": "🏆 업적 채널", "type": 0, "hint": "업적/보상"},
-        ],
-    },
-    {
-        "name": "🎟️ 티켓 / 관리자 / 이벤트",
-        "fields": [
-            {"key": "ticket_channel_id", "label": "🎟️ 티켓 채널", "type": 0, "hint": "문의/신고/티켓 패널"},
-            {"key": "ticket_log_channel_id", "label": "📁 티켓로그 채널", "type": 0, "hint": "티켓 닫기 기록"},
-            {"key": "report_channel_id", "label": "🚨 신고 채널", "type": 0, "hint": "신고 접수"},
-            {"key": "admin_panel_channel_id", "label": "🛠️ 관리자패널 채널", "type": 0, "hint": "관리 버튼/패널"},
-            {"key": "bot_command_channel_id", "label": "🤖 봇명령어 채널", "type": 0, "hint": "명령어 전용"},
-            {"key": "event_channel_id", "label": "🎉 이벤트 채널", "type": 0, "hint": "예약 이벤트 발송"},
-            {"key": "event_list_channel_id", "label": "📋 이벤트목록 채널", "type": 0, "hint": "이벤트 목록"},
-            {"key": "vote_channel_id", "label": "🗳️ 투표 채널", "type": 0, "hint": "투표 패널"},
-            {"key": "giveaway_channel_id", "label": "🎁 추첨 채널", "type": 0, "hint": "추첨/랜덤박스"},
-        ],
-    },
-    {
-        "name": "🎵 음악 / 🔊 TTS",
-        "fields": [
-            {"key": "music_command_channel_id", "label": "🎵 음악명령어 채널", "type": 0, "hint": "재생/스킵/대기열"},
-            {"key": "music_now_playing_channel_id", "label": "🎶 현재재생 채널", "type": 0, "hint": "현재 재생곡"},
-            {"key": "music_queue_channel_id", "label": "📜 재생목록 채널", "type": 0, "hint": "대기열"},
-            {"key": "tts_text_channel_id", "label": "🔊 TTS 텍스트 채널", "type": 0, "hint": "채팅을 음성으로 읽기"},
-            {"key": "music_voice_channel_id", "label": "🔊 음악 음성채널", "type": 2, "hint": "음악 감상 음성방"},
-            {"key": "tts_voice_channel_id", "label": "🔊 TTS 음성채널", "type": 2, "hint": "TTS 통방"},
-        ],
-    },
-    {
-        "name": "🌸 구인구직 / 면접",
-        "fields": [
-            {"key": "recruit_benefit_channel_id", "label": "📜 혜택안내", "type": 0, "hint": "관리자 혜택"},
-            {"key": "recruit_planning_channel_id", "label": "🎁 기획팀지원", "type": 0, "hint": "기획팀"},
-            {"key": "recruit_newbie_channel_id", "label": "🐣 뉴관팀지원", "type": 0, "hint": "뉴관팀"},
-            {"key": "recruit_guide_channel_id", "label": "📢 안내팀지원", "type": 0, "hint": "안내팀"},
-            {"key": "recruit_promotion_channel_id", "label": "💌 홍보팀지원", "type": 0, "hint": "홍보팀"},
-            {"key": "recruit_security_channel_id", "label": "🛡️ 보안팀지원", "type": 0, "hint": "보안팀"},
-            {"key": "recruit_scrim_channel_id", "label": "🎮 내전팀지원", "type": 0, "hint": "내전팀"},
-            {"key": "recruit_admin_channel_id", "label": "📚 행정팀지원", "type": 0, "hint": "행정팀"},
-            {"key": "recruit_design_channel_id", "label": "🎨 디자인팀지원", "type": 0, "hint": "디자인팀"},
-            {"key": "recruit_fixed_channel_id", "label": "💎 고정멤버", "type": 0, "hint": "고정멤버"},
-            {"key": "interview_waiting_voice_id", "label": "🔎 면접대기실", "type": 2, "hint": "면접 대기 음성방"},
-            {"key": "interview_room_1_voice_id", "label": "🎤 면접실 1", "type": 2, "hint": "면접 음성방"},
-            {"key": "interview_room_2_voice_id", "label": "🎤 면접실 2", "type": 2, "hint": "면접 음성방"},
-        ],
-    },
-    {
-        "name": "📈 개발로그 / 지원 서버",
-        "fields": [
-            {"key": "dev_update_channel_id", "label": "🚀 업데이트", "type": 0, "hint": "업데이트 알림"},
-            {"key": "dev_patch_channel_id", "label": "📝 패치노트", "type": 0, "hint": "패치노트"},
-            {"key": "dev_status_channel_id", "label": "📊 봇상태", "type": 0, "hint": "봇 상태"},
-            {"key": "dev_diary_channel_id", "label": "📅 개발일지", "type": 0, "hint": "개발 기록"},
-            {"key": "support_welcome_channel_id", "label": "💬 지원서버 환영", "type": 0, "hint": "공식 지원 서버 환영"},
-            {"key": "support_notice_channel_id", "label": "📢 지원서버 공지", "type": 0, "hint": "지원 서버 공지"},
-        ],
-    },
-    {
-        "name": "📦 카테고리 연결",
-        "fields": [
-            {"key": "rule_category_id", "label": "📌 필독 카테고리", "type": 4, "hint": "규칙/인증/역할선택"},
-            {"key": "welcome_category_id", "label": "👋 인사퇴장 카테고리", "type": 4, "hint": "입퇴장"},
-            {"key": "log_category_id", "label": "📁 로그 카테고리", "type": 4, "hint": "서버 로그"},
-            {"key": "shop_category_id", "label": "🛒 상점 카테고리", "type": 4, "hint": "경제/상점/주식"},
-            {"key": "bot_command_category_id", "label": "🤖 봇명령어 카테고리", "type": 4, "hint": "명령어/출석/레벨"},
-            {"key": "music_category_id", "label": "🎵 뮤직 카테고리", "type": 4, "hint": "음악"},
-            {"key": "tts_category_id", "label": "🔊 TTS 카테고리", "type": 4, "hint": "TTS"},
-            {"key": "recruit_category_id", "label": "🌸 구인구직 카테고리", "type": 4, "hint": "지원 채널"},
-            {"key": "event_category_id", "label": "🎉 이벤트 카테고리", "type": 4, "hint": "이벤트"},
-            {"key": "devlog_category_id", "label": "📈 개발로그 카테고리", "type": 4, "hint": "업데이트/패치노트"},
-            {"key": "server_stats_category_id", "label": "📊 서버스텟 카테고리", "type": 4, "hint": "서버 통계"},
-            {"key": "temp_voice_category_id", "label": "😴 잠수방 카테고리", "type": 4, "hint": "자동 음성방"},
-            {"key": "enhance_category_id", "label": "⚒️ 강화 카테고리", "type": 4, "hint": "강화방"},
-        ],
-    },
-]
+c.execute("""
+CREATE TABLE IF NOT EXISTS scheduled_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    channel_id INTEGER,
+    creator_id INTEGER,
+    title TEXT,
+    description TEXT,
+    event_time TEXT,
+    reward_point INTEGER DEFAULT 0,
+    reward_1 TEXT,
+    reward_2 TEXT,
+    reward_3 TEXT,
+    participant_reward TEXT,
+    win_reward TEXT,
+    lose_reward TEXT,
+    embed_color TEXT,
+    image_url TEXT,
+    footer TEXT,
+    is_sent INTEGER DEFAULT 0,
+    created_at TEXT
+)
+""")
+conn.commit()
 
-CHANNEL_SETTING_FIELDS = [field for group in CHANNEL_SETTING_GROUPS for field in group["fields"]]
-CHANNEL_SETTING_FIELD_NAMES = [field["key"] for field in CHANNEL_SETTING_FIELDS]
-CHANNEL_SETTING_TYPES = {field["key"]: field["type"] for field in CHANNEL_SETTING_FIELDS}
-
-SECURITY_FIELDS = [
-    "malicious_user_detection", "auto_filter", "raid_detection",
-    "spam_protection", "mention_spam_detection", "new_account_guard",
-    "dangerous_file_block", "token_leak_guard", "permission_guard",
-    "security_log_enabled",
-]
-
-SECURITY_LABELS = {
-    "malicious_user_detection": "악성유저감지",
-    "auto_filter": "자동검열",
-    "raid_detection": "테러감지",
-    "spam_protection": "도배보호",
-    "mention_spam_detection": "멘션테러감지",
-    "new_account_guard": "새계정보호",
-    "dangerous_file_block": "위험파일차단",
-    "token_leak_guard": "토큰보호",
-    "permission_guard": "권한보호",
-    "security_log_enabled": "보안로그",
-}
-
-DEFAULT_MISSION_SETTINGS = {"chat_target": 20, "reward_point": 500, "reward_box": 1}
-SUPPORT_SERVER_INVITE = os.getenv("SUPPORT_SERVER_INVITE", "https://discord.gg/dSjteDX5Se")
-PUBLIC_DASHBOARD_URL = os.getenv("PUBLIC_DASHBOARD_URL", "https://powerfull.o-r.kr/")
-
-DEFAULT_TITLE_SHOP = [
-    ("새싹", "🌱", 500, "처음 시작하는 멤버에게 어울리는 기본 칭호"),
-    ("단골손님", "🌸", 2500, "꾸준히 활동하는 멤버용 칭호"),
-    ("만능러", "⭐", 5000, "여러 기능을 즐기는 멤버용 칭호"),
-    ("포인트부자", "💰", 10000, "경제 시스템 고수 느낌 칭호"),
-    ("서버수호자", "🛡️", 15000, "서버를 지켜주는 멤버용 칭호"),
-    ("레전드", "👑", 30000, "최상위 활동 멤버용 프리미엄 칭호"),
-]
-
-def db():
-    con = sqlite3.connect(DATABASE_PATH)
-    con.row_factory = sqlite3.Row
-    ensure_tables(con)
-    return con
-
-
-def ensure_column(cur, table, column, definition):
-    cur.execute(f"PRAGMA table_info({table})")
-    columns = [row[1] for row in cur.fetchall()]
-    if column not in columns:
+# 기존 scheduled_events 테이블에 등수별 보상 컬럼이 없으면 자동 추가합니다.
+c.execute("PRAGMA table_info(scheduled_events)")
+_scheduled_event_columns = [row[1] for row in c.fetchall()]
+for _column in ["reward_1", "reward_2", "reward_3", "participant_reward", "win_reward", "lose_reward", "embed_color", "image_url", "footer"]:
+    if _column not in _scheduled_event_columns:
         try:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            c.execute(f"ALTER TABLE scheduled_events ADD COLUMN {_column} TEXT")
         except sqlite3.OperationalError:
             pass
+conn.commit()
+
+# 이벤트 종료/보상 결과 저장용 테이블입니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS event_results (
+    result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER,
+    guild_id INTEGER,
+    moderator_id INTEGER,
+    winner_team TEXT,
+    loser_team TEXT,
+    first_user INTEGER,
+    second_user INTEGER,
+    third_user INTEGER,
+    win_role_id INTEGER DEFAULT 0,
+    lose_role_id INTEGER DEFAULT 0,
+    first_point INTEGER DEFAULT 0,
+    second_point INTEGER DEFAULT 0,
+    third_point INTEGER DEFAULT 0,
+    win_point INTEGER DEFAULT 0,
+    lose_point INTEGER DEFAULT 0,
+    note TEXT,
+    created_at TEXT
+)
+""")
+conn.commit()
+
+# =========================
+# 만능봇 스타일 보안 설정 DB
+# =========================
+c.execute("""
+CREATE TABLE IF NOT EXISTS security_settings (
+    guild_id INTEGER PRIMARY KEY,
+    malicious_user_detection INTEGER DEFAULT 0,
+    auto_filter INTEGER DEFAULT 1,
+    raid_detection INTEGER DEFAULT 0,
+    spam_protection INTEGER DEFAULT 1,
+    mention_spam_detection INTEGER DEFAULT 1,
+    new_account_guard INTEGER DEFAULT 0,
+    dangerous_file_block INTEGER DEFAULT 1,
+    token_leak_guard INTEGER DEFAULT 1,
+    permission_guard INTEGER DEFAULT 1,
+    security_log_enabled INTEGER DEFAULT 1,
+    updated_at TEXT
+)
+""")
+conn.commit()
+
+# 악성 유저 직접 등록 목록입니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS malicious_users (
+    guild_id INTEGER,
+    user_id INTEGER,
+    reason TEXT,
+    added_by INTEGER,
+    added_at TEXT,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+# 서버별 자동검열 단어 목록입니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS custom_filter_words (
+    guild_id INTEGER,
+    word TEXT,
+    added_by INTEGER,
+    added_at TEXT,
+    PRIMARY KEY (guild_id, word)
+)
+""")
+
+# 보안패널에서 발생한 감지/차단 기록을 저장합니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS security_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    user_id INTEGER DEFAULT 0,
+    action TEXT,
+    reason TEXT,
+    channel_id INTEGER DEFAULT 0,
+    created_at TEXT
+)
+""")
+conn.commit()
 
 
-def seed_title_shop(cur, guild_id=0):
-    for name, emoji, price, desc in DEFAULT_TITLE_SHOP:
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO title_shop(guild_id,title_name,emoji,price,description,is_active,created_at)
-            VALUES (?,?,?,?,?,1,datetime('now','localtime'))
-            """,
-            (guild_id, name, emoji, price, desc),
-        )
-
-
-def ensure_tables(con):
-    cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS welcome_embeds (guild_id INTEGER PRIMARY KEY,title TEXT,description TEXT,color TEXT,image_url TEXT,footer TEXT,updated_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS auto_embeds (guild_id INTEGER,embed_type TEXT,title TEXT,description TEXT,color TEXT,image_url TEXT,footer TEXT,updated_at TEXT,PRIMARY KEY (guild_id, embed_type))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS security_settings (guild_id INTEGER PRIMARY KEY,malicious_user_detection INTEGER DEFAULT 0,auto_filter INTEGER DEFAULT 1,raid_detection INTEGER DEFAULT 0,spam_protection INTEGER DEFAULT 1,mention_spam_detection INTEGER DEFAULT 1,new_account_guard INTEGER DEFAULT 0,dangerous_file_block INTEGER DEFAULT 1,token_leak_guard INTEGER DEFAULT 1,permission_guard INTEGER DEFAULT 1,security_log_enabled INTEGER DEFAULT 1,updated_at TEXT)""")
-    for col, default in {
+def migrate_security_settings_table():
+    """예전 database.db도 새 보안패널 옵션을 바로 쓸 수 있게 컬럼을 자동 추가합니다."""
+    c.execute("PRAGMA table_info(security_settings)")
+    columns = [row[1] for row in c.fetchall()]
+    extra_columns = {
         "spam_protection": "INTEGER DEFAULT 1",
         "mention_spam_detection": "INTEGER DEFAULT 1",
         "new_account_guard": "INTEGER DEFAULT 0",
@@ -297,762 +522,14565 @@ def ensure_tables(con):
         "token_leak_guard": "INTEGER DEFAULT 1",
         "permission_guard": "INTEGER DEFAULT 1",
         "security_log_enabled": "INTEGER DEFAULT 1",
+    }
+    for column, definition in extra_columns.items():
+        if column not in columns:
+            try:
+                c.execute(f"ALTER TABLE security_settings ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
+
+
+migrate_security_settings_table()
+
+
+# 기존 DB에도 새 강화 컬럼/서버별 저장 구조가 없으면 자동 변환합니다.
+def migrate_guild_enhance_tables():
+    c.execute("PRAGMA table_info(enhance_items)")
+    columns = [row[1] for row in c.fetchall()]
+
+    for _column, _definition in {
+        "guild_id": "INTEGER DEFAULT 0",
+        "down_count": "INTEGER DEFAULT 0",
+        "total_attempts": "INTEGER DEFAULT 0",
+        "best_level": "INTEGER DEFAULT 0",
+        "updated_at": "TEXT",
     }.items():
-        ensure_column(cur, "security_settings", col, default)
-    cur.execute("""CREATE TABLE IF NOT EXISTS security_logs (log_id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id INTEGER,user_id INTEGER DEFAULT 0,action TEXT,reason TEXT,channel_id INTEGER DEFAULT 0,created_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS custom_filter_words (guild_id INTEGER,word TEXT,added_by INTEGER,added_at TEXT,PRIMARY KEY (guild_id, word))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS malicious_users (guild_id INTEGER,user_id INTEGER,reason TEXT,added_by INTEGER,added_at TEXT,PRIMARY KEY (guild_id, user_id))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY,welcome_channel_id INTEGER DEFAULT 0,goodbye_channel_id INTEGER DEFAULT 0,rule_channel_id INTEGER DEFAULT 0,game_role_channel_id INTEGER DEFAULT 0,log_channel_id INTEGER DEFAULT 0,updated_at TEXT)""")
-    for col in CHANNEL_SETTING_FIELD_NAMES:
-        ensure_column(cur, "guild_settings", col, "INTEGER DEFAULT 0")
-    cur.execute("""CREATE TABLE IF NOT EXISTS tts_settings (guild_id INTEGER PRIMARY KEY,lang TEXT DEFAULT 'ko',voice_profile TEXT DEFAULT 'yeonhong',voice_name TEXT,rate TEXT DEFAULT '+0%',pitch TEXT DEFAULT '+0Hz',updated_at TEXT)""")
-    for col, default in {"voice_profile":"TEXT DEFAULT 'yeonhong'","voice_name":"TEXT","rate":"TEXT DEFAULT '+0%'","pitch":"TEXT DEFAULT '+0Hz'"}.items():
-        ensure_column(cur, "tts_settings", col, default)
-    cur.execute("""CREATE TABLE IF NOT EXISTS recruit_embeds (guild_id INTEGER,recruit_key TEXT,title TEXT,description TEXT,color TEXT,image_url TEXT,footer TEXT,updated_at TEXT,PRIMARY KEY (guild_id, recruit_key))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (guild_id INTEGER DEFAULT 0,user_id INTEGER,point INTEGER DEFAULT 0,attendance_count INTEGER DEFAULT 0,streak INTEGER DEFAULT 0,last_attendance TEXT,PRIMARY KEY (guild_id, user_id))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS inventory (user_id INTEGER,item_name TEXT,amount INTEGER DEFAULT 1)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS levels (user_id INTEGER PRIMARY KEY,exp INTEGER DEFAULT 0,level INTEGER DEFAULT 1)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS voice_levels (user_id INTEGER PRIMARY KEY,exp INTEGER DEFAULT 0,level INTEGER DEFAULT 1,total_seconds INTEGER DEFAULT 0)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS enhance_items (guild_id INTEGER DEFAULT 0,user_id INTEGER,item_name TEXT,level INTEGER DEFAULT 0,success_count INTEGER DEFAULT 0,fail_count INTEGER DEFAULT 0,down_count INTEGER DEFAULT 0,destroy_count INTEGER DEFAULT 0,total_attempts INTEGER DEFAULT 0,best_level INTEGER DEFAULT 0,updated_at TEXT,PRIMARY KEY (guild_id, user_id, item_name))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS stock_prices (guild_id INTEGER,stock_code TEXT,stock_name TEXT,price INTEGER DEFAULT 1000,last_price INTEGER DEFAULT 1000,updated_at TEXT,PRIMARY KEY (guild_id, stock_code))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS stock_holdings (guild_id INTEGER,user_id INTEGER,stock_code TEXT,amount INTEGER DEFAULT 0,avg_price INTEGER DEFAULT 0,PRIMARY KEY (guild_id, user_id, stock_code))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS stock_logs (guild_id INTEGER,user_id INTEGER,stock_code TEXT,action TEXT,amount INTEGER,price INTEGER,total INTEGER,created_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS scheduled_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id INTEGER,channel_id INTEGER,creator_id INTEGER,title TEXT,description TEXT,event_time TEXT,reward_point INTEGER DEFAULT 0,reward_1 TEXT,reward_2 TEXT,reward_3 TEXT,participant_reward TEXT,win_reward TEXT,lose_reward TEXT,embed_color TEXT,image_url TEXT,footer TEXT,is_sent INTEGER DEFAULT 0,created_at TEXT)""")
-    for col, default in {"participant_reward":"TEXT","reward_1":"TEXT","reward_2":"TEXT","reward_3":"TEXT","win_reward":"TEXT","lose_reward":"TEXT","embed_color":"TEXT","image_url":"TEXT","footer":"TEXT"}.items():
-        ensure_column(cur, "scheduled_events", col, default)
+        if _column not in columns:
+            try:
+                c.execute(f"ALTER TABLE enhance_items ADD COLUMN {_column} {_definition}")
+            except sqlite3.OperationalError:
+                pass
 
-    # bot.py 경제 업그레이드: 일일미션 / 쿠폰
-    cur.execute("""CREATE TABLE IF NOT EXISTS daily_mission_progress (guild_id INTEGER,user_id INTEGER,mission_date TEXT,message_count INTEGER DEFAULT 0,attendance_done INTEGER DEFAULT 0,claimed INTEGER DEFAULT 0,claimed_at TEXT,PRIMARY KEY (guild_id, user_id, mission_date))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS daily_mission_settings (guild_id INTEGER PRIMARY KEY,chat_target INTEGER DEFAULT 20,reward_point INTEGER DEFAULT 500,reward_box INTEGER DEFAULT 1,updated_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS coupon_codes (guild_id INTEGER,code TEXT,reward_point INTEGER DEFAULT 0,item_name TEXT,item_amount INTEGER DEFAULT 0,max_uses INTEGER DEFAULT 1,used_count INTEGER DEFAULT 0,expires_at TEXT,is_active INTEGER DEFAULT 1,created_by INTEGER,created_at TEXT,PRIMARY KEY (guild_id, code))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS coupon_claims (guild_id INTEGER,code TEXT,user_id INTEGER,claimed_at TEXT,PRIMARY KEY (guild_id, code, user_id))""")
+    # 예전 구조는 PRIMARY KEY가 (user_id, item_name)이라 다른 서버에서 같은 아이템을 따로 저장할 수 없습니다.
+    # 그래서 서버별 PRIMARY KEY(guild_id, user_id, item_name) 구조로 안전하게 재생성합니다.
+    c.execute("PRAGMA table_info(enhance_items)")
+    columns = [row[1] for row in c.fetchall()]
+    pk_columns = [row[1] for row in c.fetchall() if row[5] > 0]
 
-    # bot.py 칭호 / 업적 업그레이드
-    cur.execute("""CREATE TABLE IF NOT EXISTS user_titles (guild_id INTEGER,user_id INTEGER,title_name TEXT,acquired_at TEXT,PRIMARY KEY (guild_id, user_id, title_name))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS user_equipped_titles (guild_id INTEGER,user_id INTEGER,title_name TEXT,updated_at TEXT,PRIMARY KEY (guild_id, user_id))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS achievement_claims (guild_id INTEGER,user_id INTEGER,achievement_key TEXT,claimed_at TEXT,PRIMARY KEY (guild_id, user_id, achievement_key))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS title_shop (guild_id INTEGER,title_name TEXT,emoji TEXT DEFAULT '🏷️',price INTEGER DEFAULT 0,description TEXT,is_active INTEGER DEFAULT 1,created_at TEXT,PRIMARY KEY (guild_id, title_name))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS custom_achievements (guild_id INTEGER,achievement_key TEXT,name TEXT,emoji TEXT DEFAULT '🏆',condition_text TEXT,reward_point INTEGER DEFAULT 0,reward_item TEXT,reward_item_amount INTEGER DEFAULT 0,reward_title TEXT,is_active INTEGER DEFAULT 1,created_at TEXT,PRIMARY KEY (guild_id, achievement_key))""")
-    seed_title_shop(cur, 0)
+    c.execute("PRAGMA table_info(enhance_items)")
+    pk_columns = [row[1] for row in c.fetchall() if row[5] > 0]
 
-    # 개발로그 / 지원 서버 / 청소 설정
-    cur.execute("""CREATE TABLE IF NOT EXISTS devlog_settings (guild_id INTEGER PRIMARY KEY,category_id INTEGER DEFAULT 0,update_channel_id INTEGER DEFAULT 0,patch_channel_id INTEGER DEFAULT 0,status_channel_id INTEGER DEFAULT 0,diary_channel_id INTEGER DEFAULT 0,notify_role_id INTEGER DEFAULT 0,updated_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS support_settings (guild_id INTEGER PRIMARY KEY,support_invite TEXT,dashboard_url TEXT,welcome_title TEXT,welcome_description TEXT,welcome_channel_id INTEGER DEFAULT 0,updated_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS clean_settings (guild_id INTEGER PRIMARY KEY,max_delete INTEGER DEFAULT 0,batch_size INTEGER DEFAULT 100,delay_seconds REAL DEFAULT 1.0,log_enabled INTEGER DEFAULT 1,updated_at TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS feature_flags (guild_id INTEGER,feature_key TEXT,is_enabled INTEGER DEFAULT 1,updated_at TEXT,PRIMARY KEY (guild_id, feature_key))""")
-    con.commit()
-
-def discord_headers(token=None):
-    return {"Authorization": f"Bearer {token or session.get('access_token')}"}
-
-def bot_headers():
-    return {"Authorization": f"Bot {BOT_TOKEN}"}
-
-def login_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not session.get("access_token"):
-            return redirect(url_for("login"))
-        return fn(*args, **kwargs)
-    return wrapper
-
-
-def fetch_user():
-    r = requests.get(f"{DISCORD_API}/users/@me", headers=discord_headers(), timeout=10)
-    if r.status_code != 200:
-        session.clear(); return None
-    return r.json()
-
-
-def fetch_user_guilds():
-    r = requests.get(f"{DISCORD_API}/users/@me/guilds", headers=discord_headers(), timeout=10)
-    if r.status_code != 200: return []
-    return [g for g in r.json() if int(g.get("permissions", 0)) & 0x8]
-
-
-def fetch_bot_guild(guild_id):
-    if not BOT_TOKEN: return None
-    r = requests.get(f"{DISCORD_API}/guilds/{guild_id}?with_counts=true", headers=bot_headers(), timeout=10)
-    return r.json() if r.status_code == 200 else None
-
-
-def fetch_channels(guild_id):
-    if not BOT_TOKEN: return []
-    r = requests.get(f"{DISCORD_API}/guilds/{guild_id}/channels", headers=bot_headers(), timeout=10)
-    if r.status_code != 200: return []
-    # type 0 = text, 2 = voice, 4 = category
-    return sorted(r.json(), key=lambda x: (x.get('position', 0), x.get('name', '')))
-
-
-def text_channels(channels):
-    return [c for c in channels if c.get("type") == 0]
-
-
-def require_admin_guild(guild_id):
-    return any(str(g["id"]) == str(guild_id) for g in fetch_user_guilds())
-
-
-def validate_hex(value):
-    value = (value or "FFB6C1").strip().replace("#", "")
-    if len(value) == 3: value = "".join(ch*2 for ch in value)
-    if len(value) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in value): return "FFB6C1"
-    return value.upper()
-
-
-def as_int(value, default=0):
-    try: return int(str(value).strip())
-    except Exception: return default
-
-
-def as_float(value, default=0.0):
-    try: return float(str(value).strip())
-    except Exception: return default
-
-
-def as_bool_form(name):
-    return 1 if request.form.get(name) else 0
-
-
-def normalize_code(value, max_len=30):
-    value = (value or "").strip().upper()
-    value = re.sub(r"\s+", "", value)
-    value = re.sub(r"[^A-Z0-9_-]", "", value)
-    return value[:max_len]
-
-
-def discord_color_int(hex_value):
-    return int(validate_hex(hex_value), 16)
-
-
-def send_discord_embed(channel_id, title, description, color="FFB6C1", image_url="", footer="", content=""):
-    if not BOT_TOKEN:
-        return False, "BOT TOKEN이 설정되지 않았어요."
-    channel_id = as_int(channel_id)
-    if not channel_id:
-        return False, "채널 ID가 올바르지 않아요."
-    embed = {
-        "title": (title or "만능 봇 알림")[:256],
-        "description": (description or "")[:4096],
-        "color": discord_color_int(color),
-    }
-    if image_url:
-        embed["image"] = {"url": image_url[:500]}
-    if footer:
-        embed["footer"] = {"text": footer[:2048]}
-    payload = {"embeds": [embed]}
-    if content:
-        payload["content"] = content[:2000]
-    try:
-        r = requests.post(f"{DISCORD_API}/channels/{channel_id}/messages", headers={**bot_headers(), "Content-Type": "application/json"}, json=payload, timeout=10)
-        if r.status_code in (200, 201, 204):
-            return True, "발송 완료"
-        return False, f"Discord API 오류: {r.status_code} / {r.text[:200]}"
-    except Exception as e:
-        return False, str(e)
-
-
-def current_user_id():
-    user = fetch_user() or {}
-    return as_int(user.get("id"), 0)
-
-@app.route("/")
-def index():
-    if session.get("access_token"): return redirect(url_for("servers"))
-    return render_template("index.html")
-
-@app.route("/login")
-def login():
-    auth_url = (f"{DISCORD_API}/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope={OAUTH_SCOPE.replace(' ', '%20')}")
-    return redirect(auth_url)
-
-@app.route("/callback")
-def callback():
-    code = request.args.get("code")
-    if not code: return redirect(url_for("index"))
-    data = {"client_id":DISCORD_CLIENT_ID,"client_secret":DISCORD_CLIENT_SECRET,"grant_type":"authorization_code","code":code,"redirect_uri":DISCORD_REDIRECT_URI}
-    r = requests.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=10)
-    if r.status_code != 200:
-        flash("디스코드 로그인 실패: CLIENT_ID / SECRET / REDIRECT_URI를 확인해주세요.")
-        return redirect(url_for("index"))
-    session["access_token"] = r.json()["access_token"]
-    return redirect(url_for("servers"))
-
-@app.route("/logout")
-def logout():
-    session.clear(); return redirect(url_for("index"))
-
-@app.route("/servers")
-@login_required
-def servers():
-    return render_template("servers.html", user=fetch_user(), guilds=fetch_user_guilds())
-
-@app.route("/dashboard/<guild_id>")
-@login_required
-def dashboard(guild_id):
-    if not require_admin_guild(guild_id):
-        flash("이 서버를 설정할 관리자 권한이 없어요."); return redirect(url_for("servers"))
-    guild = fetch_bot_guild(guild_id)
-    if not guild: flash("봇이 이 서버에 없거나 BOT TOKEN이 잘못됐어요.")
-    channels = fetch_channels(guild_id)
-    con = db()
-    welcome = con.execute("SELECT * FROM welcome_embeds WHERE guild_id=?", (guild_id,)).fetchone()
-    security = con.execute("SELECT * FROM security_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    if not security:
-        con.execute("INSERT OR IGNORE INTO security_settings(guild_id) VALUES (?)", (guild_id,)); con.commit()
-        security = con.execute("SELECT * FROM security_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    guild_settings = con.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    tts = con.execute("SELECT * FROM tts_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    mission_settings = con.execute("SELECT * FROM daily_mission_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    if not mission_settings:
-        con.execute("INSERT OR IGNORE INTO daily_mission_settings(guild_id,chat_target,reward_point,reward_box,updated_at) VALUES (?,?,?,?,datetime('now','localtime'))", (guild_id, DEFAULT_MISSION_SETTINGS["chat_target"], DEFAULT_MISSION_SETTINGS["reward_point"], DEFAULT_MISSION_SETTINGS["reward_box"]))
-        con.commit()
-        mission_settings = con.execute("SELECT * FROM daily_mission_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    devlog = con.execute("SELECT * FROM devlog_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    support = con.execute("SELECT * FROM support_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    clean = con.execute("SELECT * FROM clean_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    embeds = {}
-    for key, default in DEFAULT_AUTO_EMBEDS.items():
-        row = con.execute("SELECT * FROM auto_embeds WHERE guild_id=? AND embed_type=?", (guild_id, key)).fetchone()
-        embeds[key] = dict(row) if row else default.copy()
-    recruit = {}
-    for key, label in RECRUIT_ITEMS.items():
-        row = con.execute("SELECT * FROM recruit_embeds WHERE guild_id=? AND recruit_key=?", (guild_id, key)).fetchone()
-        recruit[key] = dict(row) if row else {"title":label,"description":f"{label} 내용을 웹에서 수정해보세요.","color":"FFB6C1","image_url":"","footer":"🌸 구인구직 안내"}
-    stocks = con.execute("SELECT * FROM stock_prices WHERE guild_id=? ORDER BY stock_code", (guild_id,)).fetchall()
-    events = con.execute("SELECT * FROM scheduled_events WHERE guild_id=? ORDER BY event_time DESC LIMIT 20", (guild_id,)).fetchall()
-    filter_words = con.execute("SELECT * FROM custom_filter_words WHERE guild_id=? ORDER BY word", (guild_id,)).fetchall()
-    bad_users = con.execute("SELECT * FROM malicious_users WHERE guild_id=? ORDER BY added_at DESC LIMIT 30", (guild_id,)).fetchall()
-    top_points = con.execute("SELECT user_id, point, attendance_count, streak FROM users WHERE guild_id=? ORDER BY point DESC LIMIT 10", (guild_id,)).fetchall()
-    coupons = con.execute("SELECT * FROM coupon_codes WHERE guild_id=? ORDER BY created_at DESC LIMIT 30", (guild_id,)).fetchall()
-    mission_today = con.execute("SELECT COUNT(*) AS users, SUM(claimed) AS claimed FROM daily_mission_progress WHERE guild_id=? AND mission_date=date('now','localtime')", (guild_id,)).fetchone()
-    title_shop = con.execute("SELECT * FROM title_shop WHERE guild_id IN (0, ?) ORDER BY guild_id, price", (guild_id,)).fetchall()
-    custom_achievements = con.execute("SELECT * FROM custom_achievements WHERE guild_id=? ORDER BY created_at DESC", (guild_id,)).fetchall()
-    security_logs = con.execute("SELECT * FROM security_logs WHERE guild_id=? ORDER BY log_id DESC LIMIT 15", (guild_id,)).fetchall()
-    stock_logs = con.execute("SELECT * FROM stock_logs WHERE guild_id=? ORDER BY created_at DESC LIMIT 15", (guild_id,)).fetchall()
-    con.close()
-    return render_template("dashboard.html", guild_id=guild_id, guild=guild, welcome=dict(welcome) if welcome else WELCOME_DEFAULT, security=dict(security), security_fields=SECURITY_FIELDS, security_labels=SECURITY_LABELS, embeds=embeds, embed_types=EMBED_TYPES, channels=channels, text_channels=text_channels(channels), guild_settings=dict(guild_settings) if guild_settings else {}, tts=dict(tts) if tts else {"lang":"ko"}, tts_langs=TTS_LANGS, recruit=recruit, recruit_items=RECRUIT_ITEMS, stocks=stocks, events=events, filter_words=filter_words, bad_users=bad_users, top_points=top_points, coupons=coupons, mission_settings=dict(mission_settings), mission_today=dict(mission_today) if mission_today else {}, title_shop=title_shop, custom_achievements=custom_achievements, devlog=dict(devlog) if devlog else {}, support=dict(support) if support else {"support_invite": SUPPORT_SERVER_INVITE, "dashboard_url": PUBLIC_DASHBOARD_URL}, clean=dict(clean) if clean else {"max_delete":0,"batch_size":100,"delay_seconds":1.0,"log_enabled":1}, security_logs=security_logs, stock_logs=stock_logs, channel_setting_groups=CHANNEL_SETTING_GROUPS)
-
-CHANNEL_SETTINGS_PAGE_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h1>📦 전체 서버 채널 연결</h1>
-<p>이 페이지는 <b>guild_settings</b> 테이블에 모든 기능 채널을 저장합니다.</p>
-<p><a href="{{ url_for('dashboard', guild_id=guild_id) }}#guild-settings">← 대시보드로 돌아가기</a></p>
-
-<form method="post" action="{{ url_for('save_guild_settings', guild_id=guild_id) }}">
-  {% for group in channel_setting_groups %}
-  <section class="card" style="margin:18px 0;padding:18px;border:1px solid rgba(255,255,255,.12);border-radius:16px;">
-    <h2>{{ group.name }}</h2>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
-      {% for f in group.fields %}
-      <label style="display:block;">
-        <div style="font-weight:700;margin-bottom:6px;">{{ f.label }}</div>
-        <select name="{{ f.key }}" style="width:100%;padding:10px;border-radius:10px;">
-          <option value="0">미설정</option>
-          {% for c in channels %}
-            {% if c.type == f.type %}
-              <option value="{{ c.id }}" {% if (guild_settings.get(f.key, 0)|string) == (c.id|string) %}selected{% endif %}>
-                {% if c.type == 4 %}📁{% elif c.type == 2 %}🔊{% else %}#{% endif %} {{ c.name }}
-              </option>
-            {% endif %}
-          {% endfor %}
-        </select>
-        <small>{{ f.hint }} · DB: {{ f.key }}</small>
-      </label>
-      {% endfor %}
-    </div>
-  </section>
-  {% endfor %}
-  <button type="submit" style="padding:12px 18px;border-radius:12px;font-weight:800;">✅ 전체 채널 설정 저장</button>
-</form>
-{% endblock %}
-"""
-
-@app.route("/dashboard/<guild_id>/channels")
-@login_required
-def channel_settings_page(guild_id):
-    if not require_admin_guild(guild_id):
-        flash("이 서버를 설정할 관리자 권한이 없어요.")
-        return redirect(url_for("servers"))
-    channels = fetch_channels(guild_id)
-    con = db()
-    row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    con.close()
-    return render_template_string(
-        CHANNEL_SETTINGS_PAGE_TEMPLATE,
-        guild_id=guild_id,
-        channels=channels,
-        guild_settings=dict(row) if row else {},
-        channel_setting_groups=CHANNEL_SETTING_GROUPS,
-    )
-
-@app.route("/dashboard/<guild_id>/guild_settings", methods=["POST"])
-@login_required
-def save_guild_settings(guild_id):
-    if not require_admin_guild(guild_id):
-        return redirect(url_for("servers"))
-
-    submitted_fields = [field for field in CHANNEL_SETTING_FIELD_NAMES if field in request.form]
-
-    # 예전 dashboard.html에서 5개만 보내도 호환되고,
-    # 새 전체 채널 연결 페이지에서는 모든 기능 채널을 한 번에 저장합니다.
-    if not submitted_fields:
-        submitted_fields = ["welcome_channel_id", "goodbye_channel_id", "rule_channel_id", "game_role_channel_id", "log_channel_id"]
-
-    con = db()
-    con.execute(
-        "INSERT OR IGNORE INTO guild_settings(guild_id, updated_at) VALUES (?, datetime('now','localtime'))",
-        (guild_id,)
-    )
-
-    for field in submitted_fields:
-        if field not in CHANNEL_SETTING_FIELD_NAMES:
-            continue
-        con.execute(
-            f"UPDATE guild_settings SET {field}=?, updated_at=datetime('now','localtime') WHERE guild_id=?",
-            (as_int(request.form.get(field)), guild_id),
+    if pk_columns != ["guild_id", "user_id", "item_name"]:
+        c.execute("ALTER TABLE enhance_items RENAME TO enhance_items_old")
+        c.execute("""
+        CREATE TABLE enhance_items (
+            guild_id INTEGER DEFAULT 0,
+            user_id INTEGER,
+            item_name TEXT,
+            level INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            down_count INTEGER DEFAULT 0,
+            destroy_count INTEGER DEFAULT 0,
+            total_attempts INTEGER DEFAULT 0,
+            best_level INTEGER DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY (guild_id, user_id, item_name)
         )
+        """)
+        c.execute("""
+        INSERT OR REPLACE INTO enhance_items(
+            guild_id, user_id, item_name, level, success_count, fail_count,
+            down_count, destroy_count, total_attempts, best_level, updated_at
+        )
+        SELECT
+            COALESCE(guild_id, 0), user_id, item_name,
+            COALESCE(level, 0), COALESCE(success_count, 0), COALESCE(fail_count, 0),
+            COALESCE(down_count, 0), COALESCE(destroy_count, 0),
+            COALESCE(total_attempts, 0), COALESCE(best_level, COALESCE(level, 0)), updated_at
+        FROM enhance_items_old
+        """)
+        c.execute("DROP TABLE enhance_items_old")
 
-    con.commit()
-    con.close()
-    flash(f"서버 채널 설정 {len(submitted_fields)}개를 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#guild-settings")
-
-@app.route("/dashboard/<guild_id>/welcome", methods=["POST"])
-@login_required
-def save_welcome(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db()
-    con.execute("""INSERT OR REPLACE INTO welcome_embeds(guild_id,title,description,color,image_url,footer,updated_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))""", (guild_id, request.form.get("title","")[:256], request.form.get("description","")[:4096], validate_hex(request.form.get("color")), request.form.get("image_url","")[:500], request.form.get("footer","")[:2048]))
-    con.commit(); con.close(); flash("환영 임베드 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#welcome")
-
-@app.route("/dashboard/<guild_id>/embed/<embed_type>", methods=["POST"])
-@login_required
-def save_auto_embed(guild_id, embed_type):
-    if embed_type not in EMBED_TYPES or not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db()
-    con.execute("""INSERT OR REPLACE INTO auto_embeds(guild_id,embed_type,title,description,color,image_url,footer,updated_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))""", (guild_id, embed_type, request.form.get("title","")[:256], request.form.get("description","")[:4096], validate_hex(request.form.get("color")), request.form.get("image_url","")[:500], request.form.get("footer","")[:2048]))
-    con.commit(); con.close(); flash(f"{EMBED_TYPES[embed_type]} 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+f"#{embed_type}")
-
-@app.route("/dashboard/<guild_id>/security", methods=["POST"])
-@login_required
-def save_security(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    values = {key: as_bool_form(key) for key in SECURITY_FIELDS}
-    # 보안로그는 실수로 꺼지는 것을 줄이려고 체크박스가 없으면 기본 켜짐으로 둡니다.
-    if "security_log_enabled" not in request.form:
-        values["security_log_enabled"] = 1
-    con = db()
-    con.execute(
-        """
-        INSERT INTO security_settings(
-            guild_id, malicious_user_detection, auto_filter, raid_detection,
-            spam_protection, mention_spam_detection, new_account_guard,
-            dangerous_file_block, token_leak_guard, permission_guard,
-            security_log_enabled, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))
-        ON CONFLICT(guild_id) DO UPDATE SET
-            malicious_user_detection=excluded.malicious_user_detection,
-            auto_filter=excluded.auto_filter,
-            raid_detection=excluded.raid_detection,
-            spam_protection=excluded.spam_protection,
-            mention_spam_detection=excluded.mention_spam_detection,
-            new_account_guard=excluded.new_account_guard,
-            dangerous_file_block=excluded.dangerous_file_block,
-            token_leak_guard=excluded.token_leak_guard,
-            permission_guard=excluded.permission_guard,
-            security_log_enabled=excluded.security_log_enabled,
-            updated_at=excluded.updated_at
-        """,
-        (guild_id, *(values[key] for key in SECURITY_FIELDS)),
-    )
-    con.commit(); con.close(); flash("보안패널 전체 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#security")
-
-@app.route("/dashboard/<guild_id>/filter_word", methods=["POST"])
-@login_required
-def save_filter_word(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    word=(request.form.get("word") or "").strip().lower()
-    if word:
-        con=db(); con.execute("INSERT OR IGNORE INTO custom_filter_words(guild_id,word,added_by,added_at) VALUES (?,?,?,datetime('now','localtime'))", (guild_id, word, current_user_id())); con.commit(); con.close(); flash("검열 단어를 추가했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#security")
-
-@app.route("/dashboard/<guild_id>/filter_word/delete", methods=["POST"])
-@login_required
-def delete_filter_word(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con=db(); con.execute("DELETE FROM custom_filter_words WHERE guild_id=? AND word=?", (guild_id, request.form.get("word",""))); con.commit(); con.close(); flash("검열 단어를 삭제했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#security")
-
-@app.route("/dashboard/<guild_id>/bad_user", methods=["POST"])
-@login_required
-def save_bad_user(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    user_id=as_int(request.form.get("user_id")); reason=(request.form.get("reason") or "웹 대시보드 등록")[:300]
-    if user_id:
-        con=db(); con.execute("INSERT OR REPLACE INTO malicious_users(guild_id,user_id,reason,added_by,added_at) VALUES (?,?,?,?,datetime('now','localtime'))", (guild_id, user_id, reason, current_user_id())); con.commit(); con.close(); flash("악성 유저 목록에 등록했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#security")
-
-@app.route("/dashboard/<guild_id>/bad_user/delete", methods=["POST"])
-@login_required
-def delete_bad_user(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con=db(); con.execute("DELETE FROM malicious_users WHERE guild_id=? AND user_id=?", (guild_id, as_int(request.form.get("user_id")))); con.commit(); con.close(); flash("악성 유저 목록에서 삭제했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#security")
-
-@app.route("/dashboard/<guild_id>/tts", methods=["POST"])
-@login_required
-def save_tts(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    lang=request.form.get("lang","ko") if request.form.get("lang") in TTS_LANGS else "ko"
-    con=db(); con.execute("INSERT OR REPLACE INTO tts_settings(guild_id,lang,updated_at) VALUES (?,?,datetime('now','localtime'))", (guild_id, lang)); con.commit(); con.close(); flash("TTS 언어 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#voice")
-
-@app.route("/dashboard/<guild_id>/recruit/<recruit_key>", methods=["POST"])
-@login_required
-def save_recruit(guild_id, recruit_key):
-    if recruit_key not in RECRUIT_ITEMS or not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con=db(); con.execute("""INSERT OR REPLACE INTO recruit_embeds(guild_id,recruit_key,title,description,color,image_url,footer,updated_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))""", (guild_id, recruit_key, request.form.get("title","")[:256], request.form.get("description","")[:4096], validate_hex(request.form.get("color")), request.form.get("image_url","")[:500], request.form.get("footer","")[:2048])); con.commit(); con.close(); flash(f"{RECRUIT_ITEMS[recruit_key]} 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#recruit")
-
-@app.route("/dashboard/<guild_id>/stock", methods=["POST"])
-@login_required
-def save_stock(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    code=(request.form.get("stock_code") or "").strip().upper()[:20]
-    name=(request.form.get("stock_name") or "").strip()[:60]
-    price=max(1, as_int(request.form.get("price"), 1000))
-    if code and name:
-        con=db(); old=con.execute("SELECT price FROM stock_prices WHERE guild_id=? AND stock_code=?", (guild_id,code)).fetchone(); last=old[0] if old else price
-        con.execute("INSERT OR REPLACE INTO stock_prices(guild_id,stock_code,stock_name,price,last_price,updated_at) VALUES (?,?,?,?,?,datetime('now','localtime'))", (guild_id,code,name,price,last)); con.commit(); con.close(); flash("가상 주식을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#economy")
-
-@app.route("/dashboard/<guild_id>/stock/delete", methods=["POST"])
-@login_required
-def delete_stock(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con=db(); con.execute("DELETE FROM stock_prices WHERE guild_id=? AND stock_code=?", (guild_id, request.form.get("stock_code",""))); con.commit(); con.close(); flash("가상 주식을 삭제했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#economy")
-
-@app.route("/dashboard/<guild_id>/points", methods=["POST"])
-@login_required
-def save_points(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    user_id=as_int(request.form.get("user_id")); amount=as_int(request.form.get("amount")); mode=request.form.get("mode","add")
-    if user_id:
-        con=db(); con.execute("INSERT OR IGNORE INTO users(guild_id,user_id,point) VALUES (?,?,0)", (guild_id,user_id))
-        if mode == "set": con.execute("UPDATE users SET point=? WHERE guild_id=? AND user_id=?", (amount,guild_id,user_id))
-        else: con.execute("UPDATE users SET point=point+? WHERE guild_id=? AND user_id=?", (amount,guild_id,user_id))
-        con.commit(); con.close(); flash("포인트를 변경했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#economy")
-
-@app.route("/dashboard/<guild_id>/event", methods=["POST"])
-@login_required
-def save_event(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con=db(); con.execute("""INSERT INTO scheduled_events(guild_id,channel_id,creator_id,title,description,event_time,reward_point,reward_1,reward_2,reward_3,win_reward,lose_reward,embed_color,image_url,footer,is_sent,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,datetime('now','localtime'))""", (guild_id, as_int(request.form.get("channel_id")), current_user_id(), request.form.get("title","")[:256], request.form.get("description","")[:4096], request.form.get("event_time","")[:40], as_int(request.form.get("reward_point")), request.form.get("reward_1","")[:500], request.form.get("reward_2","")[:500], request.form.get("reward_3","")[:500], request.form.get("win_reward","")[:500], request.form.get("lose_reward","")[:500], validate_hex(request.form.get("embed_color")), request.form.get("image_url","")[:500], request.form.get("footer","")[:2048])); con.commit(); con.close(); flash("예약 이벤트를 추가했어요. 봇의 이벤트 루프가 DB를 읽으면 자동 발송돼요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#event")
-
-@app.route("/dashboard/<guild_id>/event/delete", methods=["POST"])
-@login_required
-def delete_event(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con=db(); con.execute("DELETE FROM scheduled_events WHERE guild_id=? AND event_id=?", (guild_id, as_int(request.form.get("event_id")))); con.commit(); con.close(); flash("예약 이벤트를 삭제했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#event")
+    conn.commit()
 
 
-@app.route("/dashboard/<guild_id>/send_embed", methods=["POST"])
-@login_required
-def send_embed_message(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    ok, msg = send_discord_embed(
-        request.form.get("channel_id"),
-        request.form.get("title", "만능 봇 알림"),
-        request.form.get("description", ""),
-        request.form.get("color", "FFB6C1"),
-        request.form.get("image_url", ""),
-        request.form.get("footer", "⭐ 만능 봇"),
-        request.form.get("content", ""),
-    )
-    flash("임베드 알림을 보냈어요." if ok else f"임베드 발송 실패: {msg}")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#notice")
-
-@app.route("/dashboard/<guild_id>/support", methods=["POST"])
-@login_required
-def save_support_settings(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db()
-    con.execute(
-        """
-        INSERT OR REPLACE INTO support_settings(
-            guild_id,support_invite,dashboard_url,welcome_title,welcome_description,welcome_channel_id,updated_at
-        ) VALUES (?,?,?,?,?,?,datetime('now','localtime'))
-        """,
-        (
-            guild_id,
-            request.form.get("support_invite", SUPPORT_SERVER_INVITE)[:300],
-            request.form.get("dashboard_url", PUBLIC_DASHBOARD_URL)[:300],
-            request.form.get("welcome_title", "🎉 만능 봇 공식 지원 서버에 오신 것을 환영합니다!")[:256],
-            request.form.get("welcome_description", "")[:4096],
-            as_int(request.form.get("welcome_channel_id")),
-        ),
-    )
-    con.commit(); con.close(); flash("지원 서버/홈페이지 환영 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#support")
-
-@app.route("/dashboard/<guild_id>/support/send_welcome", methods=["POST"])
-@login_required
-def send_support_welcome(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    channel_id = request.form.get("channel_id")
-    title = request.form.get("title") or "🎉 만능 봇 공식 지원 서버에 오신 것을 환영합니다!"
-    desc = request.form.get("description") or (
-        "만능 봇은 환영 메시지, 인증 패널, 보안, 티켓, 경제 시스템을 한 곳에서 관리할 수 있는 통합 관리 봇입니다.\n\n"
-        f"💬 지원 서버: {SUPPORT_SERVER_INVITE}\n"
-        f"🚀 대시보드: {PUBLIC_DASHBOARD_URL}"
-    )
-    ok, msg = send_discord_embed(channel_id, title, desc, request.form.get("color", "FFB6C1"), request.form.get("image_url", ""), "⭐ 만능 봇 공식 지원센터")
-    flash("지원 서버 환영 메시지를 보냈어요." if ok else f"환영 메시지 발송 실패: {msg}")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#support")
-
-@app.route("/dashboard/<guild_id>/devlog", methods=["POST"])
-@login_required
-def save_devlog_settings(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db()
-    con.execute(
-        """
-        INSERT OR REPLACE INTO devlog_settings(
-            guild_id,category_id,update_channel_id,patch_channel_id,status_channel_id,diary_channel_id,notify_role_id,updated_at
-        ) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))
-        """,
-        (guild_id, as_int(request.form.get("category_id")), as_int(request.form.get("update_channel_id")), as_int(request.form.get("patch_channel_id")), as_int(request.form.get("status_channel_id")), as_int(request.form.get("diary_channel_id")), as_int(request.form.get("notify_role_id"))),
-    )
-    con.commit(); con.close(); flash("개발로그 채널 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#devlog")
-
-@app.route("/dashboard/<guild_id>/devlog/send", methods=["POST"])
-@login_required
-def send_devlog_notice(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    notice_type = request.form.get("notice_type", "update")
-    channel_field = {"update":"update_channel_id", "patch":"patch_channel_id", "status":"status_channel_id", "diary":"diary_channel_id"}.get(notice_type, "update_channel_id")
-    con = db(); row = con.execute("SELECT * FROM devlog_settings WHERE guild_id=?", (guild_id,)).fetchone(); con.close()
-    channel_id = request.form.get("channel_id") or (row[channel_field] if row and row[channel_field] else 0)
-    mention = ""
-    if row and row["notify_role_id"]:
-        mention = f"<@&{row['notify_role_id']}>"
-    ok, msg = send_discord_embed(channel_id, request.form.get("title", "🚀 만능 봇 업데이트"), request.form.get("description", ""), request.form.get("color", "FFB6C1"), request.form.get("image_url", ""), request.form.get("footer", "⭐ 만능 봇 개발로그"), mention)
-    flash("개발로그 알림을 보냈어요." if ok else f"개발로그 발송 실패: {msg}")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#devlog")
-
-@app.route("/dashboard/<guild_id>/mission", methods=["POST"])
-@login_required
-def save_mission_settings(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    chat_target = max(1, as_int(request.form.get("chat_target"), DEFAULT_MISSION_SETTINGS["chat_target"]))
-    reward_point = max(0, as_int(request.form.get("reward_point"), DEFAULT_MISSION_SETTINGS["reward_point"]))
-    reward_box = max(0, as_int(request.form.get("reward_box"), DEFAULT_MISSION_SETTINGS["reward_box"]))
-    con = db(); con.execute("INSERT OR REPLACE INTO daily_mission_settings(guild_id,chat_target,reward_point,reward_box,updated_at) VALUES (?,?,?,?,datetime('now','localtime'))", (guild_id, chat_target, reward_point, reward_box)); con.commit(); con.close(); flash("일일미션 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#mission")
-
-@app.route("/dashboard/<guild_id>/coupon", methods=["POST"])
-@login_required
-def save_coupon(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    code = normalize_code(request.form.get("code"))
-    if not code:
-        flash("쿠폰 코드를 입력해주세요."); return redirect(url_for("dashboard", guild_id=guild_id)+"#coupon")
-    con = db()
-    old = con.execute("SELECT used_count FROM coupon_codes WHERE guild_id=? AND code=?", (guild_id, code)).fetchone()
-    used_count = old[0] if old else 0
-    con.execute(
-        """
-        INSERT OR REPLACE INTO coupon_codes(guild_id,code,reward_point,item_name,item_amount,max_uses,used_count,expires_at,is_active,created_by,created_at)
-        VALUES (?,?,?,?,?,?,?,?,1,?,datetime('now','localtime'))
-        """,
-        (guild_id, code, max(0, as_int(request.form.get("reward_point"))), request.form.get("item_name", "")[:80], max(0, as_int(request.form.get("item_amount"))), max(1, as_int(request.form.get("max_uses"), 1)), used_count, request.form.get("expires_at", "")[:40], current_user_id()),
-    )
-    con.commit(); con.close(); flash(f"쿠폰 `{code}`를 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#coupon")
-
-@app.route("/dashboard/<guild_id>/coupon/delete", methods=["POST"])
-@login_required
-def delete_coupon(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    code = normalize_code(request.form.get("code"))
-    con = db(); con.execute("UPDATE coupon_codes SET is_active=0 WHERE guild_id=? AND code=?", (guild_id, code)); con.commit(); con.close(); flash(f"쿠폰 `{code}`를 비활성화했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#coupon")
-
-@app.route("/dashboard/<guild_id>/title_shop", methods=["POST"])
-@login_required
-def save_title_shop(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    title_name = (request.form.get("title_name") or "")[:40].strip()
-    if not title_name:
-        flash("칭호 이름을 입력해주세요."); return redirect(url_for("dashboard", guild_id=guild_id)+"#title")
-    con = db(); con.execute("INSERT OR REPLACE INTO title_shop(guild_id,title_name,emoji,price,description,is_active,created_at) VALUES (?,?,?,?,?,1,datetime('now','localtime'))", (guild_id, title_name, (request.form.get("emoji") or "🏷️")[:10], max(0, as_int(request.form.get("price"))), request.form.get("description", "")[:300])); con.commit(); con.close(); flash("칭호 상점 항목을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#title")
-
-@app.route("/dashboard/<guild_id>/title_shop/delete", methods=["POST"])
-@login_required
-def delete_title_shop(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db(); con.execute("UPDATE title_shop SET is_active=0 WHERE guild_id=? AND title_name=?", (guild_id, request.form.get("title_name", ""))); con.commit(); con.close(); flash("칭호 상점 항목을 비활성화했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#title")
-
-@app.route("/dashboard/<guild_id>/title/give", methods=["POST"])
-@login_required
-def give_user_title(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    user_id = as_int(request.form.get("user_id")); title_name = (request.form.get("title_name") or "")[:40].strip()
-    if user_id and title_name:
-        con = db(); con.execute("INSERT OR IGNORE INTO user_titles(guild_id,user_id,title_name,acquired_at) VALUES (?,?,?,datetime('now','localtime'))", (guild_id, user_id, title_name)); con.commit(); con.close(); flash("유저에게 칭호를 지급했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#title")
-
-@app.route("/dashboard/<guild_id>/title/remove", methods=["POST"])
-@login_required
-def remove_user_title(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db(); con.execute("DELETE FROM user_titles WHERE guild_id=? AND user_id=? AND title_name=?", (guild_id, as_int(request.form.get("user_id")), request.form.get("title_name", ""))); con.commit(); con.close(); flash("유저 칭호를 회수했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#title")
-
-@app.route("/dashboard/<guild_id>/achievement", methods=["POST"])
-@login_required
-def save_custom_achievement(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    key = normalize_code(request.form.get("achievement_key"), 50).lower()
-    name = (request.form.get("name") or "")[:80].strip()
-    if not key or not name:
-        flash("업적 키와 이름을 입력해주세요."); return redirect(url_for("dashboard", guild_id=guild_id)+"#achievement")
-    con = db(); con.execute("""INSERT OR REPLACE INTO custom_achievements(guild_id,achievement_key,name,emoji,condition_text,reward_point,reward_item,reward_item_amount,reward_title,is_active,created_at) VALUES (?,?,?,?,?,?,?,?,?,1,datetime('now','localtime'))""", (guild_id, key, name, (request.form.get("emoji") or "🏆")[:10], request.form.get("condition_text", "")[:300], max(0, as_int(request.form.get("reward_point"))), request.form.get("reward_item", "")[:80], max(0, as_int(request.form.get("reward_item_amount"))), request.form.get("reward_title", "")[:40])); con.commit(); con.close(); flash("커스텀 업적을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#achievement")
-
-@app.route("/dashboard/<guild_id>/achievement/delete", methods=["POST"])
-@login_required
-def delete_custom_achievement(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    con = db(); con.execute("UPDATE custom_achievements SET is_active=0 WHERE guild_id=? AND achievement_key=?", (guild_id, request.form.get("achievement_key", ""))); con.commit(); con.close(); flash("커스텀 업적을 비활성화했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#achievement")
-
-@app.route("/dashboard/<guild_id>/clean", methods=["POST"])
-@login_required
-def save_clean_settings(guild_id):
-    if not require_admin_guild(guild_id): return redirect(url_for("servers"))
-    max_delete = max(0, as_int(request.form.get("max_delete"), 0))
-    batch_size = min(100, max(1, as_int(request.form.get("batch_size"), 100)))
-    delay_seconds = max(0.0, min(10.0, as_float(request.form.get("delay_seconds"), 1.0)))
-    con = db(); con.execute("INSERT OR REPLACE INTO clean_settings(guild_id,max_delete,batch_size,delay_seconds,log_enabled,updated_at) VALUES (?,?,?,?,?,datetime('now','localtime'))", (guild_id, max_delete, batch_size, delay_seconds, as_bool_form("log_enabled"))); con.commit(); con.close(); flash("청소 명령어 설정을 저장했어요.")
-    return redirect(url_for("dashboard", guild_id=guild_id)+"#clean")
-
-@app.route("/api/health")
-def api_health():
-    return jsonify({"ok": True, "service": "powerfull-dashboard"})
-
-@app.route("/api/guild/<guild_id>/overview")
-@login_required
-def api_guild_overview(guild_id):
-    if not require_admin_guild(guild_id):
-        return jsonify({"ok": False, "error": "권한 없음"}), 403
-    con = db()
-    data = {
-        "ok": True,
-        "guild_id": guild_id,
-        "top_points": [dict(r) for r in con.execute("SELECT user_id, point, attendance_count, streak FROM users WHERE guild_id=? ORDER BY point DESC LIMIT 10", (guild_id,)).fetchall()],
-        "coupons": [dict(r) for r in con.execute("SELECT code,reward_point,item_name,item_amount,max_uses,used_count,is_active,expires_at FROM coupon_codes WHERE guild_id=? ORDER BY created_at DESC LIMIT 20", (guild_id,)).fetchall()],
-        "security_logs": [dict(r) for r in con.execute("SELECT user_id,action,reason,channel_id,created_at FROM security_logs WHERE guild_id=? ORDER BY log_id DESC LIMIT 20", (guild_id,)).fetchall()],
-    }
-    con.close()
-    return jsonify(data)
-
-
-@app.route("/api/guild/<guild_id>/channel-settings")
-@login_required
-def api_channel_settings(guild_id):
-    if not require_admin_guild(guild_id):
-        return jsonify({"ok": False, "error": "forbidden"}), 403
-    con = db()
-    row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    con.close()
-    return jsonify({
-        "ok": True,
-        "guild_id": str(guild_id),
-        "settings": dict(row) if row else {},
-        "fields": CHANNEL_SETTING_GROUPS,
-    })
-
+migrate_guild_enhance_tables()
 
 # =========================
-# 봇 자동 동기화 API
+# 웹 대시보드 DB 자동 동기화
 # =========================
-# bot.py가 웹 대시보드의 DB 설정을 자동으로 읽어갈 수 있게 하는 전용 API입니다.
-# DASHBOARD_SYNC_TOKEN 환경변수를 설정하면 같은 토큰을 가진 봇만 접근할 수 있습니다.
-def _bot_sync_allowed():
-    if not DASHBOARD_SYNC_TOKEN:
-        return True
-    token = request.headers.get("X-Dashboard-Sync-Token", "") or request.args.get("token", "")
-    return token == DASHBOARD_SYNC_TOKEN
+# 대시보드에서 저장한 설정을 봇이 자동으로 읽어옵니다.
+# 기본값은 네 Render 대시보드 주소입니다. 다른 주소를 쓰면 DASHBOARD_SYNC_URL 환경변수로 바꿀 수 있습니다.
+DASHBOARD_SYNC_URL = os.getenv("DASHBOARD_SYNC_URL", "https://manneung-bot-dashboard.onrender.com").strip().rstrip("/")
+DASHBOARD_SYNC_TOKEN = os.getenv("DASHBOARD_SYNC_TOKEN", "").strip()
+DASHBOARD_SYNC_ENABLED = os.getenv("DASHBOARD_SYNC_ENABLED", "1").strip() != "0"
+DASHBOARD_SYNC_CACHE_SECONDS = 30
+DASHBOARD_SYNC_CACHE = {}
+DASHBOARD_SYNC_LAST_ERROR = {}
+
+DASHBOARD_GUILD_SETTING_COLUMNS = ['welcome_channel_id', 'goodbye_channel_id', 'rule_channel_id', 'intro_channel_id', 'verify_channel_id', 'role_select_channel_id', 'game_role_channel_id', 'notice_channel_id', 'log_channel_id', 'general_log_channel_id', 'warning_log_channel_id', 'punishment_log_channel_id', 'chat_log_channel_id', 'voice_log_channel_id', 'nickname_log_channel_id', 'level_log_channel_id', 'security_log_channel_id', 'clean_log_channel_id', 'shop_channel_id', 'point_channel_id', 'stock_channel_id', 'attendance_channel_id', 'attendance_reward_channel_id', 'level_channel_id', 'enhance_channel_id', 'coupon_channel_id', 'mission_channel_id', 'title_channel_id', 'achievement_channel_id', 'ticket_channel_id', 'ticket_log_channel_id', 'report_channel_id', 'admin_panel_channel_id', 'bot_command_channel_id', 'event_channel_id', 'event_list_channel_id', 'vote_channel_id', 'giveaway_channel_id', 'music_command_channel_id', 'music_now_playing_channel_id', 'music_queue_channel_id', 'tts_text_channel_id', 'music_voice_channel_id', 'tts_voice_channel_id', 'recruit_benefit_channel_id', 'recruit_planning_channel_id', 'recruit_newbie_channel_id', 'recruit_guide_channel_id', 'recruit_promotion_channel_id', 'recruit_security_channel_id', 'recruit_scrim_channel_id', 'recruit_admin_channel_id', 'recruit_design_channel_id', 'recruit_fixed_channel_id', 'interview_waiting_voice_id', 'interview_room_1_voice_id', 'interview_room_2_voice_id', 'dev_update_channel_id', 'dev_patch_channel_id', 'dev_status_channel_id', 'dev_diary_channel_id', 'support_welcome_channel_id', 'support_notice_channel_id', 'rule_category_id', 'welcome_category_id', 'log_category_id', 'shop_category_id', 'bot_command_category_id', 'music_category_id', 'tts_category_id', 'recruit_category_id', 'event_category_id', 'devlog_category_id', 'server_stats_category_id', 'temp_voice_category_id', 'enhance_category_id']
+DASHBOARD_SYNC_SIMPLE_TABLES = {
+    "welcome_embeds": ["guild_id", "title", "description", "color", "image_url", "footer", "updated_at"],
+    "security_settings": [
+        "guild_id", "malicious_user_detection", "auto_filter", "raid_detection",
+        "spam_protection", "mention_spam_detection", "new_account_guard",
+        "dangerous_file_block", "token_leak_guard", "permission_guard", "security_log_enabled", "updated_at"
+    ],
+    "tts_settings": ["guild_id", "lang", "voice_profile", "voice_name", "rate", "pitch", "updated_at"],
+    "daily_mission_settings": ["guild_id", "chat_target", "reward_point", "reward_box", "updated_at"],
+    "devlog_settings": ["guild_id", "category_id", "update_channel_id", "patch_channel_id", "status_channel_id", "diary_channel_id", "notify_role_id", "updated_at"],
+    "support_settings": ["guild_id", "support_invite", "dashboard_url", "welcome_title", "welcome_description", "welcome_channel_id", "updated_at"],
+    "clean_settings": ["guild_id", "max_delete", "batch_size", "delay_seconds", "log_enabled", "updated_at"],
+}
 
 
-def _row_to_dict(row):
-    return dict(row) if row else {}
-
-
-def _fetch_one(con, table, guild_id):
+def dashboard_table_columns(table_name: str):
     try:
-        row = con.execute(f"SELECT * FROM {table} WHERE guild_id=?", (guild_id,)).fetchone()
-        return _row_to_dict(row)
-    except sqlite3.Error:
-        return {}
-
-
-def _fetch_many(con, table, guild_id, order_by=None, limit=None):
-    try:
-        sql = f"SELECT * FROM {table} WHERE guild_id=?"
-        if order_by:
-            sql += f" ORDER BY {order_by}"
-        if limit:
-            sql += f" LIMIT {int(limit)}"
-        return [dict(r) for r in con.execute(sql, (guild_id,)).fetchall()]
+        c.execute(f"PRAGMA table_info({table_name})")
+        return [row[1] for row in c.fetchall()]
     except sqlite3.Error:
         return []
 
 
-@app.route("/api/bot-sync/<guild_id>")
-def api_bot_sync(guild_id):
-    if not _bot_sync_allowed():
-        return jsonify({"ok": False, "error": "invalid sync token"}), 403
+def dashboard_add_missing_columns(table_name: str, columns: dict):
+    existing = set(dashboard_table_columns(table_name))
+    for column, definition in columns.items():
+        if column not in existing:
+            try:
+                c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
 
-    con = db()
-    data = {
-        "ok": True,
-        "guild_id": str(guild_id),
-        "channel_setting_fields": CHANNEL_SETTING_FIELD_NAMES,
-        "guild_settings": _fetch_one(con, "guild_settings", guild_id),
-        "welcome_embed": _fetch_one(con, "welcome_embeds", guild_id),
-        "security_settings": _fetch_one(con, "security_settings", guild_id),
-        "tts_settings": _fetch_one(con, "tts_settings", guild_id),
-        "daily_mission_settings": _fetch_one(con, "daily_mission_settings", guild_id),
-        "devlog_settings": _fetch_one(con, "devlog_settings", guild_id),
-        "support_settings": _fetch_one(con, "support_settings", guild_id),
-        "clean_settings": _fetch_one(con, "clean_settings", guild_id),
-        "auto_embeds": _fetch_many(con, "auto_embeds", guild_id, "embed_type"),
-        "recruit_embeds": _fetch_many(con, "recruit_embeds", guild_id, "recruit_key"),
-        "custom_filter_words": _fetch_many(con, "custom_filter_words", guild_id, "word"),
-        "malicious_users": _fetch_many(con, "malicious_users", guild_id, "added_at DESC", 500),
-        "stock_prices": _fetch_many(con, "stock_prices", guild_id, "stock_code"),
-        "scheduled_events": _fetch_many(con, "scheduled_events", guild_id, "event_time DESC", 200),
-        "coupon_codes": _fetch_many(con, "coupon_codes", guild_id, "created_at DESC", 500),
-        "title_shop": _fetch_many(con, "title_shop", guild_id, "title_name"),
-        "user_titles": _fetch_many(con, "user_titles", guild_id, "user_id", 1000),
-        "custom_achievements": _fetch_many(con, "custom_achievements", guild_id, "achievement_key"),
+
+def ensure_dashboard_sync_tables():
+    # guild_settings를 대시보드의 전체 채널 연결 컬럼까지 확장합니다.
+    dashboard_add_missing_columns("guild_settings", {col: "INTEGER DEFAULT 0" for col in DASHBOARD_GUILD_SETTING_COLUMNS})
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS daily_mission_settings (
+        guild_id INTEGER PRIMARY KEY,
+        chat_target INTEGER DEFAULT 20,
+        reward_point INTEGER DEFAULT 500,
+        reward_box INTEGER DEFAULT 1,
+        updated_at TEXT
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS title_shop (
+        guild_id INTEGER,
+        title_name TEXT,
+        emoji TEXT DEFAULT '🏷️',
+        price INTEGER DEFAULT 0,
+        description TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT,
+        PRIMARY KEY (guild_id, title_name)
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS custom_achievements (
+        guild_id INTEGER,
+        achievement_key TEXT,
+        name TEXT,
+        emoji TEXT DEFAULT '🏆',
+        condition_text TEXT,
+        reward_point INTEGER DEFAULT 0,
+        reward_item TEXT,
+        reward_item_amount INTEGER DEFAULT 0,
+        reward_title TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT,
+        PRIMARY KEY (guild_id, achievement_key)
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS devlog_settings (
+        guild_id INTEGER PRIMARY KEY,
+        category_id INTEGER DEFAULT 0,
+        update_channel_id INTEGER DEFAULT 0,
+        patch_channel_id INTEGER DEFAULT 0,
+        status_channel_id INTEGER DEFAULT 0,
+        diary_channel_id INTEGER DEFAULT 0,
+        notify_role_id INTEGER DEFAULT 0,
+        updated_at TEXT
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS support_settings (
+        guild_id INTEGER PRIMARY KEY,
+        support_invite TEXT,
+        dashboard_url TEXT,
+        welcome_title TEXT,
+        welcome_description TEXT,
+        welcome_channel_id INTEGER DEFAULT 0,
+        updated_at TEXT
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS clean_settings (
+        guild_id INTEGER PRIMARY KEY,
+        max_delete INTEGER DEFAULT 0,
+        batch_size INTEGER DEFAULT 100,
+        delay_seconds REAL DEFAULT 1.0,
+        log_enabled INTEGER DEFAULT 1,
+        updated_at TEXT
+    )
+    """)
+    conn.commit()
+
+
+def dashboard_upsert_simple_table(table_name: str, row: dict, key_columns=("guild_id",)):
+    if not row:
+        return
+    allowed_columns = set(dashboard_table_columns(table_name))
+    if not allowed_columns:
+        return
+    data = {k: v for k, v in row.items() if k in allowed_columns}
+    if not data or any(k not in data for k in key_columns):
+        return
+    columns = list(data.keys())
+    placeholders = ",".join("?" for _ in columns)
+    update_columns = [col for col in columns if col not in key_columns]
+    if update_columns:
+        update_sql = ", ".join(f"{col}=excluded.{col}" for col in update_columns)
+        sql = f"INSERT INTO {table_name}({', '.join(columns)}) VALUES ({placeholders}) ON CONFLICT({', '.join(key_columns)}) DO UPDATE SET {update_sql}"
+    else:
+        sql = f"INSERT OR IGNORE INTO {table_name}({', '.join(columns)}) VALUES ({placeholders})"
+    try:
+        c.execute(sql, [data[col] for col in columns])
+    except sqlite3.Error:
+        pass
+
+
+def dashboard_replace_list_table(table_name: str, rows: list, key_columns=("guild_id",)):
+    if rows is None:
+        return
+    allowed_columns = set(dashboard_table_columns(table_name))
+    if not allowed_columns:
+        return
+    guild_id = None
+    for row in rows:
+        if isinstance(row, dict) and row.get("guild_id"):
+            guild_id = row.get("guild_id")
+            break
+    if guild_id is not None:
+        try:
+            c.execute(f"DELETE FROM {table_name} WHERE guild_id=?", (guild_id,))
+        except sqlite3.Error:
+            pass
+    for row in rows:
+        if isinstance(row, dict):
+            dashboard_upsert_simple_table(table_name, row, key_columns=key_columns)
+
+
+def fetch_dashboard_sync_data(guild_id: int, *, force: bool = False):
+    if not DASHBOARD_SYNC_ENABLED or not DASHBOARD_SYNC_URL:
+        return None
+    now_ts = datetime.datetime.now().timestamp()
+    cached = DASHBOARD_SYNC_CACHE.get(guild_id)
+    if cached and not force and now_ts - cached.get("time", 0) < DASHBOARD_SYNC_CACHE_SECONDS:
+        return cached.get("data")
+
+    url = f"{DASHBOARD_SYNC_URL}/api/bot-sync/{guild_id}"
+    try:
+        headers = {"User-Agent": "ManeungBot-DashboardSync/1.0"}
+        if DASHBOARD_SYNC_TOKEN:
+            headers["X-Dashboard-Sync-Token"] = DASHBOARD_SYNC_TOKEN
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read(2_000_000)
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
+        if not data.get("ok"):
+            DASHBOARD_SYNC_LAST_ERROR[guild_id] = str(data.get("error") or "unknown")
+            return None
+        DASHBOARD_SYNC_CACHE[guild_id] = {"time": now_ts, "data": data}
+        return data
+    except Exception as e:
+        DASHBOARD_SYNC_LAST_ERROR[guild_id] = str(e)
+        return None
+
+
+def apply_dashboard_sync_to_local(data: dict):
+    if not data or not data.get("ok"):
+        return False
+    ensure_dashboard_sync_tables()
+    guild_id = int(data.get("guild_id") or 0)
+    if not guild_id:
+        return False
+
+    # 전체 채널 연결 저장
+    settings = data.get("guild_settings") or {}
+    if settings:
+        c.execute("INSERT OR IGNORE INTO guild_settings(guild_id, updated_at) VALUES (?, ?)", (guild_id, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        allowed = set(dashboard_table_columns("guild_settings"))
+        for key, value in settings.items():
+            if key in allowed and key != "guild_id":
+                try:
+                    if key.endswith("_id"):
+                        value = int(value or 0)
+                    c.execute(f"UPDATE guild_settings SET {key}=? WHERE guild_id=?", (value, guild_id))
+                except (sqlite3.Error, ValueError, TypeError):
+                    pass
+
+    # 단일 설정 테이블
+    for api_key, table_name in [
+        ("welcome_embed", "welcome_embeds"),
+        ("security_settings", "security_settings"),
+        ("tts_settings", "tts_settings"),
+        ("daily_mission_settings", "daily_mission_settings"),
+        ("devlog_settings", "devlog_settings"),
+        ("support_settings", "support_settings"),
+        ("clean_settings", "clean_settings"),
+    ]:
+        row = data.get(api_key)
+        if isinstance(row, dict) and row:
+            row["guild_id"] = guild_id
+            dashboard_upsert_simple_table(table_name, row, key_columns=("guild_id",))
+
+    # 목록 테이블
+    for api_key, table_name, keys in [
+        ("auto_embeds", "auto_embeds", ("guild_id", "embed_type")),
+        ("recruit_embeds", "recruit_embeds", ("guild_id", "recruit_key")),
+        ("custom_filter_words", "custom_filter_words", ("guild_id", "word")),
+        ("malicious_users", "malicious_users", ("guild_id", "user_id")),
+        ("stock_prices", "stock_prices", ("guild_id", "stock_code")),
+        ("scheduled_events", "scheduled_events", ("event_id",)),
+        ("coupon_codes", "coupon_codes", ("guild_id", "code")),
+        ("title_shop", "title_shop", ("guild_id", "title_name")),
+        ("user_titles", "user_titles", ("guild_id", "user_id", "title_name")),
+        ("custom_achievements", "custom_achievements", ("guild_id", "achievement_key")),
+    ]:
+        rows = data.get(api_key)
+        if isinstance(rows, list):
+            fixed_rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    row["guild_id"] = guild_id
+                    fixed_rows.append(row)
+            dashboard_replace_list_table(table_name, fixed_rows, key_columns=keys)
+
+    conn.commit()
+    return True
+
+
+def ensure_dashboard_sync_for_guild(guild_id: int, *, force: bool = False):
+    if not guild_id:
+        return False
+    data = fetch_dashboard_sync_data(int(guild_id), force=force)
+    if not data:
+        return False
+    return apply_dashboard_sync_to_local(data)
+
+
+ensure_dashboard_sync_tables()
+
+
+# =========================
+# 공통 함수
+# =========================
+
+def create_embed(title: str, description: str, color: int = BOT_COLOR):
+    embed = discord.Embed(title=title, description=description, color=color)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="⭐ 만능 봇 | 친목 서버 관리 봇")
+    return embed
+
+
+LOG_CATEGORY_NAME = "📁 서버 로그"
+LOG_CHANNEL_NAMES = {
+    "general": "📋-일반로그",
+    "warning": "⚠️-경고로그",
+    "punishment": "⛔-처벌로그",
+    "chat": "💬-채팅로그",
+    "voice": "🔊-음성로그",
+    "nickname": "👤-닉네임로그",
+    "level": "📈-레벨로그",
+}
+
+DEFAULT_SERVER_CATEGORY_NAME = "📦 기본 서버"
+TEMP_VOICE_CATEGORY_NAME = "😴 잠수방"
+TEMP_VOICE_CREATE_CHANNEL_NAME = "➕ 음성방 생성"
+TEMP_VOICE_CHANNELS = {}
+
+ENHANCE_CATEGORY_NAME = "⚒️ 강화방"
+ENHANCE_CHANNEL_NAME = "⚒️-강화"
+TTS_CATEGORY_NAME = "🔊 TTS방"
+TTS_TEXT_CHANNEL_NAME = "🔊-tts"
+TTS_VOICE_CHANNEL_NAME = "🔊 TTS 통방 1"
+TTS_VOICE_CHANNEL_NAMES = ["🔊 TTS 통방 1", "🔊 TTS 통방 2", "🔊 TTS 통방 3"]
+TTS_CHANNEL_NAMES = [TTS_TEXT_CHANNEL_NAME, "tts", "티티에스"]
+
+MUSIC_CATEGORY_NAME = "🎵 뮤직방"
+MUSIC_COMMAND_CHANNEL_NAME = "🎵-뮤직명령어"
+MUSIC_NOW_PLAYING_CHANNEL_NAME = "🎶-현재재생"
+MUSIC_QUEUE_CHANNEL_NAME = "📜-재생목록"
+MUSIC_VOICE_CHANNEL_NAME = "🔊 음악감상"
+
+BOT_COMMAND_CATEGORY_NAME = "🤖 봇명령어방"
+BOT_COMMAND_CHANNEL_NAME = "🤖-명령어"
+ATTENDANCE_CHANNEL_NAME = "📅-출석체크"
+ATTENDANCE_REWARD_CHANNEL_NAME = "🎁-출석보상"
+POINT_CHANNEL_NAME = "💰-포인트"
+SHOP_CHANNEL_NAME = "🛒-상점"
+STOCK_CHANNEL_NAME = "📈-주식"
+SHOP_CATEGORY_NAME = "🛒 상점"
+LEVEL_CHANNEL_NAME = "📈-레벨"
+
+TTS_VOICE_PRESETS = {
+    # 연홍/연하 스타일처럼 바로 고를 수 있는 목소리 프리셋입니다.
+    # edge-tts가 설치되어 있으면 더 자연스러운 목소리로 재생되고, 없으면 gTTS 기본 음성으로 자동 대체됩니다.
+    "yeonhong": {
+        "label": "연홍 느낌",
+        "lang": "ko",
+        "voice": "ko-KR-SunHiNeural",
+        "rate": "+8%",
+        "pitch": "+4Hz",
+        "desc": "밝고 또렷한 여성 목소리",
+    },
+    "yeonha": {
+        "label": "연하 느낌",
+        "lang": "ko",
+        "voice": "ko-KR-SunHiNeural",
+        "rate": "-4%",
+        "pitch": "-2Hz",
+        "desc": "차분하고 부드러운 여성 목소리",
+    },
+    "minjun": {
+        "label": "민준 느낌",
+        "lang": "ko",
+        "voice": "ko-KR-InJoonNeural",
+        "rate": "+0%",
+        "pitch": "+0Hz",
+        "desc": "깔끔한 남성 목소리",
+    },
+    "cute": {
+        "label": "귀여운 느낌",
+        "lang": "ko",
+        "voice": "ko-KR-SunHiNeural",
+        "rate": "+12%",
+        "pitch": "+8Hz",
+        "desc": "조금 빠르고 귀여운 목소리",
+    },
+    "calm": {
+        "label": "차분한 느낌",
+        "lang": "ko",
+        "voice": "ko-KR-SunHiNeural",
+        "rate": "-10%",
+        "pitch": "-4Hz",
+        "desc": "느긋하고 차분한 목소리",
+    },
+    "en": {
+        "label": "영어 여성",
+        "lang": "en",
+        "voice": "en-US-JennyNeural",
+        "rate": "+0%",
+        "pitch": "+0Hz",
+        "desc": "영어 TTS",
+    },
+    "ja": {
+        "label": "일본어 여성",
+        "lang": "ja",
+        "voice": "ja-JP-NanamiNeural",
+        "rate": "+0%",
+        "pitch": "+0Hz",
+        "desc": "일본어 TTS",
+    },
+}
+
+
+def migrate_tts_settings_table():
+    c.execute("PRAGMA table_info(tts_settings)")
+    columns = [row[1] for row in c.fetchall()]
+    for column, definition in {
+        "voice_profile": "TEXT DEFAULT 'yeonhong'",
+        "voice_name": "TEXT",
+        "rate": "TEXT DEFAULT '+0%'",
+        "pitch": "TEXT DEFAULT '+0Hz'",
+    }.items():
+        if column not in columns:
+            try:
+                c.execute(f"ALTER TABLE tts_settings ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
+
+
+migrate_tts_settings_table()
+
+
+def get_tts_voice_config(guild_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    c.execute("SELECT lang, voice_profile, voice_name, rate, pitch FROM tts_settings WHERE guild_id=?", (guild_id,))
+    row = c.fetchone()
+    if not row:
+        return TTS_VOICE_PRESETS["yeonhong"].copy()
+
+    lang, profile, voice_name, rate, pitch = row
+    preset = TTS_VOICE_PRESETS.get(profile or "yeonhong", TTS_VOICE_PRESETS["yeonhong"]).copy()
+    if lang:
+        preset["lang"] = lang
+    if voice_name:
+        preset["voice"] = voice_name
+    if rate:
+        preset["rate"] = rate
+    if pitch:
+        preset["pitch"] = pitch
+    return preset
+
+
+def get_tts_lang(guild_id: int):
+    return get_tts_voice_config(guild_id).get("lang", "ko")
+
+
+def set_tts_voice_preset(guild_id: int, profile: str):
+    preset = TTS_VOICE_PRESETS.get(profile, TTS_VOICE_PRESETS["yeonhong"])
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT INTO tts_settings(guild_id, lang, voice_profile, voice_name, rate, pitch, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            lang=excluded.lang,
+            voice_profile=excluded.voice_profile,
+            voice_name=excluded.voice_name,
+            rate=excluded.rate,
+            pitch=excluded.pitch,
+            updated_at=excluded.updated_at
+        """,
+        (guild_id, preset["lang"], profile, preset["voice"], preset["rate"], preset["pitch"], now)
+    )
+    conn.commit()
+
+
+def set_tts_lang(guild_id: int, lang: str):
+    # 예전 코드 호환용입니다. 언어만 바꿀 때도 프리셋 구조로 저장합니다.
+    profile = "yeonhong"
+    if lang == "en":
+        profile = "en"
+    elif lang == "ja":
+        profile = "ja"
+    set_tts_voice_preset(guild_id, profile)
+
+
+
+
+FRIEND_ROLE_NAMES = [
+    "대표", "부대표", "총관리자", "부관리자", "운영진", "관리자",
+      
+    "내전팀", "안내팀", "보안팀", "뉴관팀", "이벤트팀", "홍보팀",
+    "팀장", "부팀장", "뉴페이스", "미인증",
+    "VIP", "VVIP", "귀빈", "우수회원", "단골", "서버부스터", "후원자",
+    "스트리머", "유튜버", "디자이너", "개발자",
+    "남성", "여성",
+    "롤", "발로란트", "배틀그라운드", "이터널리턴", "마인크래프트", "로블록스",
+    "오버워치", "서든어택", "피파", "스타크래프트", "종합게임",
+    "20대", "10대",
+]
+
+DIVIDER_ROLE_NAMES = [
+    "˚₊‧꒰ა 👑 운영진 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა 🛡️ 담당팀 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚",
+]
+
+IP_BLOCK_REGEX = re.compile(
+    r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\d)"
+)
+
+
+
+# 만능봇 스타일 보안 감지 설정값입니다.
+SECURITY_JOIN_TRACKER = {}
+SECURITY_ACTION_TRACKER = {}
+AUTO_FILTER_BAD_WORDS = [
+    "시발", "병신", "새끼", "좆까", "니애미", "씨발", "ㅅㅂ", "ㅄ", "ㅈㄹ",
+]
+AUTO_FILTER_INVITE_WORDS = ["discord.gg/", "discord.com/invite/", "discordapp.com/invite/"]
+SECURITY_MENTION_LIMIT = 5
+SECURITY_ROLE_MENTION_LIMIT = 3
+SECURITY_NEW_ACCOUNT_DAYS = 3
+SECURITY_LOG_PREVIEW_LIMIT = 8
+SECURITY_DANGEROUS_EXTENSIONS = {
+    ".exe", ".bat", ".cmd", ".scr", ".ps1", ".vbs", ".js", ".jar",
+    ".com", ".msi", ".reg", ".hta", ".pif", ".apk", ".dll",
+}
+SECURITY_TOKEN_REGEX = re.compile(
+    r"(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{27,})"
+)
+SECURITY_DANGEROUS_PERMISSION_NAMES = {
+    "administrator": "관리자",
+    "manage_guild": "서버 관리",
+    "manage_roles": "역할 관리",
+    "manage_channels": "채널 관리",
+    "ban_members": "밴 권한",
+    "kick_members": "추방 권한",
+    "manage_webhooks": "웹후크 관리",
+    "manage_messages": "메시지 관리",
+    "moderate_members": "타임아웃 권한",
+}
+
+
+def get_security_settings(guild_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    security_columns = [
+        "malicious_user_detection",
+        "auto_filter",
+        "raid_detection",
+        "spam_protection",
+        "mention_spam_detection",
+        "new_account_guard",
+        "dangerous_file_block",
+        "token_leak_guard",
+        "permission_guard",
+        "security_log_enabled",
+    ]
+    defaults = {
+        "malicious_user_detection": False,
+        "auto_filter": True,
+        "raid_detection": False,
+        "spam_protection": True,
+        "mention_spam_detection": True,
+        "new_account_guard": False,
+        "dangerous_file_block": True,
+        "token_leak_guard": True,
+        "permission_guard": True,
+        "security_log_enabled": True,
     }
-    con.close()
-    return jsonify(data)
+    c.execute(
+        f"""
+        SELECT {', '.join(security_columns)}
+        FROM security_settings
+        WHERE guild_id=?
+        """,
+        (guild_id,)
+    )
+    row = c.fetchone()
+    if row is None:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            """
+            INSERT OR IGNORE INTO security_settings(
+                guild_id, malicious_user_detection, auto_filter, raid_detection,
+                spam_protection, mention_spam_detection, new_account_guard,
+                dangerous_file_block, token_leak_guard, permission_guard,
+                security_log_enabled, updated_at
+            ) VALUES (?, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, ?)
+            """,
+            (guild_id, now)
+        )
+        conn.commit()
+        return defaults
+
+    return {column: bool(row[index]) for index, column in enumerate(security_columns)}
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+def set_security_setting(guild_id: int, key: str, enabled: bool):
+    allowed = {
+        "malicious_user_detection",
+        "auto_filter",
+        "raid_detection",
+        "spam_protection",
+        "mention_spam_detection",
+        "new_account_guard",
+        "dangerous_file_block",
+        "token_leak_guard",
+        "permission_guard",
+        "security_log_enabled",
+    }
+    if key not in allowed:
+        return
+    get_security_settings(guild_id)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        f"UPDATE security_settings SET {key}=?, updated_at=? WHERE guild_id=?",
+        (1 if enabled else 0, now, guild_id)
+    )
+    conn.commit()
+
+
+def security_state_text(enabled: bool):
+    return "켜짐 ✅" if enabled else "꺼짐 ❌"
+
+
+def add_malicious_user(guild_id: int, user_id: int, reason: str, added_by: int):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO malicious_users(guild_id, user_id, reason, added_by, added_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, user_id, reason, added_by, now)
+    )
+    conn.commit()
+
+
+def remove_malicious_user(guild_id: int, user_id: int):
+    c.execute("DELETE FROM malicious_users WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+    changed = c.rowcount
+    conn.commit()
+    return changed > 0
+
+
+def get_malicious_user(guild_id: int, user_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    c.execute("SELECT reason, added_by, added_at FROM malicious_users WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+    return c.fetchone()
+
+
+def list_malicious_users(guild_id: int, limit: int = 20):
+    c.execute(
+        """
+        SELECT user_id, reason, added_by, added_at
+        FROM malicious_users
+        WHERE guild_id=?
+        ORDER BY added_at DESC
+        LIMIT ?
+        """,
+        (guild_id, limit)
+    )
+    return c.fetchall()
+
+
+def add_custom_filter_word(guild_id: int, word: str, added_by: int):
+    word = (word or "").strip().lower()
+    if not word:
+        return False
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR IGNORE INTO custom_filter_words(guild_id, word, added_by, added_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (guild_id, word, added_by, now)
+    )
+    changed = c.rowcount
+    conn.commit()
+    return changed > 0
+
+
+def remove_custom_filter_word(guild_id: int, word: str):
+    word = (word or "").strip().lower()
+    c.execute("DELETE FROM custom_filter_words WHERE guild_id=? AND word=?", (guild_id, word))
+    changed = c.rowcount
+    conn.commit()
+    return changed > 0
+
+
+def get_custom_filter_words(guild_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    c.execute("SELECT word FROM custom_filter_words WHERE guild_id=? ORDER BY word ASC", (guild_id,))
+    return [row[0] for row in c.fetchall()]
+
+
+def get_all_filter_words(guild_id: int):
+    return list(dict.fromkeys(AUTO_FILTER_BAD_WORDS + get_custom_filter_words(guild_id)))
+
+
+def add_security_log(guild_id: int, user_id: int, action: str, reason: str, channel_id: int = 0):
+    settings = get_security_settings(guild_id)
+    if not settings.get("security_log_enabled"):
+        return
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT INTO security_logs(guild_id, user_id, action, reason, channel_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (guild_id, user_id or 0, action[:100], reason[:700], channel_id or 0, now)
+    )
+    conn.commit()
+
+
+def list_security_logs(guild_id: int, limit: int = SECURITY_LOG_PREVIEW_LIMIT):
+    c.execute(
+        """
+        SELECT user_id, action, reason, channel_id, created_at
+        FROM security_logs
+        WHERE guild_id=?
+        ORDER BY log_id DESC
+        LIMIT ?
+        """,
+        (guild_id, limit)
+    )
+    return c.fetchall()
+
+
+def count_security_logs(guild_id: int, hours: int = 24):
+    cutoff = (datetime.datetime.now() - datetime.timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "SELECT COUNT(*) FROM security_logs WHERE guild_id=? AND created_at>=?",
+        (guild_id, cutoff)
+    )
+    row = c.fetchone()
+    return row[0] if row else 0
+
+
+def looks_like_discord_token(content: str) -> bool:
+    return bool(content and SECURITY_TOKEN_REGEX.search(content))
+
+
+def find_dangerous_attachment_name(message: discord.Message):
+    for attachment in getattr(message, "attachments", []):
+        filename = (attachment.filename or "").lower().strip()
+        if not filename:
+            continue
+        if any(filename.endswith(ext) for ext in SECURITY_DANGEROUS_EXTENSIONS):
+            return attachment.filename
+        # 예: image.png.exe, file.txt.js 처럼 이중 확장자 위장도 잡습니다.
+        parts = filename.split(".")
+        if len(parts) >= 3 and f".{parts[-1]}" in SECURITY_DANGEROUS_EXTENSIONS:
+            return attachment.filename
+    return None
+
+
+def dangerous_permissions_from(perms: discord.Permissions):
+    result = []
+    for attr, label in SECURITY_DANGEROUS_PERMISSION_NAMES.items():
+        if getattr(perms, attr, False):
+            result.append(label)
+    return result
+
+
+def dangerous_permissions_added(before: discord.Permissions, after: discord.Permissions):
+    result = []
+    for attr, label in SECURITY_DANGEROUS_PERMISSION_NAMES.items():
+        if not getattr(before, attr, False) and getattr(after, attr, False):
+            result.append(label)
+    return result
+
+
+async def add_auto_warning(member: discord.Member, reason: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO warnings VALUES (?, ?, ?, ?)", (member.id, bot.user.id if bot.user else 0, reason, now))
+    conn.commit()
+    try:
+        return await update_warning_role(member)
+    except Exception:
+        return 0
+
+
+async def get_audit_log_user(guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
+    try:
+        async for entry in guild.audit_logs(limit=5, action=action):
+            if entry.target and getattr(entry.target, "id", None) == target_id:
+                return entry.user
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+    return None
+
+
+async def track_raid_action(guild: discord.Guild, actor: discord.User, action_text: str):
+    settings = get_security_settings(guild.id)
+    if not settings.get("raid_detection") or actor is None or actor.bot:
+        return
+
+    member = guild.get_member(actor.id)
+    if member and member == guild.owner:
+        return
+
+    now_ts = datetime.datetime.now().timestamp()
+    key = (guild.id, actor.id)
+    SECURITY_ACTION_TRACKER.setdefault(key, []).append(now_ts)
+    SECURITY_ACTION_TRACKER[key] = [t for t in SECURITY_ACTION_TRACKER[key] if now_ts - t <= 30]
+    count = len(SECURITY_ACTION_TRACKER[key])
+    add_security_log(guild.id, actor.id, "테러감지", f"{action_text} / 최근 30초 {count}회", 0)
+
+    if count >= 3:
+        await send_log(
+            guild,
+            f"🚨 테러감지 경고\n대상: {actor.mention}\n최근 30초 내 위험 작업: `{count}`회\n마지막 작업: `{action_text}`\n관리자는 권한/역할을 바로 확인해주세요.",
+            "punishment"
+        )
+    else:
+        await send_log(
+            guild,
+            f"🛡️ 테러감지 기록\n대상: {actor.mention}\n작업: `{action_text}`\n최근 기록: `{count}/3`",
+            "general"
+        )
+
+
+def get_channel_by_id_or_name(guild: discord.Guild, channel_id: int = 0, names=None, channel_type: str = "text"):
+    if guild is None:
+        return None
+
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel:
+            return channel
+
+    names = names or []
+    channel_list = guild.text_channels if channel_type == "text" else guild.voice_channels
+    for name in names:
+        channel = discord.utils.get(channel_list, name=name)
+        if channel:
+            return channel
+    return None
+
+
+def get_role_by_id_or_name(guild: discord.Guild, role_id: int = 0, names=None):
+    if guild is None:
+        return None
+
+    if role_id:
+        role = guild.get_role(role_id)
+        if role:
+            return role
+
+    names = names or []
+    for name in names:
+        role = discord.utils.get(guild.roles, name=name)
+        if role:
+            return role
+    return None
+
+
+def channel_mention_by_id_or_name(guild: discord.Guild, channel_id: int = 0, names=None):
+    channel = get_channel_by_id_or_name(guild, channel_id, names, "text")
+    return channel.mention if channel else "미설정"
+
+
+def role_mention_by_id_or_name(guild: discord.Guild, role_id: int = 0, names=None):
+    role = get_role_by_id_or_name(guild, role_id, names)
+    return role.mention if role else "미설정"
+
+
+def get_log_channel(guild: discord.Guild, log_type: str = "general"):
+    if guild is None:
+        return None
+
+    # 웹 대시보드에서 연결한 로그 채널을 최우선으로 사용합니다.
+    log_column_map = {
+        "general": "general_log_channel_id",
+        "warning": "warning_log_channel_id",
+        "punishment": "punishment_log_channel_id",
+        "chat": "chat_log_channel_id",
+        "voice": "voice_log_channel_id",
+        "nickname": "nickname_log_channel_id",
+        "level": "level_log_channel_id",
+        "security": "security_log_channel_id",
+        "clean": "clean_log_channel_id",
+    }
+    saved_id = get_saved_channel_id(guild.id, log_column_map.get(log_type, "log_channel_id")) or get_saved_channel_id(guild.id, "log_channel_id")
+    if saved_id:
+        channel = guild.get_channel(saved_id)
+        if channel:
+            return channel
+
+    channel_name = LOG_CHANNEL_NAMES.get(log_type, LOG_CHANNEL_NAMES["general"])
+    channel = discord.utils.get(guild.text_channels, name=channel_name)
+    if channel:
+        return channel
+
+    # 로그 카테고리를 아직 만들지 않았을 때 기존 LOG_CHANNEL_ID 또는 일반적인 로그 채널명으로도 로그가 가게 유지
+    fallback = get_channel_by_id_or_name(guild, LOG_CHANNEL_ID, ["📋-일반로그", "bot-log", "로그", "관리로그"], "text")
+    return fallback
+
+
+async def send_log(guild: discord.Guild, message: str, log_type: str = "general"):
+    if guild is None:
+        return
+    channel = get_log_channel(guild, log_type)
+    if not channel:
+        return
+    try:
+        await channel.send(message)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
+# =========================
+# 봇 관리자 역할 권한
+# =========================
+# 이제 봇 세팅/관리 명령어는 특정 유저 ID를 따로 등록하지 않고,
+# 서버에서 아래 역할을 가진 사람만 사용할 수 있습니다.
+BOT_MANAGER_ROLE_NAMES = [
+    "대표", "부대표", "총관리자", "부관리자",
+    "운영진", "관리자", "팀장", "부팀장",
+]
+
+
+def get_authorized_user_ids():
+    # 예전 DB 호환용입니다. 새 방식에서는 사용하지 않습니다.
+    return set()
+
+
+def has_bot_manager_role(member: discord.Member):
+    if member is None:
+        return False
+    return any(role.name in BOT_MANAGER_ROLE_NAMES for role in getattr(member, "roles", []))
+
+
+async def is_bot_owner_user(user: discord.User):
+    if user.id in BOT_OWNER_IDS:
+        return True
+    try:
+        return await bot.is_owner(user)
+    except Exception:
+        return False
+
+
+async def can_use_owner_commands(user: discord.User):
+    # 봇 소유자 전용 명령어도 서버 안에서는 대표~부팀장 역할이 사용할 수 있게 변경합니다.
+    if isinstance(user, discord.Member) and has_bot_manager_role(user):
+        return True
+    return await is_bot_owner_user(user)
+
+
+async def can_use_setup_commands(user: discord.User):
+    if isinstance(user, discord.Member):
+        if has_bot_manager_role(user):
+            return True
+        # 새 서버에서 역할을 만들기 전 최초 세팅은 서버 관리자도 사용할 수 있게 둡니다.
+        if user.guild_permissions.administrator:
+            return True
+    return await is_bot_owner_user(user)
+
+
+async def can_manage_bot_in_guild(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return False
+    return await can_use_setup_commands(interaction.user)
+
+
+async def reject_if_not_setup_manager(interaction: discord.Interaction):
+    if await can_manage_bot_in_guild(interaction):
+        return False
+    await interaction.response.send_message(
+        "❌ 봇 관리자 역할(대표/부대표/총관리자/부관리자/운영진/관리자/팀장/부팀장)만 사용할 수 있습니다.",
+        ephemeral=True
+    )
+    return True
+
+
+async def reject_if_not_bot_manager(interaction: discord.Interaction):
+    if await can_manage_bot_in_guild(interaction):
+        return False
+    await interaction.response.send_message(
+        "❌ 봇 관리자 역할(대표~부팀장)만 사용할 수 있습니다.",
+        ephemeral=True
+    )
+    return True
+
+
+def save_guild_settings(guild: discord.Guild, *, welcome_channel=None, goodbye_channel=None, rule_channel=None, game_role_channel=None, log_channel=None):
+    c.execute("SELECT guild_id FROM guild_settings WHERE guild_id=?", (guild.id,))
+    exists = c.fetchone() is not None
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    values = {
+        "welcome_channel_id": welcome_channel.id if welcome_channel else 0,
+        "goodbye_channel_id": goodbye_channel.id if goodbye_channel else 0,
+        "rule_channel_id": rule_channel.id if rule_channel else 0,
+        "game_role_channel_id": game_role_channel.id if game_role_channel else 0,
+        "log_channel_id": log_channel.id if log_channel else 0,
+    }
+    if exists:
+        c.execute("""
+            UPDATE guild_settings
+            SET welcome_channel_id=COALESCE(NULLIF(?, 0), welcome_channel_id),
+                goodbye_channel_id=COALESCE(NULLIF(?, 0), goodbye_channel_id),
+                rule_channel_id=COALESCE(NULLIF(?, 0), rule_channel_id),
+                game_role_channel_id=COALESCE(NULLIF(?, 0), game_role_channel_id),
+                log_channel_id=COALESCE(NULLIF(?, 0), log_channel_id),
+                updated_at=?
+            WHERE guild_id=?
+        """, (values["welcome_channel_id"], values["goodbye_channel_id"], values["rule_channel_id"], values["game_role_channel_id"], values["log_channel_id"], now, guild.id))
+    else:
+        c.execute("""
+            INSERT INTO guild_settings(guild_id, welcome_channel_id, goodbye_channel_id, rule_channel_id, game_role_channel_id, log_channel_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (guild.id, values["welcome_channel_id"], values["goodbye_channel_id"], values["rule_channel_id"], values["game_role_channel_id"], values["log_channel_id"], now))
+    conn.commit()
+
+
+def get_saved_channel_id(guild_id: int, column: str):
+    ensure_dashboard_sync_tables()
+    if column not in DASHBOARD_GUILD_SETTING_COLUMNS and column not in {
+        "welcome_channel_id", "goodbye_channel_id", "rule_channel_id", "game_role_channel_id", "log_channel_id"
+    }:
+        return 0
+
+    def _read_local():
+        try:
+            c.execute(f"SELECT {column} FROM guild_settings WHERE guild_id=?", (guild_id,))
+            row = c.fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except sqlite3.Error:
+            return 0
+
+    value = _read_local()
+    if value:
+        return value
+
+    # 로컬 DB에 없으면 웹 대시보드 DB를 자동으로 읽어와서 저장합니다.
+    ensure_dashboard_sync_for_guild(guild_id)
+    return _read_local()
+
+
+
+def get_default_role_ids(guild_id: int):
+    c.execute("SELECT role_id FROM default_roles WHERE guild_id=?", (guild_id,))
+    return [row[0] for row in c.fetchall()]
+
+
+async def give_default_roles(member: discord.Member):
+    """서버에 등록된 기본 역할을 신규 멤버에게 자동 지급합니다."""
+    if member.bot or member.guild is None:
+        return
+
+    role_ids = get_default_role_ids(member.guild.id)
+    if not role_ids:
+        return
+
+    roles = []
+    for role_id in role_ids:
+        role = member.guild.get_role(role_id)
+        if role and not role.managed and role not in member.roles:
+            roles.append(role)
+
+    if not roles:
+        return
+
+    try:
+        await member.add_roles(*roles, reason="기본 역할 자동 지급")
+        role_text = ", ".join(role.mention for role in roles)
+        await send_log(member.guild, f"🎭 기본 역할 자동 지급\n대상: {member.mention}\n역할: {role_text}", "general")
+    except discord.Forbidden:
+        await send_log(member.guild, f"❌ 기본 역할 자동 지급 실패\n대상: {member.mention}\n사유: 봇 역할 위치 또는 권한 부족", "general")
+    except discord.HTTPException as e:
+        await send_log(member.guild, f"❌ 기본 역할 자동 지급 실패\n대상: {member.mention}\n오류: `{e}`", "general")
+
+
+# 봇권한추가/삭제/목록 명령어는 제거했습니다.
+# 이제 별도 유저 등록 없이 서버 역할(대표~부팀장/관리자/운영진)로 권한을 판단합니다.
+
+
+@bot.tree.command(name="역할기본등록", description="구분선 역할(게임역할/멤버등급/프로필/특수역할/미인증)을 기본 역할로 자동 등록합니다.")
+async def register_default_role(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    guild = interaction.guild
+    bot_member = guild.me or guild.get_member(bot.user.id)
+
+    # 네가 원한 구분선 역할들을 기본 역할로 자동 등록
+    auto_default_role_names = [
+        "˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚",
+        "˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚",
+        "˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚",
+        "˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚",
+        "미인증",
+    ]
+
+    registered = []
+    missing = []
+    skipped = []
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for role_name in auto_default_role_names:
+        role = discord.utils.get(guild.roles, name=role_name)
+
+        if role is None:
+            missing.append(role_name)
+            continue
+
+        if role == guild.default_role or role.managed:
+            skipped.append(role_name)
+            continue
+
+        if bot_member and role >= bot_member.top_role:
+            skipped.append(f"{role_name}(봇 역할보다 높음)")
+            continue
+
+        c.execute(
+            "INSERT OR REPLACE INTO default_roles(guild_id, role_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+            (guild.id, role.id, interaction.user.id, now)
+        )
+        registered.append(role)
+
+    conn.commit()
+
+    registered_text = "\n".join(f"• {role.mention}" for role in registered) if registered else "없음"
+    missing_text = "\n".join(f"• `{name}`" for name in missing) if missing else "없음"
+    skipped_text = "\n".join(f"• `{name}`" for name in skipped) if skipped else "없음"
+
+    await interaction.response.send_message(
+        "✅ 구분선 역할 기본 자동등록이 완료됐습니다.\n\n"
+        f"**등록됨**\n{registered_text}\n\n"
+        f"**없는 역할**\n{missing_text}\n\n"
+        f"**건너뜀**\n{skipped_text}",
+        ephemeral=True
+    )
+
+    await send_log(
+        guild,
+        f"🎭 구분선 역할 기본 자동등록\n관리자: {interaction.user.mention}\n등록 수: {len(registered)}개",
+        "general"
+    )
+
+
+@bot.tree.command(name="역할기본해제", description="등록된 기본 역할을 해제합니다.")
+async def unregister_default_role(interaction: discord.Interaction, role: discord.Role):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    c.execute("DELETE FROM default_roles WHERE guild_id=? AND role_id=?", (interaction.guild.id, role.id))
+    conn.commit()
+    await interaction.response.send_message(f"✅ 기본 역할에서 {role.mention} 을 해제했습니다.", ephemeral=True)
+    await send_log(interaction.guild, f"🎭 기본 역할 해제\n역할: {role.mention}\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="역할기본목록", description="현재 서버의 기본 역할 목록을 확인합니다.")
+async def list_default_roles(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    role_ids = get_default_role_ids(interaction.guild.id)
+    roles = [interaction.guild.get_role(role_id) for role_id in role_ids]
+    roles = [role for role in roles if role]
+
+    if not roles:
+        return await interaction.response.send_message("현재 등록된 기본 역할이 없습니다.", ephemeral=True)
+
+    text = "\n".join(f"• {role.mention} (`{role.id}`)" for role in roles)
+    await interaction.response.send_message(f"✅ 기본 역할 목록\n{text}", ephemeral=True)
+
+
+@bot.tree.command(name="서버추가", description="현재 서버를 봇 세팅 서버로 저장합니다. 환영테스트도 이 설정을 사용합니다.")
+async def register_server(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    welcome_channel = get_channel_by_id_or_name(guild, WELCOME_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "환영", "welcome"], "text")
+    goodbye_channel = get_channel_by_id_or_name(guild, GOODBYE_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "퇴장", "goodbye"], "text")
+    rule_channel = get_channel_by_id_or_name(guild, RULE_CHANNEL_ID, ["📌-필독", "필독", "규칙"], "text")
+    game_role_channel = get_channel_by_id_or_name(guild, GAME_ROLE_CHANNEL_ID, ["🎮-게임역할선택", "게임역할선택", "🎮-게임채팅"], "text")
+    log_channel = get_log_channel(guild, "general")
+    save_guild_settings(guild, welcome_channel=welcome_channel, goodbye_channel=goodbye_channel, rule_channel=rule_channel, game_role_channel=game_role_channel, log_channel=log_channel)
+
+    await interaction.response.send_message(
+        f"✅ 서버 설정을 저장했습니다.\n서버 ID: `{guild.id}`\n환영 채널: {welcome_channel.mention if welcome_channel else '미설정'}\n게임역할 채널: {game_role_channel.mention if game_role_channel else '미설정'}",
+        ephemeral=True
+    )
+
+
+
+
+# =========================
+# 역할 선택 패널
+# =========================
+
+PROFILE_ROLE_NAMES = ["남성", "여성", "20대", "10대"]
+
+
+class ProfileRoleSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, description=f"{name} 역할을 선택/해제합니다.")
+            for name in PROFILE_ROLE_NAMES
+        ]
+        super().__init__(
+            placeholder="프로필 역할을 선택해주세요",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            custom_id="profile_role_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        member = interaction.user
+        selected_names = set(self.values)
+
+        add_roles = []
+        remove_roles = []
+
+        for role_name in PROFILE_ROLE_NAMES:
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if role is None:
+                continue
+
+            if role_name in selected_names and role not in member.roles:
+                add_roles.append(role)
+            elif role_name not in selected_names and role in member.roles:
+                remove_roles.append(role)
+
+        try:
+            if add_roles:
+                await member.add_roles(*add_roles, reason="프로필 역할 선택")
+            if remove_roles:
+                await member.remove_roles(*remove_roles, reason="프로필 역할 선택 해제")
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ 봇 역할 위치가 낮아서 역할을 지급/해제할 수 없습니다.",
+                ephemeral=True
+            )
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                "❌ 역할 처리 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+        added_text = ", ".join(role.name for role in add_roles) if add_roles else "없음"
+        removed_text = ", ".join(role.name for role in remove_roles) if remove_roles else "없음"
+
+        await interaction.response.send_message(
+            f"✅ 프로필 역할 선택이 완료됐습니다.\n추가: {added_text}\n해제: {removed_text}",
+            ephemeral=True
+        )
+
+
+
+CREATOR_ROLE_NAMES = ["스트리머", "유튜버", "디자이너", "개발자"]
+
+class CreatorRoleSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, description=f"{name} 역할을 선택/해제합니다.")
+            for name in CREATOR_ROLE_NAMES
+        ]
+        super().__init__(
+            placeholder="크리에이터 역할을 선택해주세요",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            custom_id="creator_role_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        selected = set(self.values)
+
+        add_roles = []
+        remove_roles = []
+
+        for role_name in CREATOR_ROLE_NAMES:
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if not role:
+                continue
+
+            if role_name in selected and role not in member.roles:
+                add_roles.append(role)
+            elif role_name not in selected and role in member.roles:
+                remove_roles.append(role)
+
+        if add_roles:
+            await member.add_roles(*add_roles)
+        if remove_roles:
+            await member.remove_roles(*remove_roles)
+
+        await interaction.response.send_message("✅ 크리에이터 역할이 적용되었습니다.", ephemeral=True)
+
+class CreatorRoleSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(CreatorRoleSelect())
+
+
+class ProfileRoleSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(ProfileRoleSelect())
+
+
+@bot.tree.command(name="역할선택생성", description="필독 카테고리에 뉴페이스용 프로필 역할 선택 패널을 생성합니다.")
+async def create_profile_role_panel(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+
+    rule_category = discord.utils.get(guild.categories, name="📌 필독")
+    if rule_category is None:
+        rule_category = await guild.create_category("📌 필독")
+
+    channel = discord.utils.get(guild.text_channels, name="🎭-역할선택")
+    if channel is None:
+        channel = await guild.create_text_channel("🎭-역할선택", category=rule_category)
+    elif channel.category != rule_category:
+        await channel.edit(category=rule_category)
+
+    newface_role = discord.utils.get(guild.roles, name="뉴페이스")
+    unverified_role = discord.utils.get(guild.roles, name="미인증")
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    if newface_role:
+        overwrites[newface_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+    if unverified_role:
+        overwrites[unverified_role] = discord.PermissionOverwrite(view_channel=False)
+
+    await channel.edit(overwrites=overwrites)
+
+    embed = discord.Embed(
+        title="🎭 프로필 역할 선택",
+        description=(
+            "아래 선택 박스를 눌러서 프로필 역할을 받을 수 있어요.\n\n"
+            "선택 가능 역할\n"
+            "• 남성 / 여성\n"
+            "• 20대 / 10대\n\n"
+            "다시 선택하면 역할을 바꿀 수 있습니다."
+        ),
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="🌸 뉴페이스도 쉽게 누를 수 있는 역할 선택 패널")
+
+    await channel.send(embed=embed, view=ProfileRoleSelectView())
+
+    creator_embed = discord.Embed(
+        title="🎬 크리에이터 역할 선택",
+        description="스트리머, 유튜버, 디자이너, 개발자 역할을 선택할 수 있습니다.",
+        color=BOT_COLOR
+    )
+    await channel.send(embed=creator_embed, view=CreatorRoleSelectView())
+
+    await interaction.followup.send(
+        f"✅ 역할 선택 패널을 {channel.mention} 에 생성했습니다.",
+        ephemeral=True
+    )
+    await send_log(guild, f"🎭 역할 선택 패널 생성\n채널: {channel.mention}\n관리자: {interaction.user.mention}", "general")
+
+
+
+
+
+# =========================
+# 구인구직 채널 생성 / 임베드 설정
+# =========================
+
+# 구인구직 임베드 커스텀 저장용 테이블입니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS recruit_embeds (
+    guild_id INTEGER,
+    recruit_key TEXT,
+    title TEXT,
+    description TEXT,
+    color TEXT,
+    image_url TEXT,
+    footer TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, recruit_key)
+)
+""")
+conn.commit()
+
+RECRUIT_CATEGORY_NAME = " 🌸 구 인 구 직 🌸 "
+
+RECRUIT_TEXT_CHANNELS = [
+    {
+        "key": "benefit",
+        "name": "📜︱혜택안내",
+        "topic": "📜 관리자 혜택, 활동 보상, 지원 전 안내를 확인하는 공간입니다.",
+        "title": "📜 관리자 혜택 안내",
+        "description": (
+            "╭──────────────╮\n"
+            "      📜 관리자 혜택 안내\n"
+            "╰──────────────╯\n\n"
+            "💖 **지원 전 확인해주세요**\n"
+            "• 활동량에 따른 포인트 보상\n"
+            "• 팀별 전용 역할 지급\n"
+            "• 우수 활동자 특별 칭호 지급\n"
+            "• 서버 이벤트 우선 참여 혜택\n\n"
+            "✨ 자세한 혜택은 담당 관리자에게 문의해주세요."
+        ),
+    },
+    {
+        "key": "planning",
+        "name": "🎁︱기획팀지원",
+        "topic": "🎁 이벤트와 서버 콘텐츠를 기획하는 기획팀 지원 공간입니다.",
+        "title": "🎁 기획팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       🎁 기획팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 서버 이벤트 기획\n"
+            "• 콘텐츠 아이디어 제안\n"
+            "• 행사 진행 보조\n\n"
+            "💎 **지원 조건**\n"
+            "• 책임감 있게 활동 가능하신 분\n"
+            "• 새로운 아이디어를 잘 내는 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "newbie",
+        "name": "🐣︱뉴관팀지원",
+        "topic": "🐣 뉴페이스 적응을 도와주는 뉴관팀 지원 공간입니다.",
+        "title": "🐣 뉴관팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       🐣 뉴관팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 신규 멤버 안내\n"
+            "• 서버 적응 도움\n"
+            "• 기본 규칙 설명\n\n"
+            "🌸 **우대 사항**\n"
+            "• 친절하게 안내할 수 있는 분\n"
+            "• 뉴페이스와 대화를 잘 이어가는 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "guide",
+        "name": "📢︱안내팀지원",
+        "topic": "📢 서버 이용 안내와 문의 응대를 담당하는 안내팀 지원 공간입니다.",
+        "title": "📢 안내팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       📢 안내팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 서버 이용 안내\n"
+            "• 질문 응답\n"
+            "• 기본 시스템 설명\n\n"
+            "💎 **지원 조건**\n"
+            "• 차분하게 설명 가능한 분\n"
+            "• 문의 응대가 빠른 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "promotion",
+        "name": "💌︱홍보팀지원",
+        "topic": "💌 서버 홍보 활동과 홍보 문구 작성을 담당하는 홍보팀 지원 공간입니다.",
+        "title": "💌 홍보팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       💌 홍보팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 서버 홍보\n"
+            "• 홍보 문구 작성\n"
+            "• 홍보 활동 관리\n\n"
+            "✨ **우대 사항**\n"
+            "• 활동량이 좋은 분\n"
+            "• 홍보 경험이 있는 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "security",
+        "name": "🛡️︱보안팀지원",
+        "topic": "🛡️ 신고 확인, 분쟁 대응, 서버 보안을 담당하는 보안팀 지원 공간입니다.",
+        "title": "🛡️ 보안팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       🛡️ 보안팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 신고 확인\n"
+            "• 분쟁 상황 확인\n"
+            "• 서버 보안 관리\n\n"
+            "🚨 **지원 조건**\n"
+            "• 침착하게 상황 판단 가능한 분\n"
+            "• 규칙을 공정하게 적용할 수 있는 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "scrim",
+        "name": "🎮︱내전팀지원",
+        "topic": "🎮 내전 모집, 게임 이벤트, 참여자 관리를 담당하는 내전팀 지원 공간입니다.",
+        "title": "🎮 내전팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       🎮 내전팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 내전 모집 및 진행\n"
+            "• 게임 이벤트 운영\n"
+            "• 참여자 관리\n\n"
+            "🏆 **우대 사항**\n"
+            "• 게임 활동이 활발한 분\n"
+            "• 팀 진행을 잘 이끄는 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "admin",
+        "name": "📚︱행정팀지원",
+        "topic": "📚 서버 운영 보조와 기록 정리를 담당하는 행정팀 지원 공간입니다.",
+        "title": "📚 행정팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       📚 행정팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 운영 보조\n"
+            "• 기록 정리\n"
+            "• 관리 업무 지원\n\n"
+            "📝 **지원 조건**\n"
+            "• 꼼꼼하게 정리 가능한 분\n"
+            "• 일정하게 활동 가능한 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "design",
+        "name": "🎨︱디자인팀지원",
+        "topic": "🎨 배너, 프로필, 포스터 등 디자인 작업을 담당하는 디자인팀 지원 공간입니다.",
+        "title": "🎨 디자인팀 모집",
+        "description": (
+            "╭──────────────╮\n"
+            "       🎨 디자인팀 지원\n"
+            "╰──────────────╯\n\n"
+            "📌 **담당 업무**\n"
+            "• 서버 배너 제작\n"
+            "• 프로필/포스터 제작\n"
+            "• 공지 이미지 제작\n\n"
+            "✨ **우대 사항**\n"
+            "• 디자인 작업이 가능한 분\n"
+            "• 포트폴리오가 있는 분\n\n"
+            "💬 지원은 면접대기실을 이용해주세요."
+        ),
+    },
+    {
+        "key": "move",
+        "name": "🚪︱이동권한",
+        "topic": "🚪 이동권한 신청 방법과 권한 사용 기준을 확인하는 공간입니다.",
+        "title": "🚪 이동권한 안내",
+        "description": (
+            "╭──────────────╮\n"
+            "       🚪 이동권한 안내\n"
+            "╰──────────────╯\n\n"
+            "📌 **안내 내용**\n"
+            "• 이동권한 신청 방법\n"
+            "• 권한 사용 기준\n"
+            "• 주의사항 안내\n\n"
+            "⚠️ 권한 남용 시 회수될 수 있습니다.\n"
+            "💬 필요한 경우 담당자에게 문의해주세요."
+        ),
+    },
+    {
+        "key": "fixed",
+        "name": "💎︱고정멤버",
+        "topic": "💎 고정멤버 신청, 활동 기준, 모집 공지를 확인하는 공간입니다.",
+        "title": "💎 고정멤버 안내",
+        "description": (
+            "╭──────────────╮\n"
+            "       💎 고정멤버 안내\n"
+            "╰──────────────╯\n\n"
+            "📌 **안내 내용**\n"
+            "• 고정멤버 신청 방법\n"
+            "• 활동 기준\n"
+            "• 모집 공지 확인\n\n"
+            "🌟 **추천 대상**\n"
+            "• 꾸준히 활동 가능한 분\n"
+            "• 서버 분위기를 함께 만들어갈 분\n\n"
+            "💬 신청은 담당자에게 문의해주세요."
+        ),
+    },
+]
+
+RECRUIT_WAITING_VOICE_NAME = "🔎︱면접대기실"
+RECRUIT_INTERVIEW_VOICE_NAMES = ["🎤︱면접실-1", "🎤︱면접실-2"]
+RECRUIT_DEFAULT_COLOR = "FFB6C1"
+RECRUIT_DEFAULT_IMAGE_URL = "https://i.pinimg.com/originals/d8/27/c2/d827c2bfe1fe524e30b5ad429b7b72cf.gif"
+
+
+def get_recruit_item(recruit_key: str):
+    for item in RECRUIT_TEXT_CHANNELS:
+        if item["key"] == recruit_key:
+            return item
+    return RECRUIT_TEXT_CHANNELS[0]
+
+
+def get_recruit_embed_config(guild_id: int, recruit_key: str):
+    ensure_dashboard_sync_for_guild(guild_id)
+    c.execute(
+        "SELECT title, description, color, image_url, footer FROM recruit_embeds WHERE guild_id=? AND recruit_key=?",
+        (guild_id, recruit_key)
+    )
+    row = c.fetchone()
+    if not row:
+        return None
+    return {
+        "title": row[0] or "",
+        "description": row[1] or "",
+        "color": row[2] or RECRUIT_DEFAULT_COLOR,
+        "image_url": row[3] or "",
+        "footer": row[4] or "",
+    }
+
+
+def save_recruit_embed_config(guild_id: int, recruit_key: str, title: str, description: str, color: str, image_url: str, footer: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO recruit_embeds(guild_id, recruit_key, title, description, color, image_url, footer, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (guild_id, recruit_key, title, description, color, image_url, footer, now)
+    )
+    conn.commit()
+
+
+def delete_recruit_embed_config(guild_id: int, recruit_key: str):
+    c.execute("DELETE FROM recruit_embeds WHERE guild_id=? AND recruit_key=?", (guild_id, recruit_key))
+    conn.commit()
+
+
+def build_recruit_embed(guild: discord.Guild, item: dict):
+    config = get_recruit_embed_config(guild.id, item["key"]) or {}
+    title = config.get("title") or item["title"]
+    description = config.get("description") or item["description"]
+    color_value = config.get("color") or RECRUIT_DEFAULT_COLOR
+    image_url = safe_url(config.get("image_url") or RECRUIT_DEFAULT_IMAGE_URL)
+    footer = config.get("footer") or "🌸 구인구직 안내 | 지원 전 내용을 꼭 확인해주세요."
+
+    embed = discord.Embed(
+        title=title[:256],
+        description=description[:4096],
+        color=normalize_embed_color(color_value)
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    if image_url:
+        embed.set_image(url=image_url)
+    embed.add_field(
+        name="🎙️ 면접 안내",
+        value=f"지원 희망자는 `{RECRUIT_WAITING_VOICE_NAME}` 에 입장 후 담당자를 기다려주세요.",
+        inline=False
+    )
+    embed.set_footer(text=footer[:2048])
+    return embed
+
+
+async def send_recruit_embed_once(channel: discord.TextChannel, guild: discord.Guild, item: dict):
+    """구인구직 채널에 안내 임베드를 중복 없이 자동 생성합니다."""
+    title = (get_recruit_embed_config(guild.id, item["key"]) or {}).get("title") or item["title"]
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds:
+                if (msg.embeds[0].title or "") == title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_recruit_embed(guild, item))
+    return True
+
+
+async def create_recruit_category_channels(guild: discord.Guild):
+    """구인구직 카테고리와 채널 모음집을 생성하고, 필독 카테고리 바로 밑에 배치합니다."""
+    rule_category = discord.utils.get(guild.categories, name="📌 필독")
+    if rule_category is None:
+        rule_category = await guild.create_category("📌 필독")
+
+    category = discord.utils.get(guild.categories, name=RECRUIT_CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(
+            RECRUIT_CATEGORY_NAME,
+            position=rule_category.position + 1
+        )
+    else:
+        try:
+            await category.edit(position=rule_category.position + 1)
+        except discord.HTTPException:
+            pass
+
+    created = []
+
+    for item in RECRUIT_TEXT_CHANNELS:
+        channel_name = item["name"]
+        topic = item["topic"]
+
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if channel is None:
+            channel = await guild.create_text_channel(channel_name, category=category, topic=topic)
+            created.append(channel_name)
+            await asyncio.sleep(0.2)
+        else:
+            changed = False
+            if channel.category != category:
+                await channel.edit(category=category)
+                changed = True
+            if channel.topic != topic:
+                await channel.edit(topic=topic)
+                changed = True
+            if changed:
+                created.append(f"{channel_name}(위치/설명 수정)")
+                await asyncio.sleep(0.2)
+
+        sent = await send_recruit_embed_once(channel, guild, item)
+        if sent:
+            created.append(f"{channel_name}(안내 임베드)")
+            await asyncio.sleep(0.2)
+
+    voice_channel = discord.utils.get(guild.voice_channels, name=RECRUIT_WAITING_VOICE_NAME)
+    if voice_channel is None:
+        await guild.create_voice_channel(RECRUIT_WAITING_VOICE_NAME, category=category, user_limit=1)
+        created.append(f"{RECRUIT_WAITING_VOICE_NAME}(통방 0/1)")
+    else:
+        if voice_channel.category != category or voice_channel.user_limit != 1:
+            await voice_channel.edit(category=category, user_limit=1)
+            created.append(f"{RECRUIT_WAITING_VOICE_NAME}(통방 0/1 수정)")
+
+    for voice_name in RECRUIT_INTERVIEW_VOICE_NAMES:
+        voice = discord.utils.get(guild.voice_channels, name=voice_name)
+        if voice is None:
+            await guild.create_voice_channel(voice_name, category=category, user_limit=2)
+            created.append(f"{voice_name}(면접실)")
+            await asyncio.sleep(0.2)
+        elif voice.category != category or voice.user_limit != 2:
+            await voice.edit(category=category, user_limit=2)
+            created.append(f"{voice_name}(면접실 수정)")
+            await asyncio.sleep(0.2)
+
+    return category, created
+
+
+async def create_recruit_channels_under_rule(guild: discord.Guild):
+    """기존 호환용: 구인구직 전용 카테고리를 필독 카테고리 바로 밑에 생성합니다."""
+    return await create_recruit_category_channels(guild)
+
+
+@bot.tree.command(name="구인구직생성", description="꾸민 구인구직 카테고리와 채널/안내 임베드를 자동 생성합니다.")
+async def create_recruit_channels(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    category, created = await create_recruit_category_channels(interaction.guild)
+
+    if created:
+        created_text = "\n".join(f"• `{name}`" for name in created[:30])
+        if len(created) > 30:
+            created_text += f"\n외 {len(created) - 30}개"
+        msg = f"✅ 구인구직 카테고리/채널/안내 임베드를 업그레이드해서 생성했습니다.\n\n{created_text}"
+    else:
+        msg = "✅ 이미 구인구직 카테고리, 채널, 안내 임베드가 모두 있습니다."
+
+    await interaction.followup.send(msg, ephemeral=True)
+    await send_log(interaction.guild, f"📋 구인구직 업그레이드 생성\n카테고리: {category.name}\n관리자: {interaction.user.mention}", "general")
+
+
+class RecruitEmbedEditModal(discord.ui.Modal):
+    def __init__(self, recruit_key: str):
+        item = get_recruit_item(recruit_key)
+        super().__init__(title=f"{item['title']} 임베드 설정")
+        self.recruit_key = recruit_key
+        self.title_input = discord.ui.TextInput(label="제목", default=item["title"][:256], required=True, max_length=256)
+        self.description_input = discord.ui.TextInput(label="내용", default=item["description"][:4000], style=discord.TextStyle.paragraph, required=True, max_length=4000)
+        self.color_input = discord.ui.TextInput(label="색상 HEX", default=RECRUIT_DEFAULT_COLOR, placeholder="예: FFB6C1", required=False, max_length=10)
+        self.image_input = discord.ui.TextInput(label="이미지/GIF URL", default=RECRUIT_DEFAULT_IMAGE_URL, required=False, max_length=500)
+        self.footer_input = discord.ui.TextInput(label="하단 문구", default="🌸 구인구직 안내 | 지원 전 내용을 꼭 확인해주세요.", required=False, max_length=2048)
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = str(self.color_input.value).strip().replace("#", "") or RECRUIT_DEFAULT_COLOR
+        if len(color_value) not in (3, 6) or not all(ch in "0123456789abcdefABCDEF" for ch in color_value):
+            return await interaction.response.send_message("❌ 색상은 `FFB6C1` 같은 HEX 값으로 입력해주세요.", ephemeral=True)
+
+        image_url = safe_url(str(self.image_input.value))
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지/GIF URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+
+        save_recruit_embed_config(
+            interaction.guild.id,
+            self.recruit_key,
+            str(self.title_input.value),
+            str(self.description_input.value),
+            color_value,
+            image_url,
+            str(self.footer_input.value),
+        )
+        await interaction.response.send_message("✅ 구인구직 임베드 설정을 저장했습니다. `/구인구직생성`을 실행하면 자동 안내메시지로 생성됩니다.", ephemeral=True)
+        await send_log(interaction.guild, f"📝 구인구직 임베드 수정\n항목: `{self.recruit_key}`\n관리자: {interaction.user.mention}", "general")
+
+
+class RecruitEmbedSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=item["title"].replace("모집", "").replace("안내", "").strip(), value=item["key"], description=item["name"][:100])
+            for item in RECRUIT_TEXT_CHANNELS
+        ]
+        super().__init__(placeholder="꾸밀 구인구직 항목을 선택해주세요.", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected_key = self.values[0]
+        item = get_recruit_item(self.view.selected_key)
+        embed = build_recruit_embed(interaction.guild, item)
+        embed.title = f"👀 미리보기 · {embed.title}"
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class RecruitEmbedSettingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.selected_key = RECRUIT_TEXT_CHANNELS[0]["key"]
+        self.add_item(RecruitEmbedSelect())
+
+    @discord.ui.button(label="만들기/수정", emoji="📝", style=discord.ButtonStyle.green)
+    async def edit_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        modal = RecruitEmbedEditModal(self.selected_key)
+        config = get_recruit_embed_config(interaction.guild.id, self.selected_key)
+        if config:
+            modal.title_input.default = config["title"][:256]
+            modal.description_input.default = config["description"][:4000]
+            modal.color_input.default = config["color"] or RECRUIT_DEFAULT_COLOR
+            modal.image_input.default = config["image_url"] or ""
+            modal.footer_input.default = config["footer"] or ""
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="미리보기", emoji="👀", style=discord.ButtonStyle.blurple)
+    async def preview_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        item = get_recruit_item(self.selected_key)
+        await interaction.response.send_message(embed=build_recruit_embed(interaction.guild, item), ephemeral=True)
+
+    @discord.ui.button(label="기본값", emoji="🗑️", style=discord.ButtonStyle.red)
+    async def reset_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        delete_recruit_embed_config(interaction.guild.id, self.selected_key)
+        item = get_recruit_item(self.selected_key)
+        await interaction.response.send_message(f"✅ `{item['title']}` 임베드를 기본값으로 초기화했습니다.", ephemeral=True)
+
+    @discord.ui.button(label="자동생성", emoji="🚀", style=discord.ButtonStyle.gray)
+    async def auto_create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        category, created = await create_recruit_category_channels(interaction.guild)
+        await interaction.followup.send(f"✅ 구인구직 안내메시지를 자동생성했습니다.\n카테고리: `{category.name}`\n생성/수정: `{len(created)}`개", ephemeral=True)
+
+
+recruit_embed_group = app_commands.Group(name="구인구직임베드", description="구인구직 안내 임베드를 박스형태로 직접 꾸밉니다.")
+
+
+@recruit_embed_group.command(name="설정", description="괄자혜택부터 고정멤버까지 구인구직 임베드를 직접 꾸밉니다.")
+async def recruit_embed_setting_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    item = RECRUIT_TEXT_CHANNELS[0]
+    embed = discord.Embed(
+        title="🌸 구인구직 임베드 설정",
+        description=(
+            "아래 선택 박스에서 꾸밀 항목을 고른 뒤 `만들기/수정`을 눌러주세요.\n\n"
+            "📜 괄자혜택부터 💎 고정멤버까지 직접 제목/내용/색상/GIF를 설정할 수 있어요.\n"
+            "🚀 `자동생성`을 누르면 설정된 임베드가 구인구직 채널에 자동 안내메시지로 생성됩니다."
+        ),
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="현재 미리보기", value=f"기본 선택: `{item['title']}`", inline=False)
+    embed.set_footer(text="🌸 박스형 구인구직 임베드 설정 패널")
+    await interaction.response.send_message(embed=embed, view=RecruitEmbedSettingView(), ephemeral=True)
+
+
+try:
+    bot.tree.add_command(recruit_embed_group)
+except app_commands.CommandAlreadyRegistered:
+    pass
+
+
+# =========================
+# 이벤트 카테고리 / 채널 자동 생성
+# =========================
+
+EVENT_CATEGORY_NAME = "🎉 이벤트"
+EVENT_CHANNELS = [
+    {
+        "name": "📢-이벤트공지",
+        "topic": "🎉 서버 이벤트 공지와 진행 중인 이벤트를 확인하는 채널입니다.",
+        "title": "🎉 서버 이벤트 공지",
+        "description": (
+            "현재 진행 중인 이벤트와 예정된 이벤트를 확인하는 공간입니다.\n\n"
+            "관리자가 `/이벤트` 명령어로 등록하거나 예약한 이벤트가 이곳에 올라올 수 있어요."
+        ),
+    },
+    {
+        "name": "🎁-이벤트보상",
+        "topic": "🎁 이벤트 보상 목록과 지급 안내를 확인하는 채널입니다.",
+        "title": "🎁 이벤트 보상 안내",
+        "description": (
+            "이벤트 보상 목록을 확인하는 공간입니다.\n\n"
+            "예시 보상\n"
+            "• 포인트\n"
+            "• 랜덤박스\n"
+            "• 칭호권\n"
+            "• 강화보호권\n"
+            "• VIP권 / VVIP권"
+        ),
+    },
+    {
+        "name": "🏆-당첨자발표",
+        "topic": "🏆 이벤트 종료 후 당첨자를 발표하는 채널입니다.",
+        "title": "🏆 이벤트 당첨자 발표",
+        "description": (
+            "이벤트 종료 후 당첨자가 발표되는 공간입니다.\n\n"
+            "당첨자 발표, 보상 지급 안내, 재추첨 안내 등이 올라옵니다."
+        ),
+    },
+    {
+        "name": "📝-이벤트참여",
+        "topic": "📝 이벤트 참여 인증과 신청을 올리는 채널입니다.",
+        "title": "📝 이벤트 참여 채널",
+        "description": (
+            "이벤트 참여 스크린샷, 인증, 신청 내용을 올리는 공간입니다.\n\n"
+            "이벤트마다 참여 방법이 다를 수 있으니 공지를 먼저 확인해주세요."
+        ),
+    },
+    {
+        "name": "📅-이벤트예약",
+        "topic": "📅 예약된 이벤트와 예정 일정을 확인하는 채널입니다.",
+        "title": "📅 예약된 이벤트",
+        "description": (
+            "`/이벤트` 명령어로 예약한 이벤트 일정을 확인하는 공간입니다.\n\n"
+            "관리자는 이벤트 시간, 보상, 진행 내용을 미리 예약할 수 있어요."
+        ),
+    },
+]
+
+
+async def send_event_embed_once(channel: discord.TextChannel, title: str, description: str):
+    """이벤트 채널에 안내 임베드를 중복 없이 전송합니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                if (msg.embeds[0].title or "") == title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="🎉 이벤트 안내 | 공지를 꼭 확인해주세요.")
+    await channel.send(embed=embed)
+    return True
+
+
+async def create_event_category_channels(guild: discord.Guild):
+    """이벤트 카테고리와 이벤트 전용 채널을 생성합니다."""
+    category = discord.utils.get(guild.categories, name=EVENT_CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(EVENT_CATEGORY_NAME)
+
+    created = []
+
+    for item in EVENT_CHANNELS:
+        channel = discord.utils.get(guild.text_channels, name=item["name"])
+
+        if channel is None:
+            channel = await guild.create_text_channel(
+                item["name"],
+                category=category,
+                topic=item["topic"]
+            )
+            created.append(item["name"])
+            await asyncio.sleep(0.2)
+        else:
+            changed = False
+            if channel.category != category:
+                await channel.edit(category=category)
+                changed = True
+            if channel.topic != item["topic"]:
+                await channel.edit(topic=item["topic"])
+                changed = True
+            if changed:
+                created.append(f"{item['name']}(위치/설명 수정)")
+                await asyncio.sleep(0.2)
+
+        sent = await send_event_embed_once(channel, item["title"], item["description"])
+        if sent:
+            created.append(f"{item['name']}(안내 임베드)")
+            await asyncio.sleep(0.2)
+
+    return category, created
+
+
+@bot.tree.command(name="이벤트자동생성", description="이벤트 카테고리와 이벤트 전용 채널을 자동 생성합니다.")
+async def create_event_auto_channels(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    category, created = await create_event_category_channels(interaction.guild)
+
+    if created:
+        created_text = "\n".join(f"• `{name}`" for name in created[:25])
+        if len(created) > 25:
+            created_text += f"\n외 {len(created) - 25}개"
+        msg = f"✅ 이벤트 카테고리/채널/안내 임베드를 생성했습니다.\n\n{created_text}"
+    else:
+        msg = "✅ 이미 이벤트 카테고리, 채널, 안내 임베드가 모두 있습니다."
+
+    await interaction.followup.send(msg, ephemeral=True)
+    await send_log(
+        interaction.guild,
+        f"🎉 이벤트 카테고리 자동 생성\n카테고리: {category.name}\n관리자: {interaction.user.mention}",
+        "general"
+    )
+
+
+# =========================
+# 환영 임베드 설정
+# =========================
+
+WELCOME_EMBED_DEFAULT_TITLE = "🌸 새로운 가족이 찾아왔어요 🌸"
+WELCOME_EMBED_DEFAULT_DESCRIPTION = (
+    "╭━━━━━━━━━━━━━━━╮\n"
+    "  💖 {user} 님 환영합니다!\n"
+    "╰━━━━━━━━━━━━━━━╯\n\n"
+    "🎀 **『 뉴페이스 』 {username}** 님이\n"
+    "🏡 **{server}** 서버에 입장하셨어요!\n\n"
+    "✨ **서버 생활 시작하기**\n"
+    "📜 규칙 확인  ⤿ {rule_channel}\n"
+    "🎮 게임 역할  ⤿ {game_role_channel}\n"
+    "🐥 적응 도움  ⤿ {new_manager_role}\n"
+    "🚨 신고 문의  ⤿ {report_role}\n"
+    "🎮 내전 문의  ⤿ {scrim_role}\n\n"
+    "📈 **입장 순번**  ⤿ {member_count}번째 가족\n"
+    "💌 즐겁고 따뜻한 서버 생활 되세요!"
+)
+WELCOME_EMBED_DEFAULT_FOOTER = "💖 {server} • 현재 서버 인원 {member_count}명"
+
+# 환영 임베드 기본 GIF입니다. 원하는 GIF 주소로 바꿔도 됩니다.
+WELCOME_GIF_URL = "https://i.pinimg.com/originals/d8/27/c2/d827c2bfe1fe524e30b5ad429b7b72cf.gif"
+
+
+def normalize_embed_color(value: str):
+    value = (value or "").strip()
+    if not value:
+        return BOT_COLOR
+    value = value.replace("#", "")
+    try:
+        return int(value, 16)
+    except ValueError:
+        return BOT_COLOR
+
+
+def safe_url(value: str):
+    value = (value or "").strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    return ""
+
+
+def get_welcome_embed_config(guild_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    c.execute("SELECT title, description, color, image_url, footer FROM welcome_embeds WHERE guild_id=?", (guild_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    return {
+        "title": row[0] or WELCOME_EMBED_DEFAULT_TITLE,
+        "description": row[1] or WELCOME_EMBED_DEFAULT_DESCRIPTION,
+        "color": row[2] or "FFB6C1",
+        "image_url": row[3] or "",
+        "footer": row[4] or WELCOME_EMBED_DEFAULT_FOOTER,
+    }
+
+
+def save_welcome_embed_config(guild_id: int, title: str, description: str, color: str, image_url: str, footer: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO welcome_embeds(guild_id, title, description, color, image_url, footer, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (guild_id, title, description, color, image_url, footer, now)
+    )
+    conn.commit()
+
+
+def delete_welcome_embed_config(guild_id: int):
+    c.execute("DELETE FROM welcome_embeds WHERE guild_id=?", (guild_id,))
+    conn.commit()
+
+
+def render_welcome_text(text: str, member: discord.Member):
+    guild = member.guild
+    return (text or "").replace("{user}", member.mention) \
+        .replace("{username}", member.display_name) \
+        .replace("{tag}", str(member)) \
+        .replace("{server}", guild.name) \
+        .replace("{member_count}", str(guild.member_count)) \
+        .replace("{created_at}", datetime.datetime.now().strftime("%Y-%m-%d")) \
+        .replace("{rule_channel}", channel_mention_by_id_or_name(guild, get_saved_channel_id(guild.id, 'rule_channel_id') or RULE_CHANNEL_ID, ['📌-필독', '필독', '규칙'])) \
+        .replace("{game_role_channel}", channel_mention_by_id_or_name(guild, get_saved_channel_id(guild.id, 'game_role_channel_id') or GAME_ROLE_CHANNEL_ID, ['🎮-게임역할선택', '게임역할선택', '🎮-게임채팅'])) \
+        .replace("{new_manager_role}", role_mention_by_id_or_name(guild, 0, ['뉴관팀'])) \
+        .replace("{adapt_role}", role_mention_by_id_or_name(guild, 0, ['뉴관팀'])) \
+        .replace("{report_role}", role_mention_by_id_or_name(guild, REPORT_ROLE_ID, ['보안팀'])) \
+        .replace("{scrim_role}", role_mention_by_id_or_name(guild, SCRIM_ROLE_ID, ['내전팀']))
+
+
+def build_welcome_embed(member: discord.Member, *, test: bool = False):
+    config = get_welcome_embed_config(member.guild.id) or {
+        "title": WELCOME_EMBED_DEFAULT_TITLE,
+        "description": WELCOME_EMBED_DEFAULT_DESCRIPTION,
+        "color": "FFB6C1",
+        "image_url": "",
+        "footer": WELCOME_EMBED_DEFAULT_FOOTER,
+    }
+
+    title = render_welcome_text(config["title"], member)
+    if test:
+        title = "🌸 환영 메시지 미리보기 🌸"
+
+    description = render_welcome_text(config["description"], member)
+    footer = render_welcome_text(config["footer"], member)
+
+    embed = discord.Embed(
+        title=title[:256],
+        description=description[:4096],
+        color=normalize_embed_color(config.get("color", "FFB6C1"))
+    )
+
+    if member.guild.icon:
+        embed.set_author(name=member.guild.name, icon_url=member.guild.icon.url)
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.add_field(
+        name="🎀 뉴페이스 전용 안내",
+        value=(
+            "처음 오셨다면 규칙을 먼저 확인하고,\n"
+            "프로필/게임 역할을 받아가시면 더 편하게 활동할 수 있어요!"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📈 입장 순번",
+        value=f"**{member.guild.member_count}번째 가족**으로 입장했어요!",
+        inline=True
+    )
+
+    embed.add_field(
+        name="✨ 계정 생성일",
+        value=f"`{member.created_at.strftime('%Y-%m-%d')}`",
+        inline=True
+    )
+
+    image_url = safe_url(config.get("image_url", ""))
+    if image_url:
+        embed.set_image(url=image_url)
+    elif member.guild.banner:
+        embed.set_image(url=member.guild.banner.url)
+    else:
+        embed.set_image(url=WELCOME_GIF_URL)
+
+    if footer:
+        embed.set_footer(text=footer[:2048])
+    else:
+        embed.set_footer(text=f"💖 {member.guild.name} • 즐거운 서버 생활 되세요!")
+
+    return embed
+
+
+def build_welcome_dm_embed(member: discord.Member):
+    guild = member.guild
+    embed = discord.Embed(
+        title=f"💌 {guild.name} 에 오신 걸 환영해요!",
+        description=(
+            f"안녕하세요, {member.mention}님!\n\n"
+            "서버에 입장해주셔서 정말 감사합니다 🌸\n"
+            "처음 오셨다면 아래 순서대로 확인해주세요.\n\n"
+            "1️⃣ 서버 규칙 확인하기\n"
+            "2️⃣ 인증 또는 역할 선택하기\n"
+            "3️⃣ 자기소개 작성하기\n"
+            "4️⃣ 편하게 대화에 참여하기\n\n"
+            "궁금한 점이 있으면 안내팀이나 관리자에게 편하게 문의해주세요 💖"
+        ),
+        color=BOT_COLOR
+    )
+    if guild.icon:
+        embed.set_author(name=guild.name, icon_url=guild.icon.url)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    if guild.banner:
+        embed.set_image(url=guild.banner.url)
+    else:
+        embed.set_image(url=WELCOME_GIF_URL)
+    embed.set_footer(text="🎀 뉴페이스 환영 DM")
+    return embed
+
+
+async def send_welcome_dm(member: discord.Member):
+    """신규 입장자에게 환영 DM을 보냅니다. DM 차단이면 조용히 넘어갑니다."""
+    try:
+        await member.send(embed=build_welcome_dm_embed(member))
+        await send_log(member.guild, f"💌 환영 DM 전송 완료\n대상: {member.mention}", "general")
+    except discord.Forbidden:
+        await send_log(member.guild, f"💌 환영 DM 전송 실패\n대상: {member.mention}\n사유: DM 차단", "general")
+    except discord.HTTPException as e:
+        await send_log(member.guild, f"💌 환영 DM 전송 실패\n대상: {member.mention}\n오류: `{e}`", "general")
+
+
+class WelcomeEmbedEditModal(discord.ui.Modal, title="환영 임베드 만들기/수정"):
+    def __init__(self, guild_id: int):
+        super().__init__()
+        config = get_welcome_embed_config(guild_id) or {
+            "title": WELCOME_EMBED_DEFAULT_TITLE,
+            "description": WELCOME_EMBED_DEFAULT_DESCRIPTION,
+            "color": "FFB6C1",
+            "image_url": "",
+            "footer": WELCOME_EMBED_DEFAULT_FOOTER,
+        }
+        self.guild_id = guild_id
+        self.title_input = discord.ui.TextInput(label="제목", default=config["title"][:256], required=True, max_length=256)
+        self.description_input = discord.ui.TextInput(label="내용", default=config["description"][:4000], style=discord.TextStyle.paragraph, required=True, max_length=4000)
+        self.color_input = discord.ui.TextInput(label="색상 HEX", default=config["color"] or "FFB6C1", placeholder="예: FFB6C1 또는 FF0000", required=False, max_length=10)
+        self.image_input = discord.ui.TextInput(label="이미지/GIF URL", default=config["image_url"] or "", placeholder="https://...jpg / https://...gif", required=False, max_length=500)
+        self.footer_input = discord.ui.TextInput(label="하단 문구", default=config["footer"][:2048], required=False, max_length=2048)
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = str(self.color_input.value).strip().replace("#", "") or "FFB6C1"
+        if len(color_value) not in (3, 6) or not all(ch in "0123456789abcdefABCDEF" for ch in color_value):
+            return await interaction.response.send_message("❌ 색상은 `FFB6C1` 같은 HEX 값으로 입력해주세요.", ephemeral=True)
+
+        image_url = safe_url(str(self.image_input.value))
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지/GIF URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+
+        save_welcome_embed_config(
+            self.guild_id,
+            str(self.title_input.value),
+            str(self.description_input.value),
+            color_value,
+            image_url,
+            str(self.footer_input.value),
+        )
+        await interaction.response.send_message("✅ 환영 임베드 설정을 저장했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🖼️ 환영 임베드 수정\n관리자: {interaction.user.mention}", "general")
+
+
+class WelcomeEmbedSettingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="만들기/수정", emoji="📝", style=discord.ButtonStyle.green)
+    async def edit_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        await interaction.response.send_modal(WelcomeEmbedEditModal(interaction.guild.id))
+
+    @discord.ui.button(label="미리보기", emoji="👀", style=discord.ButtonStyle.blurple)
+    async def preview_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=build_welcome_embed(interaction.user, test=True), ephemeral=True)
+
+    @discord.ui.button(label="사용법", emoji="❔", style=discord.ButtonStyle.gray)
+    async def help_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        text = (
+            "사용 가능한 변수\n"
+            "`{user}` 멘션 / `{username}` 닉네임 / `{tag}` 태그\n"
+            "`{server}` 서버명 / `{member_count}` 인원수\n"
+            "`{rule_channel}` 필독 채널 / `{game_role_channel}` 게임역할 채널\n"
+            "`{new_manager_role}` 뉴관팀 / `{report_role}` 보안팀 / `{scrim_role}` 내전팀\n\n"
+            "이미지나 GIF는 URL을 넣으면 임베드 아래에 표시됩니다."
+        )
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @discord.ui.button(label="초기화", emoji="🗑️", style=discord.ButtonStyle.red)
+    async def reset_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        delete_welcome_embed_config(interaction.guild.id)
+        await interaction.response.send_message("✅ 환영 임베드 설정을 기본값으로 초기화했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🗑️ 환영 임베드 초기화\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="임베드설정", description="채널 ID를 넣어 원하는 곳에 임베드를 바로 설정/전송합니다.")
+@app_commands.describe(channel_id="임베드를 보낼 채널 ID. 예: 1515758616081072159")
+async def welcome_embed_setting(interaction: discord.Interaction, channel_id: str = ""):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    target_channel_id = parse_embed_target_channel_id(channel_id)
+    target_text = f"<#{target_channel_id}>" if target_channel_id else "아직 선택 안 됨"
+
+    embed = discord.Embed(
+        title="🖼️ 통합 임베드 설정",
+        description=(
+            "아래 버튼에서 설정할 임베드를 선택해주세요.\n\n"
+            f"🎯 **전송 대상 채널:** {target_text}\n\n"
+            "사용 예시\n"
+            "`/임베드설정 channel_id:1515758616081072159`\n\n"
+            "채널 ID를 넣고 실행하면 저장 후 그 채널에 바로 전송됩니다.\n"
+            "채널 ID 없이 실행하면 설정만 저장하고 미리보기로 확인할 수 있습니다."
+        ),
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="⭐ 만능 봇 | 채널 ID 직접 지정 임베드 설정")
+    await interaction.response.send_message(
+        embed=embed,
+        view=UnifiedEmbedSettingView(target_channel_id),
+        ephemeral=True
+    )
+
+# =========================
+# 규칙 / 자기소개 임베드 설정
+# =========================
+
+AUTO_EMBED_DEFAULTS = {
+    "rules": {
+        "title": "📜 서버 규칙",
+        "description": (
+            "아래 규칙을 꼭 확인해주세요.\n\n"
+            "1️⃣ 서로 존중하고 예의를 지켜주세요.\n"
+            "2️⃣ 욕설, 도배, 분쟁 유도는 금지입니다.\n"
+            "3️⃣ 개인정보 공유와 허가 없는 홍보는 금지입니다.\n"
+            "4️⃣ 서버 분위기를 해치는 행동은 제재될 수 있습니다.\n\n"
+            "규칙을 확인한 뒤 인증 채널에서 인증을 진행해주세요."
+        ),
+        "color": "FFB6C1",
+        "image_url": "",
+        "footer": "⭐ 만능 봇 | 친목 서버 관리 봇",
+    },
+    "intro": {
+        "title": "📝 자기소개 안내",
+        "description": (
+            "처음 오신 분들은 아래 양식으로 자기소개를 남겨주세요.\n\n"
+            "**이름/닉네임:**\n"
+            "**나이대:** 10대 / 20대 등\n"
+            "**성별:** 선택 입력\n"
+            "**주로 하는 게임:**\n"
+            "**하고 싶은 말:**\n\n"
+            "서로 편하게 인사하면서 친해져요!"
+        ),
+        "color": "FFB6C1",
+        "image_url": "",
+        "footer": "⭐ 만능 봇 | 친목 서버 관리 봇",
+    },
+    "verify": {
+        "title": "✅ 만능 봇 인증 패널",
+        "description": (
+            "아래 버튼을 눌러 인증을 완료해주세요.\n\n"
+            "인증 후 `미인증` 역할이 제거되고 `뉴페이스` 역할이 지급됩니다."
+        ),
+        "color": "FFB6C1",
+        "image_url": "",
+        "footer": "⭐ 만능 봇 | 친목 서버 관리 봇",
+    },
+}
+
+
+# =========================
+# /패널 전체 임베드 꾸미기 설정
+# =========================
+# 통합 /패널 안에서 사용하는 주요 임베드를 모두 서버별로 꾸밀 수 있게 합니다.
+# 저장 위치는 기존 auto_embeds 테이블을 그대로 사용하므로 database.db와 호환됩니다.
+PANEL_CUSTOM_EMBED_TYPES = {
+    "help": "panel_help",
+    "economy": "panel_economy",
+    "shop": "panel_shop",
+    "ticket": "panel_ticket",
+    "music": "panel_music",
+    "staff_tools": "panel_staff_tools",
+    "admin": "panel_admin",
+    "game_role": "panel_game_role",
+    "security": "panel_security",
+    "warning": "panel_warning",
+    "event": "panel_event",
+    "event_end": "panel_event_end",
+    "title": "panel_title",
+    "devlog": "panel_devlog",
+    "auto_create": "panel_auto_create",
+    "all": "panel_auto_all",
+    "support_ticket": "panel_support_ticket",
+    "bot_guides": "panel_bot_guides",
+    "tts": "panel_tts",
+}
+
+PANEL_CUSTOM_EMBED_DISPLAY_META = {
+    "help": {"name": "도움말패널", "emoji": "🆘", "desc": "일반 유저용 도움말 패널 제목/내용/이미지 수정"},
+    "economy": {"name": "경제패널", "emoji": "💰", "desc": "포인트/가챠/쿠폰/백업 패널 수정"},
+    "shop": {"name": "상점패널", "emoji": "🛒", "desc": "통합상점 안내 패널 수정"},
+    "ticket": {"name": "티켓패널", "emoji": "🎫", "desc": "티켓 문의 패널 제목/내용/이미지 수정"},
+    "music": {"name": "뮤직패널", "emoji": "🎵", "desc": "음악 조작 패널 제목/내용/이미지 수정"},
+    "staff_tools": {"name": "관리도구", "emoji": "🔨", "desc": "청소/킥/밴/경고 관리도구 수정"},
+    "admin": {"name": "관리자패널", "emoji": "🎛️", "desc": "관리자 통합 메뉴 패널 수정"},
+    "game_role": {"name": "게임역할패널", "emoji": "🎮", "desc": "게임 역할 선택 패널 수정"},
+    "security": {"name": "보안패널", "emoji": "🛡️", "desc": "보안 설정 패널 제목/내용/이미지 수정"},
+    "warning": {"name": "경고패널", "emoji": "⚠️", "desc": "경고 관리 패널 제목/내용/이미지 수정"},
+    "event": {"name": "이벤트생성패널", "emoji": "🎉", "desc": "이벤트 공지/예약 패널 수정"},
+    "event_end": {"name": "이벤트종료패널", "emoji": "🏁", "desc": "이벤트 종료/보상 발표 패널 수정"},
+    "title": {"name": "칭호패널", "emoji": "🏷️", "desc": "칭호/업적 패널 수정"},
+    "devlog": {"name": "개발로그패널", "emoji": "📈", "desc": "개발로그 자동 생성 패널 수정"},
+    "auto_create": {"name": "패널자동생성", "emoji": "🧩", "desc": "자동 생성/복구 단계 안내 패널 수정"},
+    "all": {"name": "전체기본패널", "emoji": "📦", "desc": "전체 기본 패널 자동생성 안내 수정"},
+    "support_ticket": {"name": "공식지원티켓문의", "emoji": "🎫", "desc": "공식 지원 서버 티켓문의 자동생성 안내 수정"},
+    "bot_guides": {"name": "출석/레벨/강화안내", "emoji": "📅", "desc": "출석·레벨·강화 안내 자동생성 안내 수정"},
+    "tts": {"name": "TTS안내", "emoji": "🔊", "desc": "TTS 안내 자동생성 패널 수정"},
+}
+
+PANEL_CUSTOM_EMBED_DISPLAY_NAMES = {
+    key: meta["name"] for key, meta in PANEL_CUSTOM_EMBED_DISPLAY_META.items()
+}
+
+PANEL_CUSTOM_SETTING_CHOICES = [
+    {
+        "label": f"{meta['name']} 꾸미기",
+        "value": f"panel_custom_{key}",
+        "emoji": meta["emoji"],
+        "desc": meta["desc"],
+    }
+    for key, meta in PANEL_CUSTOM_EMBED_DISPLAY_META.items()
+]
+
+PANEL_CUSTOM_EMBED_DEFAULTS = {
+    "panel_help": {"title": "🆘 만능 봇 도움말", "description": "만능 봇 사용법, 명령어, 문의 방법을 한 곳에서 확인할 수 있습니다.", "color": "5865F2", "image_url": "", "footer": "만능 봇 | 공식 지원 도움말"},
+    "panel_economy": {"title": "💰 만능 봇 경제 패널", "description": "포인트, 일일 보상, 가챠, 쿠폰, 백업 기능을 한 곳에서 사용할 수 있습니다.", "color": "FEE75C", "image_url": "", "footer": "만능 봇 | 경제 시스템"},
+    "panel_shop": {"title": "🛒 만능 봇 통합 상점", "description": "포인트로 아이템을 구매하고 인벤토리에서 보유 아이템을 확인할 수 있습니다.", "color": "57F287", "image_url": "", "footer": "만능 봇 | 통합 상점"},
+    "panel_ticket": {"title": "🎫 만능 봇 통합 티켓 패널", "description": "아래 버튼을 눌러 일반 티켓, 문의 티켓, 신고 티켓을 열어주세요.", "color": "5865F2", "image_url": "", "footer": "만능 봇 | 공식 지원 티켓 시스템"},
+    "panel_music": {"title": "🎵 만능 봇 뮤직 패널", "description": "재생, 일시정지, 스킵, 대기열, 반복, 볼륨을 버튼으로 조작하세요.", "color": "57F287", "image_url": "", "footer": "만능 봇 | 음악 · TTS 지원"},
+    "panel_staff_tools": {"title": "🔨 만능 봇 관리자 전용 도구", "description": "경고, 청소, 킥, 밴 등 서버 관리 기능을 사용할 수 있습니다.", "color": "ED4245", "image_url": "", "footer": "만능 봇 | 관리자 전용"},
+    "panel_admin": {"title": "🎛️ 만능 봇 관리자 패널", "description": "공지, 경고, 경제, 티켓, 청소, 킥, 밴 등 서버 운영 기능을 관리합니다.", "color": "FFB6C1", "image_url": "", "footer": "만능 봇 | 통합 관리자 메뉴"},
+    "panel_game_role": {"title": "🎮 게임 역할 선택", "description": "자주 플레이하는 게임 역할을 선택하거나 해제할 수 있습니다.", "color": "5865F2", "image_url": "", "footer": "만능 봇 | 게임 역할 선택 패널"},
+    "panel_security": {"title": "🛡️ 만능 봇 보안패널", "description": "자동검열, 도배보호, 멘션테러, 위험파일 차단, 토큰보호, 권한보호를 한 곳에서 관리합니다.", "color": "5865F2", "image_url": "", "footer": "만능 봇 | 서버 보안 관리 패널"},
+    "panel_warning": {"title": "⚠️ 경고 관리 패널", "description": "아래 버튼으로 경고 지급, 조회, 삭제를 관리하세요.", "color": "FEE75C", "image_url": "", "footer": "만능 봇 | 관리자 전용 경고 관리"},
+    "panel_event": {"title": "🎉 이벤트 생성 패널", "description": "이벤트 제목, 설명, 보상, 예약 시간을 설정하고 공지를 전송할 수 있습니다.", "color": "FFD700", "image_url": "", "footer": "만능 봇 | 이벤트 생성 패널"},
+    "panel_event_end": {"title": "🏁 이벤트 종료 패널", "description": "우승팀, 패배팀, 결과 설명과 보상을 정리해서 종료 발표를 만들 수 있습니다.", "color": "ED4245", "image_url": "", "footer": "만능 봇 | 이벤트 종료 패널"},
+    "panel_title": {"title": "🏷️ 만능 봇 칭호 패널", "description": "칭호 상점, 구매, 내 칭호, 대표 칭호, 업적 보상을 관리합니다.", "color": "9B59B6", "image_url": "", "footer": "만능 봇 | 칭호 · 업적 시스템"},
+    "panel_devlog": {"title": "📈 개발로그 자동 생성 완료", "description": "업데이트, 패치노트, 봇상태, 개발일지 채널을 자동으로 생성하고 알림 패널을 준비합니다.", "color": "57F287", "image_url": "", "footer": "만능 봇 | 개발로그 알림 패널"},
+    "panel_auto_create": {"title": "📦 패널 자동 생성/복구", "description": "필요한 채널과 패널을 자동으로 만들거나 복구합니다. 아래에서 생성할 항목을 선택해주세요.", "color": "57F287", "image_url": "", "footer": "만능 봇 | 패널 자동 생성"},
+    "panel_auto_all": {"title": "🧩 전체 기본 패널 자동 생성", "description": "자주 사용하는 기본 채널과 패널을 한 번에 생성하거나 복구합니다.", "color": "57F287", "image_url": "", "footer": "만능 봇 | 전체 기본 패널 자동 생성"},
+    "panel_support_ticket": {"title": "🎫 공식지원 티켓문의", "description": "공식 지원 서버의 문의 채널과 티켓 패널을 생성하거나 복구합니다.", "color": "5865F2", "image_url": "", "footer": "만능 봇 | 공식 지원 티켓 문의"},
+    "panel_bot_guides": {"title": "📅 출석/레벨/강화 안내", "description": "출석체크, 레벨, 강화 안내 채널과 임베드를 생성하거나 복구합니다.", "color": "FFB6C1", "image_url": "", "footer": "만능 봇 | 성장 시스템 안내"},
+    "panel_tts": {"title": "🔊 TTS 안내", "description": "TTS 채팅방, 통방, 음성 설정 안내를 생성하거나 복구합니다.", "color": "5865F2", "image_url": "", "footer": "만능 봇 | TTS 안내"},
+}
+
+AUTO_EMBED_DEFAULTS.update(PANEL_CUSTOM_EMBED_DEFAULTS)
+
+def get_auto_embed_config(guild_id: int, embed_type: str):
+    ensure_dashboard_sync_for_guild(guild_id)
+    defaults = AUTO_EMBED_DEFAULTS.get(embed_type, AUTO_EMBED_DEFAULTS["rules"])
+    c.execute(
+        "SELECT title, description, color, image_url, footer FROM auto_embeds WHERE guild_id=? AND embed_type=?",
+        (guild_id, embed_type)
+    )
+    row = c.fetchone()
+    if not row:
+        return defaults.copy()
+    return {
+        "title": row[0] or defaults["title"],
+        "description": row[1] or defaults["description"],
+        "color": row[2] or defaults["color"],
+        "image_url": row[3] or defaults["image_url"],
+        "footer": row[4] or defaults["footer"],
+    }
+
+
+def save_auto_embed_config(guild_id: int, embed_type: str, title: str, description: str, color: str, image_url: str, footer: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO auto_embeds(guild_id, embed_type, title, description, color, image_url, footer, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (guild_id, embed_type, title, description, color, image_url, footer, now)
+    )
+    conn.commit()
+
+
+def delete_auto_embed_config(guild_id: int, embed_type: str):
+    c.execute("DELETE FROM auto_embeds WHERE guild_id=? AND embed_type=?", (guild_id, embed_type))
+    conn.commit()
+
+
+def render_auto_embed_text(text: str, guild: discord.Guild):
+    return (text or "").replace("{server}", guild.name) \
+        .replace("{member_count}", str(guild.member_count)) \
+        .replace("{created_at}", datetime.datetime.now().strftime("%Y-%m-%d")) \
+        .replace("{rule_channel}", channel_mention_by_id_or_name(guild, get_saved_channel_id(guild.id, 'rule_channel_id') or RULE_CHANNEL_ID, ['📌-필독', '필독', '규칙'])) \
+        .replace("{game_role_channel}", channel_mention_by_id_or_name(guild, get_saved_channel_id(guild.id, 'game_role_channel_id') or GAME_ROLE_CHANNEL_ID, ['🎮-게임역할선택', '게임역할선택', '🎮-게임채팅']))
+
+
+def build_auto_embed(guild: discord.Guild, embed_type: str):
+    config = get_auto_embed_config(guild.id, embed_type)
+    embed = discord.Embed(
+        title=render_auto_embed_text(config["title"], guild)[:256],
+        description=render_auto_embed_text(config["description"], guild)[:4096],
+        color=normalize_embed_color(config["color"])
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    footer = render_auto_embed_text(config.get("footer", ""), guild)
+    if footer:
+        embed.set_footer(text=footer[:2048])
+    image_url = safe_url(config.get("image_url", ""))
+    if image_url:
+        embed.set_image(url=image_url)
+    return embed
+
+
+def has_auto_embed_config(guild_id: int, embed_type: str):
+    c.execute(
+        "SELECT 1 FROM auto_embeds WHERE guild_id=? AND embed_type=? LIMIT 1",
+        (guild_id, embed_type)
+    )
+    return c.fetchone() is not None
+
+
+def get_panel_custom_embed_type(panel_value: str):
+    return PANEL_CUSTOM_EMBED_TYPES.get(panel_value)
+
+
+def apply_custom_panel_embed(guild: discord.Guild, panel_value: str, embed: discord.Embed):
+    """/패널에서 열리는 패널 임베드에 서버별 꾸미기 설정을 적용합니다.
+
+    설정이 저장되어 있지 않으면 기존 기본 임베드를 그대로 유지합니다.
+    설정이 있으면 제목/내용/색상/이미지/푸터만 바꾸고, 기존 필드와 버튼 구조는 유지합니다.
+    """
+    if guild is None or embed is None:
+        return embed
+    embed_type = get_panel_custom_embed_type(panel_value)
+    if not embed_type:
+        return embed
+    if not has_auto_embed_config(guild.id, embed_type):
+        return embed
+
+    config = get_auto_embed_config(guild.id, embed_type)
+    title = render_auto_embed_text(config.get("title", ""), guild)[:256]
+    description = render_auto_embed_text(config.get("description", ""), guild)[:4096]
+    footer = render_auto_embed_text(config.get("footer", ""), guild)[:2048]
+    image_url = safe_url(config.get("image_url", ""))
+
+    if title:
+        embed.title = title
+    if description:
+        embed.description = description
+    try:
+        embed.colour = normalize_embed_color(config.get("color", "FFB6C1"))
+    except Exception:
+        pass
+    if footer:
+        embed.set_footer(text=footer)
+    elif hasattr(embed, "remove_footer"):
+        embed.remove_footer()
+    if image_url:
+        embed.set_image(url=image_url)
+    return embed
+
+
+# =========================
+# 통합 임베드 설정 / 채널 ID 직접 전송
+# =========================
+
+EMBED_PANEL_LABELS = {
+    "welcome": {"label": "환영 메시지", "emoji": "🌸", "desc": "입장 환영 메시지를 설정합니다."},
+    "rules": {"label": "이용규칙", "emoji": "📜", "desc": "규칙/이용규칙 임베드를 설정합니다."},
+    "intro": {"label": "자기소개", "emoji": "📝", "desc": "자기소개 안내 임베드를 설정합니다."},
+    "verify": {"label": "인증패널", "emoji": "✅", "desc": "인증 버튼 패널 임베드를 설정합니다."},
+}
+
+
+def parse_embed_target_channel_id(value) -> int:
+    """슬래시 명령어에 넣은 채널 ID/채널 멘션에서 숫자 ID만 안전하게 추출합니다."""
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    match = re.search(r"\d{15,25}", raw)
+    if not match:
+        return 0
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return 0
+
+
+def resolve_embed_target_channel(guild: discord.Guild, channel_id: int):
+    if guild is None or not channel_id:
+        return None
+    channel = guild.get_channel(channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    return None
+
+
+async def send_configured_embed_to_channel(interaction: discord.Interaction, embed_type: str, target_channel_id: int):
+    """설정 저장 후 지정한 채널 ID로 임베드를 바로 전송합니다."""
+    if not target_channel_id:
+        return "저장만 완료됐습니다. 바로 전송하려면 `/임베드설정 channel_id:채널ID` 로 실행해주세요."
+
+    channel = resolve_embed_target_channel(interaction.guild, target_channel_id)
+    if channel is None:
+        return f"저장은 완료됐지만, `{target_channel_id}` 채널을 찾지 못했습니다. 같은 서버의 텍스트 채널 ID인지 확인해주세요."
+
+    try:
+        if embed_type == "welcome":
+            await channel.send(embed=build_welcome_embed(interaction.user, test=False))
+        elif embed_type == "verify":
+            await channel.send(embed=build_auto_embed(interaction.guild, "verify"), view=VerifyView())
+        else:
+            await channel.send(embed=build_auto_embed(interaction.guild, embed_type))
+        return f"저장 완료 + {channel.mention} 채널에 바로 전송했습니다."
+    except discord.Forbidden:
+        return f"저장은 완료됐지만, {channel.mention} 채널에 메시지를 보낼 권한이 없습니다. 봇 권한을 확인해주세요."
+    except discord.HTTPException as e:
+        return f"저장은 완료됐지만, 전송 중 오류가 발생했습니다: `{e}`"
+
+
+class UnifiedWelcomeEmbedEditModal(discord.ui.Modal, title="환영 메시지 임베드 설정"):
+    def __init__(self, guild_id: int, target_channel_id: int = 0):
+        super().__init__()
+        config = get_welcome_embed_config(guild_id) or {
+            "title": WELCOME_EMBED_DEFAULT_TITLE,
+            "description": WELCOME_EMBED_DEFAULT_DESCRIPTION,
+            "color": "FFB6C1",
+            "image_url": "",
+            "footer": WELCOME_EMBED_DEFAULT_FOOTER,
+        }
+        self.guild_id = guild_id
+        self.target_channel_id = target_channel_id
+        self.title_input = discord.ui.TextInput(label="제목", default=config["title"][:256], required=True, max_length=256)
+        self.description_input = discord.ui.TextInput(label="내용", default=config["description"][:4000], style=discord.TextStyle.paragraph, required=True, max_length=4000)
+        self.color_input = discord.ui.TextInput(label="색상 HEX", default=config["color"] or "FFB6C1", placeholder="예: FFB6C1", required=False, max_length=10)
+        self.image_input = discord.ui.TextInput(label="이미지/GIF URL", default=config["image_url"] or "", placeholder="https://...", required=False, max_length=500)
+        self.footer_input = discord.ui.TextInput(label="하단 문구", default=config["footer"][:2048], required=False, max_length=2048)
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = str(self.color_input.value).strip().replace("#", "") or "FFB6C1"
+        if len(color_value) not in (3, 6) or not all(ch in "0123456789abcdefABCDEF" for ch in color_value):
+            return await interaction.response.send_message("❌ 색상은 `FFB6C1` 같은 HEX 값으로 입력해주세요.", ephemeral=True)
+        image_url = safe_url(str(self.image_input.value))
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지/GIF URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+
+        save_welcome_embed_config(
+            self.guild_id,
+            str(self.title_input.value),
+            str(self.description_input.value),
+            color_value,
+            image_url,
+            str(self.footer_input.value),
+        )
+        result = await send_configured_embed_to_channel(interaction, "welcome", self.target_channel_id)
+        await interaction.response.send_message(f"✅ {result}", ephemeral=True)
+        await send_log(interaction.guild, f"🖼️ 통합 임베드 설정\n종류: 환영 메시지\n관리자: {interaction.user.mention}", "general")
+
+
+class UnifiedAutoEmbedEditModal(discord.ui.Modal):
+    def __init__(self, guild_id: int, embed_type: str, display_name: str, target_channel_id: int = 0):
+        super().__init__(title=f"{display_name} 임베드 설정")
+        self.guild_id = guild_id
+        self.embed_type = embed_type
+        self.display_name = display_name
+        self.target_channel_id = target_channel_id
+        config = get_auto_embed_config(guild_id, embed_type)
+        self.title_input = discord.ui.TextInput(label="제목", default=config["title"][:256], required=True, max_length=256)
+        self.description_input = discord.ui.TextInput(label="내용", default=config["description"][:4000], style=discord.TextStyle.paragraph, required=True, max_length=4000)
+        self.color_input = discord.ui.TextInput(label="색상 HEX", default=config["color"] or "FFB6C1", placeholder="예: FFB6C1", required=False, max_length=10)
+        self.image_input = discord.ui.TextInput(label="이미지/GIF URL", default=config["image_url"] or "", placeholder="https://...", required=False, max_length=500)
+        self.footer_input = discord.ui.TextInput(label="하단 문구", default=config["footer"][:2048], required=False, max_length=2048)
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = str(self.color_input.value).strip().replace("#", "") or "FFB6C1"
+        if len(color_value) not in (3, 6) or not all(ch in "0123456789abcdefABCDEF" for ch in color_value):
+            return await interaction.response.send_message("❌ 색상은 `FFB6C1` 같은 HEX 값으로 입력해주세요.", ephemeral=True)
+        image_url = safe_url(str(self.image_input.value))
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지/GIF URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+
+        save_auto_embed_config(
+            self.guild_id,
+            self.embed_type,
+            str(self.title_input.value),
+            str(self.description_input.value),
+            color_value,
+            image_url,
+            str(self.footer_input.value),
+        )
+        result = await send_configured_embed_to_channel(interaction, self.embed_type, self.target_channel_id)
+        await interaction.response.send_message(f"✅ {result}", ephemeral=True)
+        await send_log(interaction.guild, f"🖼️ 통합 임베드 설정\n종류: {self.display_name}\n관리자: {interaction.user.mention}", "general")
+
+
+class UnifiedEmbedSettingView(discord.ui.View):
+    def __init__(self, target_channel_id: int = 0):
+        super().__init__(timeout=300)
+        self.target_channel_id = target_channel_id
+
+    @discord.ui.button(label="환영 메시지", emoji="🌸", style=discord.ButtonStyle.green, row=0)
+    async def welcome_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        await interaction.response.send_modal(UnifiedWelcomeEmbedEditModal(interaction.guild.id, self.target_channel_id))
+
+    @discord.ui.button(label="이용규칙", emoji="📜", style=discord.ButtonStyle.blurple, row=0)
+    async def rules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        await interaction.response.send_modal(UnifiedAutoEmbedEditModal(interaction.guild.id, "rules", "이용규칙", self.target_channel_id))
+
+    @discord.ui.button(label="자기소개", emoji="📝", style=discord.ButtonStyle.blurple, row=0)
+    async def intro_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        await interaction.response.send_modal(UnifiedAutoEmbedEditModal(interaction.guild.id, "intro", "자기소개", self.target_channel_id))
+
+    @discord.ui.button(label="인증패널", emoji="✅", style=discord.ButtonStyle.green, row=1)
+    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        await interaction.response.send_modal(UnifiedAutoEmbedEditModal(interaction.guild.id, "verify", "인증패널", self.target_channel_id))
+
+    @discord.ui.button(label="사용법", emoji="❔", style=discord.ButtonStyle.gray, row=1)
+    async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        target_text = f"<#{self.target_channel_id}>" if self.target_channel_id else "없음"
+        await interaction.response.send_message(
+            "🖼️ **통합 임베드 설정 사용법**\n\n"
+            "1. 채널 ID를 복사합니다.\n"
+            "2. `/임베드설정 channel_id:채널ID` 로 실행합니다.\n"
+            "3. 원하는 버튼을 누릅니다. 예: `이용규칙`\n"
+            "4. 제목/내용/색상/이미지/하단 문구를 입력하고 저장합니다.\n\n"
+            f"현재 전송 대상: {target_text}\n\n"
+            "채널 이름이 `📜-규칙`이 아니어도 상관없습니다. 채널 ID로 직접 보내기 때문에 `📜︱이용규칙`에도 바로 적용됩니다.",
+            ephemeral=True
+        )
+
+
+class AutoEmbedEditModal(discord.ui.Modal):
+    def __init__(self, guild_id: int, embed_type: str, title_text: str):
+        super().__init__(title=title_text)
+        self.guild_id = guild_id
+        self.embed_type = embed_type
+        config = get_auto_embed_config(guild_id, embed_type)
+
+        self.title_input = discord.ui.TextInput(label="제목", default=config["title"][:256], required=True, max_length=256)
+        self.description_input = discord.ui.TextInput(label="내용", default=config["description"][:4000], style=discord.TextStyle.paragraph, required=True, max_length=4000)
+        self.color_input = discord.ui.TextInput(label="색상 HEX", default=config["color"] or "FFB6C1", placeholder="예: FFB6C1 또는 FF0000", required=False, max_length=10)
+        self.image_input = discord.ui.TextInput(label="이미지/GIF URL", default=config["image_url"] or "", placeholder="https://...jpg / https://...gif", required=False, max_length=500)
+        self.footer_input = discord.ui.TextInput(label="하단 문구", default=config["footer"][:2048], required=False, max_length=2048)
+
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = str(self.color_input.value).strip().replace("#", "") or "FFB6C1"
+        if len(color_value) not in (3, 6) or not all(ch in "0123456789abcdefABCDEF" for ch in color_value):
+            return await interaction.response.send_message("❌ 색상은 `FFB6C1` 같은 HEX 값으로 입력해주세요.", ephemeral=True)
+
+        image_url = safe_url(str(self.image_input.value))
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지/GIF URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+
+        save_auto_embed_config(
+            self.guild_id,
+            self.embed_type,
+            str(self.title_input.value),
+            str(self.description_input.value),
+            color_value,
+            image_url,
+            str(self.footer_input.value),
+        )
+        await interaction.response.send_message("✅ 임베드 설정을 저장했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🖼️ 자동 임베드 수정\n종류: {self.embed_type}\n관리자: {interaction.user.mention}", "general")
+
+
+class AutoEmbedSettingView(discord.ui.View):
+    def __init__(self, embed_type: str, display_name: str):
+        super().__init__(timeout=300)
+        self.embed_type = embed_type
+        self.display_name = display_name
+
+    @discord.ui.button(label="만들기/수정", emoji="📝", style=discord.ButtonStyle.green)
+    async def edit_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        await interaction.response.send_modal(
+            AutoEmbedEditModal(interaction.guild.id, self.embed_type, f"{self.display_name} 임베드 만들기/수정")
+        )
+
+    @discord.ui.button(label="미리보기", emoji="👀", style=discord.ButtonStyle.blurple)
+    async def preview_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=build_auto_embed(interaction.guild, self.embed_type), ephemeral=True)
+
+    @discord.ui.button(label="사용법", emoji="❔", style=discord.ButtonStyle.gray)
+    async def help_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        text = (
+            "사용 가능한 변수\n"
+            "`{server}` 서버명 / `{member_count}` 인원수\n"
+            "`{rule_channel}` 필독 채널 / `{game_role_channel}` 게임역할 채널\n\n"
+            "이미지나 GIF는 URL을 넣으면 임베드 아래에 표시됩니다.\n"
+            "저장 후 `/친목섭` 또는 `/기본카테고리생성`을 실행하면 자동 전송에 적용됩니다."
+        )
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @discord.ui.button(label="초기화", emoji="🗑️", style=discord.ButtonStyle.red)
+    async def reset_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        delete_auto_embed_config(interaction.guild.id, self.embed_type)
+        await interaction.response.send_message("✅ 임베드 설정을 기본값으로 초기화했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🗑️ 자동 임베드 초기화\n종류: {self.embed_type}\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="규칙임베드설정", description="자동 생성되는 규칙 임베드를 만들고 수정합니다.")
+async def rules_embed_setting(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    embed = discord.Embed(
+        title="📜 규칙 임베드 설정",
+        description=(
+            "자동 생성되는 `📜-규칙` 채널의 임베드를 설정합니다.\n\n"
+            "📝 만들기/수정: 제목, 내용, 색상, 이미지/GIF, 하단 문구 설정\n"
+            "👀 미리보기: 현재 설정 확인\n"
+            "❔ 사용법: 변수 확인\n"
+            "🗑️ 초기화: 기본 규칙 임베드로 복구"
+        ),
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=AutoEmbedSettingView("rules", "규칙"), ephemeral=True)
+
+
+@bot.tree.command(name="자기소개임베드설정", description="자동 생성되는 자기소개 임베드를 만들고 수정합니다.")
+async def intro_embed_setting(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    embed = discord.Embed(
+        title="📝 자기소개 임베드 설정",
+        description=(
+            "자동 생성되는 `📝-자기소개` 채널의 임베드를 설정합니다.\n\n"
+            "📝 만들기/수정: 제목, 내용, 색상, 이미지/GIF, 하단 문구 설정\n"
+            "👀 미리보기: 현재 설정 확인\n"
+            "❔ 사용법: 변수 확인\n"
+            "🗑️ 초기화: 기본 자기소개 임베드로 복구"
+        ),
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=AutoEmbedSettingView("intro", "자기소개"), ephemeral=True)
+
+
+
+@bot.tree.command(name="인증임베드설정", description="자동 생성되는 인증 패널 임베드를 만들고 수정합니다.")
+async def verify_embed_setting(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    embed = discord.Embed(
+        title="✅ 인증 패널 임베드 설정",
+        description=(
+            "자동 생성되는 `✅-인증` 채널의 인증 패널 임베드를 설정합니다.\n\n"
+            "📝 만들기/수정: 제목, 내용, 색상, 이미지/GIF, 하단 문구 설정\n"
+            "👀 미리보기: 현재 설정 확인\n"
+            "❔ 사용법: 변수 확인\n"
+            "🗑️ 초기화: 기본 인증 패널 임베드로 복구"
+        ),
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=AutoEmbedSettingView("verify", "인증"), ephemeral=True)
+
+
+@bot.tree.command(name="로그카테고리생성", description="경고/처벌/채팅/음성/닉네임 로그 채널을 생성합니다.")
+async def create_log_category(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(
+            "❌ 서버에서만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    category = discord.utils.get(guild.categories, name=LOG_CATEGORY_NAME)
+    if category is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        category = await guild.create_category(LOG_CATEGORY_NAME, overwrites=overwrites)
+
+    created = []
+    for channel_name in LOG_CHANNEL_NAMES.values():
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if channel is None:
+            await guild.create_text_channel(channel_name, category=category)
+            created.append(channel_name)
+
+    if created:
+        result = "\n".join(f"• `{name}`" for name in created)
+        await interaction.followup.send(
+            f"✅ 로그 카테고리와 로그 채널을 생성했습니다.\n{result}",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            "✅ 이미 모든 로그 채널이 있습니다.",
+            ephemeral=True
+        )
+
+    await send_log(guild, f"📁 로그 카테고리 생성/확인\n관리자: {interaction.user.mention}", "general")
+
+
+
+async def ensure_log_category_channels(guild: discord.Guild):
+    """로그 카테고리와 모든 로그 채널을 생성/확인합니다."""
+    category = discord.utils.get(guild.categories, name=LOG_CATEGORY_NAME)
+    if category is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        category = await guild.create_category(LOG_CATEGORY_NAME, overwrites=overwrites)
+
+    created = []
+    for channel_name in LOG_CHANNEL_NAMES.values():
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if channel is None:
+            await guild.create_text_channel(channel_name, category=category)
+            created.append(channel_name)
+        elif channel.category != category:
+            await channel.edit(category=category)
+
+    await apply_log_category_permissions(guild)
+    return category, created
+
+
+async def get_or_create_category(guild: discord.Guild, name: str):
+    category = discord.utils.get(guild.categories, name=name)
+    if category is None:
+        category = await guild.create_category(name)
+    return category
+
+
+async def get_or_create_category_under_rule(guild: discord.Guild, name: str):
+    """필독 카테고리 바로 밑에 카테고리를 생성/이동합니다."""
+    rule_category = discord.utils.get(guild.categories, name="📌 필독")
+    if rule_category is None:
+        rule_category = await guild.create_category("📌 필독")
+
+    category = discord.utils.get(guild.categories, name=name)
+    if category is None:
+        category = await guild.create_category(name, position=rule_category.position + 1)
+    else:
+        try:
+            await category.edit(position=rule_category.position + 1)
+        except discord.HTTPException:
+            pass
+    return category
+
+
+async def get_or_create_text_channel(guild: discord.Guild, name: str, category: discord.CategoryChannel):
+    channel = discord.utils.get(guild.text_channels, name=name)
+    if channel is None:
+        channel = await guild.create_text_channel(name, category=category)
+    elif channel.category != category:
+        await channel.edit(category=category)
+    return channel
+
+
+async def get_or_create_voice_channel(guild: discord.Guild, name: str, category: discord.CategoryChannel):
+    channel = discord.utils.get(guild.voice_channels, name=name)
+    if channel is None:
+        channel = await guild.create_voice_channel(name, category=category)
+    elif channel.category != category:
+        await channel.edit(category=category)
+    return channel
+
+
+async def apply_log_category_permissions(guild: discord.Guild):
+    """로그 카테고리는 관리자만 볼 수 있게 설정합니다."""
+    category = discord.utils.get(guild.categories, name=LOG_CATEGORY_NAME)
+    if category is None:
+        return
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+
+    # 아래 역할들이 있으면 로그를 볼 수 있게 추가합니다.
+    for role_name in ["대표", "부대표", "총관리자", "부관리자"]:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    await category.edit(overwrites=overwrites)
+    for channel in category.channels:
+        await channel.edit(sync_permissions=True)
+
+
+async def apply_default_server_permissions(guild: discord.Guild, default_category: discord.CategoryChannel):
+    """인사/퇴장/인증은 미인증만 보이게 설정합니다."""
+    unverified_role = discord.utils.get(guild.roles, name="미인증")
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    if unverified_role:
+        overwrites[unverified_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    await default_category.edit(overwrites=overwrites)
+    for channel in default_category.channels:
+        await channel.edit(sync_permissions=True)
+
+
+async def apply_rule_category_permissions(guild: discord.Guild, category: discord.CategoryChannel):
+    """필독 카테고리는 미인증/인증 유저 모두 볼 수 있게 설정합니다."""
+    unverified_role = discord.utils.get(guild.roles, name="미인증")
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    if unverified_role:
+        overwrites[unverified_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+
+    await category.edit(overwrites=overwrites)
+    for channel in category.channels:
+        await channel.edit(sync_permissions=True)
+
+
+async def send_rules_message_to_channel(channel: discord.TextChannel):
+    """규칙 채널에 설정된 규칙 임베드를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "서버 규칙" in title or "규칙" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_auto_embed(channel.guild, "rules"))
+    return True
+
+
+async def create_rule_category_channels(guild: discord.Guild):
+    """📌 필독 카테고리와 필독/규칙 채널을 생성하고 권한을 설정합니다."""
+    rule_category = await get_or_create_category(guild, "📌 필독")
+    rule_channel = await get_or_create_text_channel(guild, "📌-필독", rule_category)
+    rules_channel = await get_or_create_text_channel(guild, "📜-규칙", rule_category)
+    await apply_rule_category_permissions(guild, rule_category)
+    rules_message_sent = await send_rules_message_to_channel(rules_channel)
+    await create_recruit_channels_under_rule(guild)
+    return rule_category, rule_channel, rules_channel, rules_message_sent
+
+
+async def apply_member_category_permissions(guild: discord.Guild, category: discord.CategoryChannel):
+    """일반 카테고리는 인증한 유저는 보이고 미인증은 안 보이게 설정합니다."""
+    unverified_role = discord.utils.get(guild.roles, name="미인증")
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, connect=True, speak=True),
+    }
+    if unverified_role:
+        overwrites[unverified_role] = discord.PermissionOverwrite(view_channel=False, connect=False)
+
+    await category.edit(overwrites=overwrites)
+    for channel in category.channels:
+        await channel.edit(sync_permissions=True)
+
+
+
+async def build_music_panel_embed():
+    """뮤직 패널 임베드를 만듭니다."""
+    return create_embed(
+        "🎵 만능 봇 뮤직 패널",
+        "아래 버튼으로 음악을 조작할 수 있어요.\n\n"
+        "🎶 **재생** - 노래 제목/링크 입력\n"
+        "⏸️ **일시정지** - 현재 곡 멈춤\n"
+        "▶️ **다시재생** - 일시정지 해제\n"
+        "⏭️ **스킵 투표** - 음성방 사람 수만큼 투표하면 다음 곡으로 이동\n"
+        "📜 **대기열** - 현재 대기열 확인\n"
+        "🔁 **반복** - 현재 곡 반복 켜기/끄기\n"
+        "🔀 **셔플** - 대기열 랜덤 섞기\n"
+        "🔊 **볼륨** - 볼륨 설정\n"
+        "❌ **종료** - 음성 채널에서 나가기\n\n"
+        "유튜브 검색/링크, 사운드클라우드 링크, 멜론/지니뮤직 링크·검색어를 지원합니다.\n"
+        "멜론/지니뮤직은 원곡 파일을 직접 가져오는 방식이 아니라 제목을 찾아 유튜브/사운드클라우드에서 재생합니다."
+    )
+
+
+async def send_music_panel_to_channel(channel: discord.TextChannel):
+    """뮤직 명령어 채널에 뮤직 패널을 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "뮤직" in title and msg.components:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=await build_music_panel_embed(), view=MusicPanelView())
+    return True
+
+
+async def send_music_now_playing_guide(channel: discord.TextChannel):
+    """현재재생 채널 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "현재재생" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "🎶 현재재생 안내",
+        "현재 재생 중인 음악 정보나 안내를 확인하는 채널입니다.\n"
+        "음악 조작은 `🎵-뮤직명령어` 채널의 버튼 패널을 사용해주세요."
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def send_music_queue_guide(channel: discord.TextChannel):
+    """재생목록 채널 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "재생목록" in title or "대기열" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "📜 재생목록 안내",
+        "대기열 확인은 `🎵-뮤직명령어` 채널의 `📜 대기열` 버튼을 눌러주세요."
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def create_music_category_channels(guild: discord.Guild, *, send_panel: bool = True):
+    """🎵 뮤직방 카테고리와 뮤직 채널/음성 채널/패널을 자동 생성합니다."""
+    music_category = await get_or_create_category(guild, MUSIC_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, music_category)
+
+    music_command_channel = await get_or_create_text_channel(guild, MUSIC_COMMAND_CHANNEL_NAME, music_category)
+    now_playing_channel = await get_or_create_text_channel(guild, MUSIC_NOW_PLAYING_CHANNEL_NAME, music_category)
+    queue_channel = await get_or_create_text_channel(guild, MUSIC_QUEUE_CHANNEL_NAME, music_category)
+    music_voice_channel = await get_or_create_voice_channel(guild, MUSIC_VOICE_CHANNEL_NAME, music_category)
+
+    panel_sent = False
+    now_guide_sent = False
+    queue_guide_sent = False
+    if send_panel:
+        panel_sent = await send_music_panel_to_channel(music_command_channel)
+        now_guide_sent = await send_music_now_playing_guide(now_playing_channel)
+        queue_guide_sent = await send_music_queue_guide(queue_channel)
+
+    return {
+        "music_category": music_category,
+        "music_command_channel": music_command_channel,
+        "music_now_playing_channel": now_playing_channel,
+        "music_queue_channel": queue_channel,
+        "music_voice_channel": music_voice_channel,
+        "music_panel_sent": panel_sent,
+        "music_now_guide_sent": now_guide_sent,
+        "music_queue_guide_sent": queue_guide_sent,
+    }
+
+
+
+async def send_attendance_guide_to_channel(channel: discord.TextChannel):
+    """출석체크 채널에 사용 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "출석체크" in title or "출석 안내" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "📅 출석체크 안내",
+        "이 채널에서 하루 한 번 출석 보상을 받을 수 있어요.\n\n"
+        "사용 명령어\n"
+        "`/출석` 또는 `/출첵` - 하루 출석 보상 받기\n"
+        "`/출석랭킹` - 출석 TOP 10 확인\n"
+        "`/프로필` - 내 포인트/출석/레벨 확인\n\n"
+        "출석하면 기본 보상으로 **100P**를 받을 수 있습니다."
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+def build_enhance_guide_embed():
+    """강화 채널에 고정으로 올릴 박스형 안내 임베드입니다."""
+    embed = discord.Embed(
+        title="⚒️ 만능 봇 강화 시스템",
+        description=(
+            "아이템을 강화해서 더 높은 레벨에 도전하는 성장형 미니게임입니다.\n"
+            "슬래시 명령어와 `!강화` 명령어를 같이 사용할 수 있어요."
+        ),
+        color=0xFF9D2E
+    )
+    embed.add_field(
+        name="🚀 강화 시작",
+        value=(
+            "`/강화 아이템 이름:<아이템명>`\n"
+            "`!강화 <아이템명>`\n\n"
+            "예시: `/강화 아이템 이름:전설검`\n"
+            "예시: `!강화 전설검`"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ 강화 아이템",
+        value=(
+            "`강화보호권` : 파괴될 때 자동으로 1개 소모되어 보호\n"
+            "`강화확률업권` : 강화 시 자동으로 1개 소모되어 성공 확률 증가\n"
+            "`/강화보호권`, `/강화확률업권` 으로 보유 개수 확인"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="📦 내 기록 확인",
+        value=(
+            "`/강화 보유` : 내 강화 아이템 목록\n"
+            "`/강화 내기록` : 내 강화 통계\n"
+            "`/강화 내순위` : 내 랭킹 확인\n"
+            "`/강화 삭제` : 내 강화 아이템 삭제"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🏆 랭킹",
+        value=(
+            "`/강화 순위` : 현재 강화 랭킹\n"
+            "`/강화 기네스` : 최고 기록 랭킹"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="⏳ 쿨타임",
+        value="강화는 **1분에 1번** 사용할 수 있습니다.",
+        inline=False
+    )
+    embed.set_footer(text="⚒️ 만능 봇 강화방 | 강화는 운과 기록의 싸움입니다")
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    return embed
+
+
+class EnhanceGuideView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="강화 방법", emoji="⚒️", style=discord.ButtonStyle.blurple, custom_id="enhance_guide_how")
+    async def enhance_how(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "⚒️ **강화 방법**\n"
+            "`/강화 아이템 이름:<아이템명>` 또는 `!강화 <아이템명>` 으로 강화할 수 있어요.\n"
+            "강화는 1분 쿨타임이 적용됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="내 아이템", emoji="🎒", style=discord.ButtonStyle.green, custom_id="enhance_guide_inventory")
+    async def enhance_inventory(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "🎒 **내 아이템 확인**\n"
+            "`/강화 보유` : 보유 목록\n"
+            "`/강화 내기록` : 강화 통계\n"
+            "`/강화 내순위` : 내 순위",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="랭킹", emoji="🏆", style=discord.ButtonStyle.gray, custom_id="enhance_guide_rank")
+    async def enhance_rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "🏆 **강화 랭킹**\n"
+            "`/강화 순위` 로 현재 랭킹을 확인하고,\n"
+            "`/강화 기네스` 로 최고 기록을 확인할 수 있어요.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="보호권/확률업권", emoji="🛡️", style=discord.ButtonStyle.red, custom_id="enhance_guide_ticket")
+    async def enhance_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "🛡️ **강화 아이템**\n"
+            "`강화보호권`은 파괴될 때 자동으로 1개 소모됩니다.\n"
+            "`강화확률업권`은 강화할 때 자동으로 1개 소모됩니다.\n\n"
+            "확인 명령어: `/강화보호권`, `/강화확률업권`",
+            ephemeral=True
+        )
+
+
+async def send_enhance_guide_to_channel(channel: discord.TextChannel):
+    """강화 채널에 박스형 사용 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "만능 봇 강화 시스템" in title or "강화 안내" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_enhance_guide_embed(), view=EnhanceGuideView())
+    return True
+
+
+async def send_point_guide_to_channel(channel: discord.TextChannel):
+    """포인트 채널에 사용 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "포인트 안내" in title or "포인트 자동 안내" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "💰 포인트 자동 안내",
+        "╭━━━━━━━━━━━━━━━╮\n"
+        "  💰 포인트 시스템 안내\n"
+        "╰━━━━━━━━━━━━━━━╯\n\n"
+        "이 채널은 포인트 기능을 보기 쉽게 안내하는 자동 생성 임베드 채널입니다.\n\n"
+        "사용 명령어\n"
+        "`/프로필` - 내 포인트 확인\n"
+        "`/출석` - 출석하고 포인트 받기\n"
+        "`/포인트랭킹` - 포인트 랭킹 확인\n"
+        "`/통합상점` - 포인트로 아이템 구매\n\n"
+        "서버마다 포인트가 따로 저장됩니다."
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def send_level_guide_to_channel(channel: discord.TextChannel):
+    """레벨 채널에 사용 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "레벨 안내" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "📈 레벨 안내",
+        "채팅/음성 활동 레벨을 확인할 수 있어요.\n\n"
+        "`/랭크` - 내 레벨 확인\n"
+        "`/top` - 채팅/음성 랭킹 확인\n"
+        "`/레벨랭킹` - 레벨 TOP 10 확인"
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def send_shop_guide_to_channel(channel: discord.TextChannel):
+    """상점 채널에 통합상점 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "통합 상점" in title or "상점 안내" in title or "상점 자동 안내" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "🛒 상점 자동 안내",
+        "╭━━━━━━━━━━━━━━━╮\n"
+        "  🛒 통합 상점 안내\n"
+        "╰━━━━━━━━━━━━━━━╯\n\n"
+        "이 채널은 상점 기능을 보기 쉽게 안내하는 자동 생성 임베드 채널입니다.\n\n"
+        "사용 명령어\n"
+        "`/통합상점` - 상점 패널 열기\n"
+        "`/구매` - 박스에 상품명과 개수를 입력해서 구매\n"
+        "`/인벤토리` - 구매한 아이템 확인\n"
+        "`/닉네임색변경권` - 닉네임 색 변경권 사용\n\n"
+        "※ `/상점` 명령어는 제거했고, 이제 `/통합상점`을 사용합니다."
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def delete_shop_point_auto_embeds(channel: discord.TextChannel):
+    """상점/포인트 채널에 남아있는 기존 자동 안내 임베드를 삭제합니다."""
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if any(keyword in title for keyword in [
+                    "상점 자동 안내", "통합 상점 안내", "상점 안내",
+                    "포인트 자동 안내", "포인트 안내"
+                ]):
+                    try:
+                        await msg.delete()
+                    except discord.HTTPException:
+                        pass
+    except discord.HTTPException:
+        pass
+
+
+async def send_integrated_shop_panel_to_channel(channel: discord.TextChannel):
+    """상점 채널에 /통합상점 패널을 자동 생성합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "만능 봇 통합 상점" in title and msg.components:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_shop_embed(), view=ShopView())
+    return True
+
+
+
+async def send_stock_guide_to_channel(channel: discord.TextChannel):
+    """주식 채널에 가상 주식 안내 임베드를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "주식 자동 안내" in title or "가상 주식 시장" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "📈 주식 자동 안내",
+        "╭━━━━━━━━━━━━━━━╮\n"
+        "  📈 가상 주식 시스템 안내\n"
+        "╰━━━━━━━━━━━━━━━╯\n\n"
+        "이 채널은 포인트로 즐기는 **서버 전용 가상 주식** 안내 채널입니다.\n"
+        "실제 투자/현금 거래와 관련 없는 서버 게임용 기능이에요.\n\n"
+        "사용 명령어\n"
+        "`/주식` - 현재 주식 시장 확인\n"
+        "`/주식매수` - 포인트로 주식 구매\n"
+        "`/주식매도` - 보유 주식 판매\n"
+        "`/내주식` - 내 보유 주식 확인\n"
+        "`/주식랭킹` - 주식 평가금액 랭킹 확인\n\n"
+        "가격은 일정 시간마다 자동 변동됩니다."
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def create_shop_category_channels(guild: discord.Guild, *, send_shop_panel: bool = True):
+    """🛒 상점 카테고리를 필독 바로 밑에 만들고 상점/포인트/주식 채널을 생성 또는 이동합니다."""
+    shop_category = await get_or_create_category_under_rule(guild, SHOP_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, shop_category)
+
+    # 기존에 봇명령어방에 있던 상점/포인트 채널도 여기로 이동됩니다.
+    shop_channel = await get_or_create_text_channel(guild, SHOP_CHANNEL_NAME, shop_category)
+    point_channel = await get_or_create_text_channel(guild, POINT_CHANNEL_NAME, shop_category)
+    stock_channel = await get_or_create_text_channel(guild, STOCK_CHANNEL_NAME, shop_category)
+
+    # 상점 채널에는 /통합상점 패널만 유지하고, 포인트/주식 채널에는 안내 임베드를 자동 생성합니다.
+    await delete_shop_point_auto_embeds(shop_channel)
+
+    shop_panel_sent = False
+    point_guide_sent = False
+    stock_guide_sent = False
+    if send_shop_panel:
+        shop_panel_sent = await send_integrated_shop_panel_to_channel(shop_channel)
+        point_guide_sent = await send_point_guide_to_channel(point_channel)
+        stock_guide_sent = await send_stock_guide_to_channel(stock_channel)
+
+    return {
+        "shop_category": shop_category,
+        "shop_channel": shop_channel,
+        "point_channel": point_channel,
+        "stock_channel": stock_channel,
+        "shop_panel_sent": shop_panel_sent,
+        "shop_guide_sent": False,
+        "point_guide_sent": point_guide_sent,
+        "stock_guide_sent": stock_guide_sent,
+    }
+
+
+async def create_bot_command_category_channels(guild: discord.Guild, *, send_guides: bool = True):
+    """🤖 봇명령어방에는 출석/강화/레벨만 만들고, 상점/포인트는 상점 카테고리로 이동합니다."""
+    bot_category = await get_or_create_category(guild, BOT_COMMAND_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, bot_category)
+
+    command_channel = await get_or_create_text_channel(guild, BOT_COMMAND_CHANNEL_NAME, bot_category)
+    attendance_channel = await get_or_create_text_channel(guild, ATTENDANCE_CHANNEL_NAME, bot_category)
+    attendance_reward_channel = await get_or_create_text_channel(guild, ATTENDANCE_REWARD_CHANNEL_NAME, bot_category)
+    level_channel = await get_or_create_text_channel(guild, LEVEL_CHANNEL_NAME, bot_category)
+    shop_layout = await create_shop_category_channels(guild, send_shop_panel=True)
+    enhance_channel = await get_or_create_text_channel(guild, ENHANCE_CHANNEL_NAME, bot_category)
+
+    attendance_guide_sent = False
+    enhance_guide_sent = False
+    level_guide_sent = False
+    if send_guides:
+        attendance_guide_sent = await send_attendance_guide_to_channel(attendance_channel)
+        enhance_guide_sent = await send_enhance_guide_to_channel(enhance_channel)
+        level_guide_sent = await send_level_guide_to_channel(level_channel)
+
+    return {
+        "bot_category": bot_category,
+        "bot_command_channel": command_channel,
+        "attendance_channel": attendance_channel,
+        "attendance_reward_channel": attendance_reward_channel,
+        "point_channel": shop_layout.get("point_channel"),
+        "shop_channel": shop_layout.get("shop_channel"),
+        "stock_channel": shop_layout.get("stock_channel"),
+        "shop_category": shop_layout.get("shop_category"),
+        "level_channel": level_channel,
+        "enhance_channel": enhance_channel,
+        "attendance_guide_sent": attendance_guide_sent,
+        "enhance_guide_sent": enhance_guide_sent,
+        "point_guide_sent": shop_layout.get("point_guide_sent"),
+        "shop_guide_sent": shop_layout.get("shop_guide_sent"),
+        "level_guide_sent": level_guide_sent,
+    }
+
+
+async def send_tts_guide_to_channel(channel: discord.TextChannel):
+    """TTS 채널에 사용 안내를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "TTS 안내" in title or "TTS" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "🔊 TTS 안내",
+        "이 채널에 채팅을 치면 봇이 자동으로 음성 채널에 들어와 읽어줘요.\n\n"
+        "사용 방법\n"
+        "1️⃣ `🔊 TTS 통방 1~3` 중 원하는 통방에 들어가기\n"
+        "2️⃣ `🔊-tts` 채널에 읽을 문장 입력하기\n"
+        "3️⃣ 봇이 자동으로 네가 들어간 통방에 들어와서 읽어줍니다\n"
+        "4️⃣ 음성방에 아무도 없으면 첫 번째 TTS 통방으로 자동 입장합니다\n\n"
+        "명령어\n"
+        "`/입장` - 봇을 내 음성 채널로 부르기\n"
+        "`/퇴장` - 봇을 음성 채널에서 내보내기\n"
+        "`/목소리변경` - 연홍/연하 느낌 목소리 선택\n"
+        "`/tts text:내용` - 직접 TTS 읽기"
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def create_tts_category_channels(guild: discord.Guild):
+    """🔊 TTS 카테고리, TTS 채팅방 1개, TTS 통방 3개를 생성/확인합니다."""
+    tts_category = await get_or_create_category(guild, TTS_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, tts_category)
+    tts_text_channel = await get_or_create_text_channel(guild, TTS_TEXT_CHANNEL_NAME, tts_category)
+
+    tts_voice_channels = []
+    for voice_name in TTS_VOICE_CHANNEL_NAMES:
+        voice_channel = await get_or_create_voice_channel(guild, voice_name, tts_category)
+        tts_voice_channels.append(voice_channel)
+        await asyncio.sleep(0.1)
+
+    guide_sent = await send_tts_guide_to_channel(tts_text_channel)
+    first_voice_channel = tts_voice_channels[0] if tts_voice_channels else None
+    return tts_category, tts_text_channel, first_voice_channel, guide_sent
+
+
+def get_tts_voice_channels(guild: discord.Guild):
+    if guild is None:
+        return []
+    channels = []
+    for name in TTS_VOICE_CHANNEL_NAMES:
+        channel = discord.utils.get(guild.voice_channels, name=name)
+        if channel:
+            channels.append(channel)
+    return channels
+
+
+def find_auto_tts_voice_channel(member: discord.Member, text_channel: discord.TextChannel = None):
+    """TTS 채팅방에 글을 입력했을 때 봇이 들어갈 통방을 고릅니다."""
+    if member is None or member.guild is None:
+        return None
+
+    # 유저가 이미 음성방에 있으면 그 방으로 들어갑니다.
+    if member.voice and member.voice.channel:
+        return member.voice.channel
+
+    # 유저가 음성방에 없을 때는 TTS 통방 중 사람이 있는 방을 먼저 찾습니다.
+    tts_voice_channels = get_tts_voice_channels(member.guild)
+    for channel in tts_voice_channels:
+        humans = [m for m in channel.members if not m.bot]
+        if humans:
+            return channel
+
+    # 아무도 없으면 첫 번째 TTS 통방으로 들어갑니다.
+    if tts_voice_channels:
+        return tts_voice_channels[0]
+
+    return None
+
+
+async def send_ticket_panel_to_channel(channel: discord.TextChannel):
+    """티켓 생성 채널에 티켓 패널을 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "티켓" in title and msg.components:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "🎫 만능 봇 통합 티켓 패널",
+        "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n"
+        "🎫 **일반 티켓**\n"
+        "💬 **문의 티켓**\n"
+        "🚨 **신고 티켓**\n\n"
+        "관리자에게만 보이는 개인 채널이 생성됩니다."
+    )
+    await channel.send(embed=embed, view=UnifiedTicketView())
+    return True
+
+
+async def create_ticket_category_channels(guild: discord.Guild, *, send_panel: bool = False):
+    """🎫 티켓 카테고리, 티켓 생성 채널, 티켓 로그 채널을 생성/확인합니다."""
+    ticket_category = await get_or_create_category(guild, "🎫 티켓")
+    ticket_panel_channel = await get_or_create_text_channel(guild, "📩-티켓생성", ticket_category)
+    ticket_log_channel = await get_or_create_text_channel(guild, "📋-티켓로그", ticket_category)
+
+    panel_sent = False
+    if send_panel:
+        panel_sent = await send_ticket_panel_to_channel(ticket_panel_channel)
+
+    return ticket_category, ticket_panel_channel, ticket_log_channel, panel_sent
+
+
+async def send_verify_panel_to_channel(channel: discord.TextChannel):
+    """인증 채널에 설정된 인증 패널을 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "인증" in title and msg.components:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_auto_embed(channel.guild, "verify"), view=VerifyView())
+    return True
+
+
+async def create_verify_channel(guild: discord.Guild, category: discord.CategoryChannel):
+    """📦 기본 서버 카테고리에 ✅-인증 채널을 생성하고 인증 패널을 자동 전송합니다."""
+    verify_channel = await get_or_create_text_channel(guild, "✅-인증", category)
+    panel_sent = await send_verify_panel_to_channel(verify_channel)
+    return verify_channel, panel_sent
+
+async def send_intro_message_to_channel(channel: discord.TextChannel):
+    """자기소개 채널에 설정된 자기소개 임베드를 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "자기소개" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_auto_embed(channel.guild, "intro"))
+    return True
+
+
+async def create_intro_channel(guild: discord.Guild, category: discord.CategoryChannel):
+    """📦 기본 서버 카테고리에 자기소개 채널을 생성하고 안내 메시지를 자동 전송합니다."""
+    intro_channel = await get_or_create_text_channel(guild, "📝-자기소개", category)
+    intro_message_sent = await send_intro_message_to_channel(intro_channel)
+    return intro_channel, intro_message_sent
+
+
+
+async def create_friend_roles(guild: discord.Guild):
+    created = []
+    deleted = []
+    skipped_delete = []
+    updated = []
+
+    # /역할자동생성 또는 /친목섭 실행 시 기존 친목섭 역할을 지우고 다시 만듭니다.
+    # 아래 예쁜 구분 역할을 추가해서 역할 설정 화면이 깔끔하게 보이도록 합니다.
+    role_groups = [
+        ("˚₊‧꒰ა 👑 운영진 ໒꒱ ‧₊˚", [
+            "대표", "부대표", "총관리자", "부관리자", "운영진", "관리자",
+        ]),
+        ("˚₊‧꒰ა 🛡️ 담당팀 ໒꒱ ‧₊˚", [
+            "안내팀", "보안팀", "뉴관팀", "이벤트팀", "홍보팀", "내전팀", "팀장", "부팀장",
+        ]),
+        ("˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚", [
+            "VIP", "VVIP", "귀빈", "우수회원", "단골", "서버부스터", "후원자",
+        ]),
+        ("˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚", [
+            "스트리머", "유튜버", "디자이너", "개발자",
+        ]),
+        ("˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚", [
+            "뉴페이스", "미인증",
+        ]),
+        ("˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚", [
+            "남성", "여성", "20대", "10대",
+        ]),
+        ("˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚", [
+            "롤", "발로란트", "배틀그라운드", "이터널리턴", "마인크래프트", "로블록스",
+            "오버워치", "서든어택", "피파", "스타크래프트", "종합게임",
+        ]),
+    ]
+
+    separator_names = [group_name for group_name, _ in role_groups]
+
+    # 구분선 역할은 항상 기본 색상, 멘션 불가로 맞춥니다.
+    for divider_name in DIVIDER_ROLE_NAMES:
+        divider_role = discord.utils.get(guild.roles, name=divider_name)
+        if divider_role:
+            try:
+                await divider_role.edit(
+                    colour=discord.Colour.default(),
+                    mentionable=False,
+                    reason="구분선 역할 기본 색상 적용"
+                )
+                updated.append(divider_role.name)
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
+    pretty_role_order = []
+    for group_name, names in role_groups:
+        pretty_role_order.append(group_name)
+        pretty_role_order.extend(names)
+
+    # 예전 버전에서 만들었던 긴 선/짧은 구분 역할은 삭제하고, 위의 예쁜 구분 역할만 다시 생성합니다.
+    old_separator_names = [
+        "👑 운영진",
+        "🛡️ 서버팀",
+        "🌱 신규회원",
+        "⭐ 특별회원",
+        "🎨 크리에이터",
+        "🎮 게임역할",
+        "👤 프로필",
+        "━━━━━━━━ 👑 운영진 ━━━━━━━━",
+        "━━━━━━━━ 🛡️ 서버팀 ━━━━━━━━",
+        "━━━━━━━━ 🌱 신규회원 ━━━━━━━━",
+        "━━━━━━━━ ⭐ 특별회원 ━━━━━━━━",
+        "━━━━━━━━ 🎨 크리에이터 ━━━━━━━━",
+        "━━━━━━━━ 🎮 게임역할 ━━━━━━━━",
+        "━━━━━━━━ 👤 프로필 ━━━━━━━━",
+        "˚₊‧꒰ა ⭐ 멤버등급 ໒꒱ ‧₊˚",
+        "˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚",
+    ]
+
+    role_colors = {
+        # 예쁜 구분 역할
+        "˚₊‧꒰ა 👑 운영진 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 196, 87),
+        "˚₊‧꒰ა 🛡️ 담당팀 ໒꒱ ‧₊˚": discord.Color.from_rgb(104, 151, 255),
+        "˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 154, 202),
+        "˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚": discord.Color.from_rgb(180, 130, 255),
+        "˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚": discord.Color.from_rgb(72, 210, 255),
+        "˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 128, 170),
+        "˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 210, 92),
+        "˚₊‧꒰ა ⭐ 멤버등급 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 154, 202),
+
+        # 운영진
+        "대표": discord.Color.from_rgb(255, 77, 77),
+        "부대표": discord.Color.from_rgb(255, 145, 77),
+        "총관리자": discord.Color.from_rgb(255, 205, 74),
+        "부관리자": discord.Color.from_rgb(95, 113, 255),
+        "운영진": discord.Color.from_rgb(135, 86, 255),
+        "관리자": discord.Color.from_rgb(87, 125, 255),
+        "관리팀": discord.Color.from_rgb(120, 132, 255),
+        "스태프": discord.Color.from_rgb(83, 180, 255),
+        "매니저": discord.Color.from_rgb(54, 140, 255),
+
+        # 서버팀
+        "내전팀": discord.Color.from_rgb(175, 95, 255),
+        "안내팀": discord.Color.from_rgb(75, 222, 128),
+        "보안팀": discord.Color.from_rgb(230, 70, 70),
+        "뉴관팀": discord.Color.from_rgb(35, 204, 190),
+        "이벤트팀": discord.Color.from_rgb(190, 110, 255),
+        "홍보팀": discord.Color.from_rgb(68, 210, 150),
+        "팀장": discord.Color.from_rgb(75, 170, 255),
+        "부팀장": discord.Color.from_rgb(70, 135, 220),
+
+        # 신규회원 / 특별회원
+        "뉴페이스": discord.Color.from_rgb(185, 195, 205),
+        "미인증": discord.Color.from_rgb(100, 115, 125),
+        "VIP": discord.Color.from_rgb(255, 216, 74),
+        "VVIP": discord.Color.from_rgb(255, 151, 61),
+        "귀빈": discord.Color.from_rgb(188, 112, 255),
+        "우수회원": discord.Color.from_rgb(77, 221, 133),
+        "단골": discord.Color.from_rgb(33, 201, 185),
+        "서버부스터": discord.Color.from_rgb(255, 88, 166),
+        "후원자": discord.Color.from_rgb(255, 196, 87),
+
+        # 크리에이터
+        "스트리머": discord.Color.from_rgb(255, 92, 92),
+        "유튜버": discord.Color.from_rgb(255, 66, 66),
+        "디자이너": discord.Color.from_rgb(255, 82, 180),
+        "개발자": discord.Color.from_rgb(0, 196, 180),
+
+        # 프로필
+        "남성": discord.Color.from_rgb(70, 155, 255),
+        "여성": discord.Color.from_rgb(255, 84, 167),
+        "10대": discord.Color.from_rgb(100, 230, 145),
+        "20대": discord.Color.from_rgb(50, 190, 120),
+
+        # 게임역할
+        "롤": discord.Color.from_rgb(120, 170, 210),
+        "발로란트": discord.Color.from_rgb(255, 70, 85),
+        "배틀그라운드": discord.Color.from_rgb(230, 175, 70),
+        "이터널리턴": discord.Color.from_rgb(95, 180, 210),
+        "마인크래프트": discord.Color.from_rgb(95, 205, 90),
+        "로블록스": discord.Color.from_rgb(185, 195, 205),
+        "오버워치": discord.Color.from_rgb(255, 165, 70),
+        "서든어택": discord.Color.from_rgb(95, 110, 120),
+        "피파": discord.Color.from_rgb(70, 210, 120),
+        "스타크래프트": discord.Color.from_rgb(75, 150, 255),
+        "종합게임": discord.Color.from_rgb(105, 105, 255),
+    }
+
+    role_permissions = {
+        "대표": discord.Permissions(administrator=True),
+        "부대표": discord.Permissions(administrator=True),
+        "총관리자": discord.Permissions(
+            view_channel=True, manage_channels=True, manage_roles=True,
+            manage_messages=True, kick_members=True, ban_members=True,
+            moderate_members=True, view_audit_log=True, manage_nicknames=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "부관리자": discord.Permissions(
+            view_channel=True, manage_messages=True, kick_members=True,
+            moderate_members=True, manage_nicknames=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "운영진": discord.Permissions(
+            view_channel=True, manage_channels=True, manage_roles=True,
+            manage_messages=True, kick_members=True, ban_members=True,
+            moderate_members=True, view_audit_log=True, manage_nicknames=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "관리자": discord.Permissions(
+            view_channel=True, manage_channels=True, manage_messages=True,
+            kick_members=True, moderate_members=True, manage_nicknames=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "관리팀": discord.Permissions(
+            view_channel=True, manage_channels=True, manage_messages=True,
+            kick_members=True, moderate_members=True, manage_nicknames=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "스태프": discord.Permissions(
+            view_channel=True, manage_messages=True, moderate_members=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "매니저": discord.Permissions(
+            view_channel=True, manage_messages=True, manage_nicknames=True,
+            read_message_history=True, send_messages=True, connect=True, speak=True
+        ),
+        "이벤트팀": discord.Permissions(
+            view_channel=True, manage_events=True, read_message_history=True,
+            send_messages=True, attach_files=True, embed_links=True, connect=True, speak=True
+        ),
+        "홍보팀": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            attach_files=True, embed_links=True
+        ),
+        "보안팀": discord.Permissions(
+            view_channel=True, manage_messages=True, kick_members=True,
+            ban_members=True, moderate_members=True, view_audit_log=True,
+            read_message_history=True, send_messages=True
+        ),
+        "안내팀": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            manage_messages=True, manage_nicknames=True
+        ),
+        "뉴관팀": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            manage_nicknames=True
+        ),
+        "내전팀": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            manage_events=True, connect=True, speak=True, move_members=True
+        ),
+        "팀장": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            connect=True, speak=True, move_members=True
+        ),
+        "부팀장": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            connect=True, speak=True
+        ),
+        "뉴페이스": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True,
+            add_reactions=True, attach_files=True, embed_links=True,
+            connect=True, speak=True, use_voice_activation=True
+        ),
+        "미인증": discord.Permissions(
+            view_channel=True, read_message_history=True, send_messages=True
+        ),
+    }
+
+    default_member_permissions = discord.Permissions(
+        view_channel=True, read_message_history=True, send_messages=True,
+        add_reactions=True, connect=True, speak=True, use_voice_activation=True
+    )
+
+    bot_member = guild.me or guild.get_member(bot.user.id)
+    target_role_names = set(pretty_role_order + old_separator_names)
+
+    # 기존 친목섭 역할을 먼저 삭제합니다.
+    # 봇보다 높은 역할, 봇/연동 서비스 관리 역할, @everyone은 삭제하지 않습니다.
+    for role_name in target_role_names:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            continue
+        if role == guild.default_role or role.managed or (bot_member and role >= bot_member.top_role):
+            skipped_delete.append(role.name)
+            continue
+        try:
+            await role.delete(reason="친목섭 역할 자동 재생성: 기존 역할 삭제")
+            deleted.append(role.name)
+            await asyncio.sleep(0.25)
+        except discord.Forbidden:
+            skipped_delete.append(role.name)
+            await send_log(guild, f"❌ 역할 삭제 실패: `{role.name}`\n사유: 봇 역할 위치 또는 권한 부족", "general")
+        except discord.HTTPException as e:
+            skipped_delete.append(role.name)
+            await send_log(guild, f"❌ 역할 삭제 실패: `{role.name}`\n오류: `{e}`", "general")
+
+    # 새 디자인으로 다시 생성합니다.
+    for role_name in pretty_role_order:
+        is_separator = role_name in separator_names
+        permissions = discord.Permissions.none() if is_separator else role_permissions.get(role_name, default_member_permissions)
+        hoist_role = is_separator or role_name in [
+            "대표", "부대표", "총관리자", "부관리자", "운영진", "관리자",
+            "팀장", "부팀장", "VIP", "VVIP"
+        ]
+
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            try:
+                await role.edit(
+                    permissions=permissions,
+                    color=discord.Color.default() if role_name in DIVIDER_ROLE_NAMES else role_colors.get(role_name, role.color),
+                    hoist=hoist_role,
+                    mentionable=False if role_name in DIVIDER_ROLE_NAMES else (False if is_separator else True),
+                    reason="친목섭 역할 디자인/권한 자동 정리"
+                )
+                updated.append(role_name)
+            except discord.Forbidden:
+                await send_log(guild, f"❌ 역할 수정 실패: `{role_name}`\n사유: 봇 역할 위치 또는 권한 부족", "general")
+            except discord.HTTPException as e:
+                await send_log(guild, f"❌ 역할 수정 실패: `{role_name}`\n오류: `{e}`", "general")
+            continue
+
+        try:
+            role = await guild.create_role(
+                name=role_name,
+                color=discord.Color.default() if role_name in DIVIDER_ROLE_NAMES else role_colors.get(role_name, discord.Color.default()),
+                permissions=permissions,
+                hoist=hoist_role,
+                mentionable=False if role_name in DIVIDER_ROLE_NAMES else (False if is_separator else True),
+                reason="친목섭 예쁜 역할 자동 생성"
+            )
+            created.append(role.name)
+            await asyncio.sleep(0.25)
+        except discord.Forbidden:
+            await send_log(guild, f"❌ 역할 생성 실패: `{role_name}`\n사유: 봇 역할 위치 또는 권한 부족", "general")
+        except discord.HTTPException as e:
+            await send_log(guild, f"❌ 역할 생성 실패: `{role_name}`\n오류: `{e}`", "general")
+
+    # 역할 설정 화면에서 위에서부터 예쁘게 보이도록 순서를 정리합니다.
+    try:
+        editable_roles = [
+            discord.utils.get(guild.roles, name=name)
+            for name in reversed(pretty_role_order)
+        ]
+        editable_roles = [role for role in editable_roles if role and bot_member and role < bot_member.top_role]
+        if editable_roles:
+            start_position = max(1, bot_member.top_role.position - len(editable_roles))
+            positions = {role: start_position + index for index, role in enumerate(editable_roles)}
+            await guild.edit_role_positions(positions=positions, reason="친목섭 역할 순서 예쁘게 정리")
+    except discord.Forbidden:
+        await send_log(guild, "❌ 역할 순서 정리 실패\n사유: 봇 역할 위치 또는 권한 부족", "general")
+    except discord.HTTPException as e:
+        await send_log(guild, f"❌ 역할 순서 정리 실패\n오류: `{e}`", "general")
+
+    return created, deleted, skipped_delete, updated
+
+
+async def create_friend_server_layout(guild: discord.Guild):
+    # 로그 시스템도 서버별로 자동 사용 가능하도록 로그 카테고리/채널을 만듭니다.
+    await ensure_log_category_channels(guild)
+
+    # 티켓 시스템도 서버별로 자동 사용 가능하도록 기본 티켓 카테고리/채널/패널을 만듭니다.
+    ticket_category, ticket_panel_channel, ticket_log_channel, ticket_panel_sent = await create_ticket_category_channels(guild, send_panel=True)
+    await apply_member_category_permissions(guild, ticket_category)
+
+    default_category = await get_or_create_category(guild, DEFAULT_SERVER_CATEGORY_NAME)
+    await get_or_create_text_channel(guild, "👋-인사-퇴장", default_category)
+    intro_channel, intro_message_sent = await create_intro_channel(guild, default_category)
+    verify_channel, verify_panel_sent = await create_verify_channel(guild, default_category)
+    await apply_default_server_permissions(guild, default_category)
+
+    rule_category, rule_channel, rules_channel, rules_message_sent = await create_rule_category_channels(guild)
+
+    chat_category = await get_or_create_category(guild, "💬 채팅방")
+    await apply_member_category_permissions(guild, chat_category)
+    await get_or_create_text_channel(guild, "💬-자유채팅", chat_category)
+    await get_or_create_text_channel(guild, "📷-사진", chat_category)
+
+    voice_category = await get_or_create_category(guild, "🔊 음성방")
+    await apply_member_category_permissions(guild, voice_category)
+    await get_or_create_voice_channel(guild, "🔊 음성방 1", voice_category)
+    await get_or_create_voice_channel(guild, "🔊 음성방 2", voice_category)
+
+    game_category = await get_or_create_category(guild, "🎮 게임방")
+    await apply_member_category_permissions(guild, game_category)
+    await get_or_create_text_channel(guild, "🎮-게임채팅", game_category)
+    game_role_channel = await get_or_create_text_channel(guild, "🎮-게임역할선택", game_category)
+    game_role_panel_sent = await send_game_role_panel_to_channel(game_role_channel)
+    await get_or_create_voice_channel(guild, "🎮 게임 음성 1", game_category)
+
+    bot_command_layout = await create_bot_command_category_channels(guild, send_guides=True)
+
+    music_layout = await create_music_category_channels(guild, send_panel=True)
+    music_command_channel = music_layout.get("music_command_channel")
+    bot_command_channel = bot_command_layout.get("bot_command_channel")
+    attendance_channel = bot_command_layout.get("attendance_channel")
+    enhance_channel = bot_command_layout.get("enhance_channel")
+    shop_category = bot_command_layout.get("shop_category")
+    shop_channel = bot_command_layout.get("shop_channel")
+    point_channel = bot_command_layout.get("point_channel")
+
+    tts_category, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
+
+    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
+    await apply_member_category_permissions(guild, scrim_category)
+    await get_or_create_text_channel(guild, "⚔️-내전모집", scrim_category)
+    await get_or_create_voice_channel(guild, "⚔️ 내전 대기방", scrim_category)
+
+    busking_category = await get_or_create_category(guild, "🎤 버스킹")
+    await apply_member_category_permissions(guild, busking_category)
+    await get_or_create_text_channel(guild, "🎤-버스킹채팅", busking_category)
+    await get_or_create_voice_channel(guild, "🎤 버스킹 무대", busking_category)
+
+    adult_category = await get_or_create_category(guild, "🔞 수위방")
+    await apply_member_category_permissions(guild, adult_category)
+    await get_or_create_text_channel(guild, "🔞-수위채팅", adult_category)
+    await get_or_create_voice_channel(guild, "🔞 수위 음성", adult_category)
+
+    afk_category = await get_or_create_category(guild, TEMP_VOICE_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, afk_category)
+    await get_or_create_voice_channel(guild, "😴 잠수방", afk_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, afk_category)
+
+    welcome_channel = get_channel_by_id_or_name(guild, WELCOME_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "환영", "welcome"], "text")
+    goodbye_channel = get_channel_by_id_or_name(guild, GOODBYE_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "퇴장", "goodbye"], "text")
+    rule_channel = get_channel_by_id_or_name(guild, RULE_CHANNEL_ID, ["📌-필독", "필독", "규칙"], "text")
+    save_guild_settings(guild, welcome_channel=welcome_channel, goodbye_channel=goodbye_channel, rule_channel=rule_channel, game_role_channel=game_role_channel)
+
+    return {
+        "welcome_channel": welcome_channel,
+        "goodbye_channel": goodbye_channel,
+        "rule_channel": rule_channel,
+        "game_role_channel": game_role_channel,
+        "game_role_panel_sent": game_role_panel_sent,
+        "ticket_panel_channel": ticket_panel_channel,
+        "ticket_log_channel": ticket_log_channel,
+        "ticket_panel_sent": ticket_panel_sent,
+        "verify_channel": verify_channel,
+        "verify_panel_sent": verify_panel_sent,
+        "intro_channel": intro_channel,
+        "intro_message_sent": intro_message_sent,
+        "rule_category": rule_category,
+        "rule_channel": rule_channel,
+        "rules_channel": rules_channel,
+        "rules_message_sent": rules_message_sent,
+        "music_command_channel": music_command_channel,
+        "music_category": music_layout.get("music_category"),
+        "music_now_playing_channel": music_layout.get("music_now_playing_channel"),
+        "music_queue_channel": music_layout.get("music_queue_channel"),
+        "music_voice_channel": music_layout.get("music_voice_channel"),
+        "music_panel_sent": music_layout.get("music_panel_sent"),
+        "music_now_guide_sent": music_layout.get("music_now_guide_sent"),
+        "music_queue_guide_sent": music_layout.get("music_queue_guide_sent"),
+        "bot_command_channel": bot_command_layout.get("bot_command_channel"),
+        "attendance_channel": bot_command_layout.get("attendance_channel"),
+        "attendance_reward_channel": bot_command_layout.get("attendance_reward_channel"),
+        "point_channel": bot_command_layout.get("point_channel"),
+        "shop_channel": bot_command_layout.get("shop_channel"),
+        "shop_category": bot_command_layout.get("shop_category"),
+        "level_channel": bot_command_layout.get("level_channel"),
+        "enhance_channel": bot_command_layout.get("enhance_channel"),
+        "attendance_guide_sent": bot_command_layout.get("attendance_guide_sent"),
+        "enhance_guide_sent": bot_command_layout.get("enhance_guide_sent"),
+        "point_guide_sent": bot_command_layout.get("point_guide_sent"),
+        "shop_guide_sent": bot_command_layout.get("shop_guide_sent"),
+        "level_guide_sent": bot_command_layout.get("level_guide_sent"),
+        "tts_text_channel": tts_text_channel,
+        "tts_voice_channel": tts_voice_channel,
+        "tts_guide_sent": tts_guide_sent,
+    }
+
+
+
+
+# =========================
+# 만능봇 스타일 서버 시작 / 보안 설정
+# =========================
+
+setting_group = app_commands.Group(name="설정", description="서버 보안 기능을 설정합니다.")
+
+
+async def require_admin_interaction(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return False
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return False
+    return True
+
+
+@setting_group.command(name="악성유저감지", description="새 계정/대량 입장 같은 의심 유저 감지를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_malicious_user_detection(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "malicious_user_detection", 상태)
+    embed = create_embed(
+        "🛡️ 악성유저감지 설정",
+        f"상태: **{security_state_text(상태)}**\n\n새 계정 입장, 짧은 시간 대량 입장, 의심 닉네임을 로그에 알려줍니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🛡️ 악성유저감지 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="자동검열", description="초대링크/IP/금지어 자동 삭제를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_auto_filter(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "auto_filter", 상태)
+    embed = create_embed(
+        "🧹 자동검열 설정",
+        f"상태: **{security_state_text(상태)}**\n\n초대 링크, IP 주소, 금지어를 감지하면 메시지를 삭제하고 경고 로그를 남깁니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🧹 자동검열 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="테러감지", description="채널/역할 삭제 같은 위험 작업 감지를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_raid_detection(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "raid_detection", 상태)
+    embed = create_embed(
+        "🚨 테러감지 설정",
+        f"상태: **{security_state_text(상태)}**\n\n채널 삭제, 역할 삭제 같은 위험 작업이 짧은 시간 반복되면 처벌로그에 경고를 남깁니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🚨 테러감지 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="도배보호", description="짧은 시간 반복 채팅 감지를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_spam_protection(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "spam_protection", 상태)
+    embed = create_embed(
+        "⚠️ 도배보호 설정",
+        f"상태: **{security_state_text(상태)}**\n\n짧은 시간에 메시지를 반복하면 자동 경고와 보안 로그를 남깁니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"⚠️ 도배보호 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="멘션테러감지", description="대량 멘션/역할 멘션 감지를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_mention_spam_detection(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "mention_spam_detection", 상태)
+    embed = create_embed(
+        "📣 멘션테러감지 설정",
+        f"상태: **{security_state_text(상태)}**\n\n많은 유저/역할 멘션 또는 @everyone/@here 사용을 감지하면 삭제하고 경고합니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"📣 멘션테러감지 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="새계정보호", description="생성된 지 얼마 안 된 계정 입장 알림을 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_new_account_guard(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "new_account_guard", 상태)
+    embed = create_embed(
+        "🧊 새계정보호 설정",
+        f"상태: **{security_state_text(상태)}**\n\n계정 생성 {SECURITY_NEW_ACCOUNT_DAYS}일 미만 유저가 입장하면 보안 로그와 경고 로그에 표시합니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🧊 새계정보호 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="보안로그저장", description="보안 감지 기록 저장을 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_security_log_enabled(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "security_log_enabled", 상태)
+    embed = create_embed(
+        "📑 보안로그 저장 설정",
+        f"상태: **{security_state_text(상태)}**\n\n켜두면 자동검열/도배/멘션테러/테러감지 기록을 DB에 저장해서 `/설정 보안로그` 로 볼 수 있습니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"📑 보안로그 저장 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="위험파일차단", description="exe/bat/js 같은 위험 첨부파일 자동 삭제를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_dangerous_file_block(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "dangerous_file_block", 상태)
+    embed = create_embed(
+        "📎 위험파일차단 설정",
+        f"상태: **{security_state_text(상태)}**\n\nexe, bat, cmd, js, vbs, ps1, jar 같은 위험 확장자 첨부파일을 자동 삭제하고 경고합니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"📎 위험파일차단 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="토큰보호", description="디스코드 봇 토큰처럼 보이는 문자열 자동 삭제를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_token_leak_guard(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "token_leak_guard", 상태)
+    embed = create_embed(
+        "🔐 토큰보호 설정",
+        f"상태: **{security_state_text(상태)}**\n\n봇 토큰처럼 보이는 문자열이 올라오면 내용을 로그에 남기지 않고 메시지를 삭제합니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🔐 토큰보호 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="권한보호", description="관리자/역할관리 같은 위험 권한 부여 감지를 켜거나 끕니다.")
+@app_commands.describe(상태="켜기=True / 끄기=False")
+async def setting_permission_guard(interaction: discord.Interaction, 상태: bool):
+    if not await require_admin_interaction(interaction):
+        return
+    set_security_setting(interaction.guild.id, "permission_guard", 상태)
+    embed = create_embed(
+        "🧬 권한보호 설정",
+        f"상태: **{security_state_text(상태)}**\n\n위험 권한이 포함된 역할 지급/역할 권한 변경을 보안 로그에 표시합니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🧬 권한보호 {security_state_text(상태)}\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="상태", description="현재 서버의 보안 설정 상태를 확인합니다.")
+async def setting_security_status(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+    settings = get_security_settings(interaction.guild.id)
+    bad_count = len(get_custom_filter_words(interaction.guild.id))
+    malicious_count = len(list_malicious_users(interaction.guild.id, 100))
+    log_count = count_security_logs(interaction.guild.id, 24)
+    embed = create_embed(
+        "🛡️ 보안 설정 상태",
+        "만능봇 느낌의 서버 보호 설정입니다.\n\n"
+        f"🛡️ 악성유저감지: **{security_state_text(settings['malicious_user_detection'])}**\n"
+        f"🧹 자동검열: **{security_state_text(settings['auto_filter'])}**\n"
+        f"🚨 테러감지: **{security_state_text(settings['raid_detection'])}**\n"
+        f"⚠️ 도배보호: **{security_state_text(settings['spam_protection'])}**\n"
+        f"📣 멘션테러감지: **{security_state_text(settings['mention_spam_detection'])}**\n"
+        f"🧊 새계정보호: **{security_state_text(settings['new_account_guard'])}**\n"
+        f"📎 위험파일차단: **{security_state_text(settings['dangerous_file_block'])}**\n"
+        f"🔐 토큰보호: **{security_state_text(settings['token_leak_guard'])}**\n"
+        f"🧬 권한보호: **{security_state_text(settings['permission_guard'])}**\n"
+        f"📑 보안로그저장: **{security_state_text(settings['security_log_enabled'])}**\n\n"
+        f"등록 악성유저: `{malicious_count}`명\n"
+        f"추가 차단단어: `{bad_count}`개\n"
+        f"최근 24시간 보안기록: `{log_count}`건"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@setting_group.command(name="악성유저등록", description="관리자가 직접 악성/주의 유저를 등록합니다.")
+@app_commands.describe(유저="등록할 유저", 사유="등록 사유")
+async def setting_add_malicious_user(interaction: discord.Interaction, 유저: discord.User, 사유: str = "관리자 직접 등록"):
+    if not await require_admin_interaction(interaction):
+        return
+    add_malicious_user(interaction.guild.id, 유저.id, 사유[:500], interaction.user.id)
+    add_security_log(interaction.guild.id, 유저.id, "악성유저등록", 사유[:500], 0)
+    embed = create_embed(
+        "🚨 악성유저 등록",
+        f"대상: {유저.mention}\n사유: `{사유[:500]}`\n\n악성유저감지가 켜져 있으면 입장 시 경고 로그가 올라갑니다."
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🚨 악성유저 등록\n대상: {유저.mention}\n관리자: {interaction.user.mention}\n사유: `{사유[:500]}`", "warning")
+
+
+@setting_group.command(name="악성유저삭제", description="등록된 악성/주의 유저를 목록에서 삭제합니다.")
+@app_commands.describe(유저="삭제할 유저")
+async def setting_remove_malicious_user(interaction: discord.Interaction, 유저: discord.User):
+    if not await require_admin_interaction(interaction):
+        return
+    removed = remove_malicious_user(interaction.guild.id, 유저.id)
+    if removed:
+        add_security_log(interaction.guild.id, 유저.id, "악성유저삭제", "관리자 직접 삭제", 0)
+    msg = f"✅ {유저.mention} 님을 악성유저 목록에서 삭제했습니다." if removed else "❌ 해당 유저는 등록되어 있지 않습니다."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@setting_group.command(name="악성유저목록", description="등록된 악성/주의 유저 목록을 확인합니다.")
+async def setting_list_malicious_users(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+    rows = list_malicious_users(interaction.guild.id, 20)
+    embed = create_embed("🚨 악성유저 목록", "관리자가 직접 등록한 주의 유저 목록입니다.")
+    if not rows:
+        embed.add_field(name="목록 없음", value="등록된 유저가 없습니다.", inline=False)
+    else:
+        for user_id, reason, added_by, added_at in rows:
+            embed.add_field(
+                name=f"<@{user_id}> (`{user_id}`)",
+                value=f"사유: `{reason or '없음'}`\n등록자: <@{added_by}>\n등록일: `{added_at}`",
+                inline=False
+            )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@setting_group.command(name="차단단어추가", description="자동검열에 사용할 차단 단어를 추가합니다.")
+@app_commands.describe(단어="추가할 단어")
+async def setting_add_filter_word(interaction: discord.Interaction, 단어: str):
+    if not await require_admin_interaction(interaction):
+        return
+    word = 단어.strip().lower()
+    if len(word) < 2:
+        return await interaction.response.send_message("❌ 단어는 2글자 이상으로 입력해주세요.", ephemeral=True)
+    added = add_custom_filter_word(interaction.guild.id, word, interaction.user.id)
+    msg = f"✅ 차단단어 `{word}` 를 추가했습니다." if added else f"이미 `{word}` 가 등록되어 있습니다."
+    await interaction.response.send_message(msg, ephemeral=True)
+    await send_log(interaction.guild, f"🧹 차단단어 추가\n단어: `{word}`\n관리자: {interaction.user.mention}", "general")
+
+
+@setting_group.command(name="차단단어삭제", description="자동검열 차단 단어를 삭제합니다.")
+@app_commands.describe(단어="삭제할 단어")
+async def setting_remove_filter_word(interaction: discord.Interaction, 단어: str):
+    if not await require_admin_interaction(interaction):
+        return
+    word = 단어.strip().lower()
+    removed = remove_custom_filter_word(interaction.guild.id, word)
+    msg = f"✅ 차단단어 `{word}` 를 삭제했습니다." if removed else "❌ 해당 단어는 추가 목록에 없습니다."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@setting_group.command(name="차단단어목록", description="자동검열 차단 단어 목록을 확인합니다.")
+async def setting_list_filter_words(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+    custom_words = get_custom_filter_words(interaction.guild.id)
+    base_preview = ", ".join(AUTO_FILTER_BAD_WORDS[:8])
+    custom_text = ", ".join(f"`{w}`" for w in custom_words[:50]) if custom_words else "추가된 단어가 없습니다."
+    embed = create_embed(
+        "🧹 차단단어 목록",
+        f"기본 필터 일부: `{base_preview}` ...\n\n서버 추가 단어:\n{custom_text}"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def build_security_log_embed(guild: discord.Guild):
+    rows = list_security_logs(guild.id, SECURITY_LOG_PREVIEW_LIMIT)
+    embed = create_embed(
+        "📑 보안 로그",
+        f"최근 보안 감지/차단 기록 {len(rows)}개를 표시합니다."
+    )
+    if not rows:
+        embed.add_field(name="기록 없음", value="아직 저장된 보안 로그가 없습니다.", inline=False)
+    else:
+        for user_id, action, reason, channel_id, created_at in rows:
+            target = f"<@{user_id}>" if user_id else "알 수 없음"
+            channel_text = f"<#{channel_id}>" if channel_id else "채널 없음"
+            embed.add_field(
+                name=f"{action} · {created_at}",
+                value=f"대상: {target}\n채널: {channel_text}\n사유: `{reason or '없음'}`",
+                inline=False
+            )
+    embed.set_footer(text="/설정 보안로그 로도 확인할 수 있어요.")
+    return embed
+
+
+@setting_group.command(name="보안로그", description="최근 보안 감지/차단 기록을 확인합니다.")
+async def setting_security_logs(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+    await interaction.response.send_message(embed=build_security_log_embed(interaction.guild), ephemeral=True)
+
+
+@setting_group.command(name="보안점검", description="봇 권한과 위험 역할을 빠르게 점검합니다.")
+async def setting_security_check(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+
+    guild = interaction.guild
+    bot_member = guild.me or guild.get_member(bot.user.id)
+    missing = []
+    if bot_member:
+        needed = {
+            "manage_messages": "메시지 관리",
+            "manage_roles": "역할 관리",
+            "ban_members": "멤버 차단",
+            "kick_members": "멤버 추방",
+            "moderate_members": "타임아웃",
+            "view_audit_log": "감사 로그 보기",
+        }
+        for attr, label in needed.items():
+            if not getattr(bot_member.guild_permissions, attr, False):
+                missing.append(label)
+
+    risky_roles = []
+    for role in guild.roles:
+        if role.is_default() or role.managed:
+            continue
+        risky = dangerous_permissions_from(role.permissions)
+        if risky:
+            risky_roles.append(f"{role.mention}: {', '.join(risky[:3])}")
+
+    embed = create_embed(
+        "🧪 보안점검 결과",
+        "현재 서버의 보안 상태를 빠르게 확인했습니다."
+    )
+    embed.add_field(
+        name="봇 권한",
+        value="✅ 주요 권한이 충분합니다." if not missing else "⚠️ 부족 권한: " + ", ".join(missing),
+        inline=False
+    )
+    embed.add_field(
+        name="위험 권한 역할",
+        value="없음" if not risky_roles else "\n".join(risky_roles[:12]) + (f"\n외 {len(risky_roles) - 12}개" if len(risky_roles) > 12 else ""),
+        inline=False
+    )
+    embed.add_field(
+        name="추천",
+        value="`/보안패널`에서 자동검열, 도배보호, 멘션테러, 위험파일, 토큰보호, 권한보호를 켜두는 것을 추천합니다.",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class SecurityPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def _toggle(self, interaction: discord.Interaction, key: str, label: str):
+        if not await require_admin_interaction(interaction):
+            return
+        settings = get_security_settings(interaction.guild.id)
+        new_state = not settings.get(key, False)
+        set_security_setting(interaction.guild.id, key, new_state)
+        embed = build_security_panel_embed(interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=SecurityPanelView())
+        await send_log(interaction.guild, f"🛡️ 보안패널 변경\n항목: `{label}`\n상태: {security_state_text(new_state)}\n관리자: {interaction.user.mention}", "general")
+
+    async def _set_all(self, interaction: discord.Interaction, enabled: bool):
+        if not await require_admin_interaction(interaction):
+            return
+        keys = [
+            "malicious_user_detection",
+            "auto_filter",
+            "raid_detection",
+            "spam_protection",
+            "mention_spam_detection",
+            "new_account_guard",
+            "dangerous_file_block",
+            "token_leak_guard",
+            "permission_guard",
+            "security_log_enabled",
+        ]
+        for key in keys:
+            set_security_setting(interaction.guild.id, key, enabled)
+        await interaction.response.edit_message(embed=build_security_panel_embed(interaction.guild), view=SecurityPanelView())
+        await send_log(
+            interaction.guild,
+            f"🛡️ 보안패널 전체 {'켜기' if enabled else '끄기'}\n관리자: {interaction.user.mention}",
+            "general"
+        )
+
+    @discord.ui.button(label="악성유저감지", emoji="🛡️", style=discord.ButtonStyle.blurple, row=0)
+    async def toggle_malicious(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "malicious_user_detection", "악성유저감지")
+
+    @discord.ui.button(label="자동검열", emoji="🧹", style=discord.ButtonStyle.green, row=0)
+    async def toggle_filter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "auto_filter", "자동검열")
+
+    @discord.ui.button(label="테러감지", emoji="🚨", style=discord.ButtonStyle.red, row=0)
+    async def toggle_raid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "raid_detection", "테러감지")
+
+    @discord.ui.button(label="도배보호", emoji="⚠️", style=discord.ButtonStyle.blurple, row=1)
+    async def toggle_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "spam_protection", "도배보호")
+
+    @discord.ui.button(label="멘션테러", emoji="📣", style=discord.ButtonStyle.blurple, row=1)
+    async def toggle_mention(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "mention_spam_detection", "멘션테러감지")
+
+    @discord.ui.button(label="새계정보호", emoji="🧊", style=discord.ButtonStyle.gray, row=1)
+    async def toggle_new_account(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "new_account_guard", "새계정보호")
+
+    @discord.ui.button(label="위험파일", emoji="📎", style=discord.ButtonStyle.red, row=3)
+    async def toggle_dangerous_file(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "dangerous_file_block", "위험파일차단")
+
+    @discord.ui.button(label="토큰보호", emoji="🔐", style=discord.ButtonStyle.red, row=3)
+    async def toggle_token_guard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "token_leak_guard", "토큰보호")
+
+    @discord.ui.button(label="권한보호", emoji="🧬", style=discord.ButtonStyle.red, row=3)
+    async def toggle_permission_guard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle(interaction, "permission_guard", "권한보호")
+
+    @discord.ui.button(label="전체켜기", emoji="✅", style=discord.ButtonStyle.green, row=2)
+    async def enable_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_all(interaction, True)
+
+    @discord.ui.button(label="전체끄기", emoji="🧯", style=discord.ButtonStyle.red, row=2)
+    async def disable_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_all(interaction, False)
+
+    @discord.ui.button(label="보안로그", emoji="📑", style=discord.ButtonStyle.gray, row=2)
+    async def show_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_admin_interaction(interaction):
+            return
+        await interaction.response.send_message(embed=build_security_log_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="새로고침", emoji="🔄", style=discord.ButtonStyle.gray, row=2)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_admin_interaction(interaction):
+            return
+        await interaction.response.edit_message(embed=build_security_panel_embed(interaction.guild), view=SecurityPanelView())
+
+
+def build_security_panel_embed(guild: discord.Guild):
+    settings = get_security_settings(guild.id)
+    bad_count = len(get_custom_filter_words(guild.id))
+    malicious_count = len(list_malicious_users(guild.id, 100))
+    recent_logs = count_security_logs(guild.id, 24)
+    embed = create_embed(
+        "🛡️ 만능봇 업그레이드 보안패널",
+        "아래 버튼으로 서버 보호 기능을 바로 켜고 끌 수 있어요.\n\n"
+        f"🛡️ 악성유저감지: **{security_state_text(settings['malicious_user_detection'])}**\n"
+        f"🧹 자동검열: **{security_state_text(settings['auto_filter'])}**\n"
+        f"🚨 테러감지: **{security_state_text(settings['raid_detection'])}**\n"
+        f"⚠️ 도배보호: **{security_state_text(settings['spam_protection'])}**\n"
+        f"📣 멘션테러감지: **{security_state_text(settings['mention_spam_detection'])}**\n"
+        f"🧊 새계정보호: **{security_state_text(settings['new_account_guard'])}**\n"
+        f"📎 위험파일차단: **{security_state_text(settings['dangerous_file_block'])}**\n"
+        f"🔐 토큰보호: **{security_state_text(settings['token_leak_guard'])}**\n"
+        f"🧬 권한보호: **{security_state_text(settings['permission_guard'])}**\n"
+        f"📑 보안로그저장: **{security_state_text(settings['security_log_enabled'])}**\n\n"
+        f"등록 악성유저: `{malicious_count}`명 | 추가 차단단어: `{bad_count}`개 | 최근 24시간 로그: `{recent_logs}`건\n"
+        "관리자 전용 패널입니다."
+    )
+    embed.add_field(
+        name="✨ 추가된 보호 기능",
+        value=(
+            "• 도배보호: 짧은 시간 반복 채팅 자동 경고\n"
+            "• 멘션테러감지: 대량 멘션/@everyone 감지\n"
+            f"• 새계정보호: 생성 {SECURITY_NEW_ACCOUNT_DAYS}일 미만 계정 입장 알림\n"
+            "• 위험파일차단: exe/bat/js/ps1 등 위험 첨부파일 삭제\n"
+            "• 토큰보호: 봇 토큰처럼 보이는 문자열 즉시 삭제\n"
+            "• 권한보호: 관리자/역할관리 같은 위험 권한 부여 감지\n"
+            "• 보안로그: 최근 차단/감지 기록 확인"
+        ),
+        inline=False
+    )
+    return embed
+
+
+bot.tree.add_command(setting_group)
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="보안패널", description="만능봇 스타일 보안 설정 버튼 패널을 엽니다.")
+async def security_panel_command(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+    await interaction.response.send_message(embed=build_security_panel_embed(interaction.guild), view=SecurityPanelView(), ephemeral=True)
+
+
+@bot.tree.command(name="서버시작", description="서버 초기 세팅 방식을 선택해서 자동으로 시작합니다.")
+@app_commands.describe(방식="서버를 어떤 형태로 초기 세팅할지 선택하세요.")
+@app_commands.choices(방식=[
+    app_commands.Choice(name="친목섭 전체세팅", value="friend"),
+    app_commands.Choice(name="기본채널만 생성", value="basic"),
+    app_commands.Choice(name="보안설정만 켜기", value="security"),
+])
+async def server_start_command(interaction: discord.Interaction, 방식: app_commands.Choice[str]):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    if 방식.value == "friend":
+        created_roles, deleted_roles, skipped_delete_roles, updated_roles = await create_friend_roles(guild)
+        _, created_log_channels = await ensure_log_category_channels(guild)
+        layout = await create_friend_server_layout(guild)
+        stats_category, created_stats_channels = await ensure_server_stats_channels(guild)
+        devlog_result = await ensure_development_log_channels(guild)
+        set_security_setting(guild.id, "auto_filter", True)
+        set_security_setting(guild.id, "malicious_user_detection", True)
+        set_security_setting(guild.id, "raid_detection", True)
+        set_security_setting(guild.id, "spam_protection", True)
+        set_security_setting(guild.id, "mention_spam_detection", True)
+        set_security_setting(guild.id, "new_account_guard", True)
+        set_security_setting(guild.id, "security_log_enabled", True)
+        text = (
+            "🌸 **친목섭 전체세팅 완료**\n"
+            f"🎭 역할: 새로 생성 `{len(created_roles)}`개 / 삭제 못함 `{len(skipped_delete_roles)}`개\n"
+            f"📁 로그 채널: 새로 생성 `{len(created_log_channels)}`개\n"
+            f"📊 서버스텟: 새로 생성 `{created_stats_channels}`개\n"
+            f"📈 개발로그: 새로 생성 `{len(devlog_result.get('created', []))}`개 / 알림패널 준비\n"
+            f"🎵 뮤직패널: {'새로 전송됨' if layout.get('music_panel_sent') else '이미 있음'}\n"
+            "🛡️ 자동검열/악성유저감지/테러감지/도배보호/멘션테러/새계정보호: 켜짐"
+        )
+    elif 방식.value == "basic":
+        _, created_log_channels = await ensure_log_category_channels(guild)
+        layout = await create_friend_server_layout(guild)
+        devlog_result = await ensure_development_log_channels(guild)
+        text = (
+            "📦 **기본채널 세팅 완료**\n"
+            f"📁 로그 채널: 새로 생성 `{len(created_log_channels)}`개\n"
+            f"📈 개발로그: 새로 생성 `{len(devlog_result.get('created', []))}`개 / 알림패널 준비\n"
+            f"✅ 인증채널: {layout.get('verify_channel').mention if layout.get('verify_channel') else '미설정'}\n"
+            f"🎵 뮤직명령어방: {layout.get('music_command_channel').mention if layout.get('music_command_channel') else '미설정'}"
+        )
+    else:
+        await ensure_log_category_channels(guild)
+        set_security_setting(guild.id, "auto_filter", True)
+        set_security_setting(guild.id, "malicious_user_detection", True)
+        set_security_setting(guild.id, "raid_detection", True)
+        set_security_setting(guild.id, "spam_protection", True)
+        set_security_setting(guild.id, "mention_spam_detection", True)
+        set_security_setting(guild.id, "new_account_guard", True)
+        set_security_setting(guild.id, "dangerous_file_block", True)
+        set_security_setting(guild.id, "token_leak_guard", True)
+        set_security_setting(guild.id, "permission_guard", True)
+        set_security_setting(guild.id, "security_log_enabled", True)
+        text = "🛡️ **보안설정 완료**\n자동검열, 악성유저감지, 테러감지, 도배보호, 멘션테러감지, 새계정보호, 위험파일차단, 토큰보호, 권한보호, 보안로그저장을 모두 켰습니다."
+
+    embed = create_embed("🚀 서버시작 완료", text)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await send_log(guild, f"🚀 서버시작 실행\n방식: `{방식.name}`\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="역할자동생성", description="친목섭 기본 역할을 자동으로 생성합니다.")
+async def create_friend_roles_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    created, deleted, skipped_delete, updated = await create_friend_roles(guild)
+
+    await interaction.followup.send(
+        f"✅ 역할 자동 생성을 완료했습니다.\n"
+        f"기존 삭제: **{len(deleted)}개**\n"
+        f"새로 생성: **{len(created)}개**\n"
+        f"삭제 못한 역할: **{len(skipped_delete)}개**\n"
+        f"권한 정리: **{len(updated)}개**",
+        ephemeral=True
+    )
+    await send_log(guild, f"🎭 역할 자동 생성/확인\n관리자: {interaction.user.mention}\n기존 삭제: {len(deleted)}개\n새로 생성: {len(created)}개\n삭제 못한 역할: {len(skipped_delete)}개\n권한 정리: {len(updated)}개", "general")
+
+
+@bot.tree.command(name="친목섭", description="친목섭 역할/기본카테고리/로그/서버스텟을 한 번에 자동 생성합니다.")
+async def create_friend_server(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    created_roles, deleted_roles, skipped_delete_roles, updated_roles = await create_friend_roles(guild)
+
+    # /로그카테고리생성 기능 통합
+    _, created_log_channels = await ensure_log_category_channels(guild)
+
+    # /기본카테고리생성 기능 통합
+    layout = await create_friend_server_layout(guild)
+
+    # /서버스텟생성 기능 통합
+    stats_category, created_stats_channels = await ensure_server_stats_channels(guild)
+
+    game_role_channel = layout.get("game_role_channel") if layout else None
+    ticket_panel_channel = layout.get("ticket_panel_channel") if layout else None
+    game_role_panel_status = "새로 전송됨" if layout and layout.get("game_role_panel_sent") else "이미 있음"
+    ticket_panel_status = "새로 전송됨" if layout and layout.get("ticket_panel_sent") else "이미 있음"
+
+    await interaction.followup.send(
+        "✅ 친목섭 전체 세팅을 완료했습니다.\n\n"
+        f"🎭 역할 재생성: 기존 삭제 **{len(deleted_roles)}개** / 새로 생성 **{len(created_roles)}개** / 삭제 못함 **{len(skipped_delete_roles)}개** / 권한 정리 **{len(updated_roles)}개**\n"
+        "📦 기본 카테고리/채널 생성 완료\n"
+        f"📁 로그 카테고리: 생성/확인 완료 `새 로그 채널 {len(created_log_channels)}개`\n"
+        f"📊 서버 스텟: 생성/확인 완료 `새 스텟 채널 {created_stats_channels}개`\n"
+        f"🎮 게임역할패널: {game_role_channel.mention if game_role_channel else '미설정'} / {game_role_panel_status}\n"
+        f"✅ 인증채널: {layout.get('verify_channel').mention if layout and layout.get('verify_channel') else '미설정'}\n"
+        f"📝 자기소개채널: {layout.get('intro_channel').mention if layout and layout.get('intro_channel') else '미설정'} / {'새로 전송됨' if layout and layout.get('intro_message_sent') else '이미 있음'}\n"
+        f"📌 필독카테고리: {layout.get('rule_category').mention if layout and layout.get('rule_category') else '미설정'} / 규칙채널: {layout.get('rules_channel').mention if layout and layout.get('rules_channel') else '미설정'}\n"
+        f"🛒 상점카테고리: {layout.get('shop_category').mention if layout and layout.get('shop_category') else '미설정'} / 상점: {layout.get('shop_channel').mention if layout and layout.get('shop_channel') else '미설정'} / 포인트: {layout.get('point_channel').mention if layout and layout.get('point_channel') else '미설정'}\n"
+        f"🎫 티켓패널: {ticket_panel_channel.mention if ticket_panel_channel else '미설정'} / {ticket_panel_status}\n"
+        f"🎵 뮤직명령어방: {layout.get('music_command_channel').mention if layout and layout.get('music_command_channel') else '미설정'}\n"
+        f"🔊 TTS채널: {layout.get('tts_text_channel').mention if layout and layout.get('tts_text_channel') else '미설정'} / 음성: {layout.get('tts_voice_channel').mention if layout and layout.get('tts_voice_channel') else '미설정'}\n"
+        "😴 잠수방 자동 음성방 생성 준비 완료\n"
+        "🛡️ IP 주소 채팅 차단 기능 적용 완료",
+        ephemeral=True
+    )
+    await send_log(guild, f"🌸 친목섭 자동 세팅 완료\n관리자: {interaction.user.mention}\n역할 생성: {len(created_roles)}개\n권한 정리: {len(updated_roles)}개", "general")
+
+
+@bot.tree.command(name="기본카테고리생성", description="인사/퇴장, 필독, 상점, 채팅, 음성, 게임, 뮤직, 봇명령어, 내전, 버스킹, 수위, 잠수방을 생성합니다.")
+async def create_default_server_categories(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(
+            "❌ 서버에서만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    # =========================
+    # 로그 카테고리 / 레벨로그 포함
+    # =========================
+    await ensure_log_category_channels(guild)
+
+    # =========================
+    # 서버 스텟 카테고리
+    # =========================
+    await ensure_server_stats_channels(guild)
+
+    # =========================
+    # 티켓 카테고리 / 티켓 패널
+    # =========================
+    ticket_category, ticket_panel_channel, ticket_log_channel, panel_sent = await create_ticket_category_channels(guild, send_panel=True)
+    await apply_member_category_permissions(guild, ticket_category)
+
+    default_category = await get_or_create_category(guild, DEFAULT_SERVER_CATEGORY_NAME)
+    await get_or_create_text_channel(guild, "👋-인사-퇴장", default_category)
+    intro_channel, intro_message_sent = await create_intro_channel(guild, default_category)
+    verify_channel, verify_panel_sent = await create_verify_channel(guild, default_category)
+    await apply_default_server_permissions(guild, default_category)
+
+    rule_category, rule_channel, rules_channel, rules_message_sent = await create_rule_category_channels(guild)
+
+    chat_category = await get_or_create_category(guild, "💬 채팅방")
+    await apply_member_category_permissions(guild, chat_category)
+    await get_or_create_text_channel(guild, "💬-자유채팅", chat_category)
+    await get_or_create_text_channel(guild, "📷-사진", chat_category)
+    await get_or_create_text_channel(guild, "🤖-봇명령어", chat_category)
+
+    voice_category = await get_or_create_category(guild, "🔊 음성방")
+    await apply_member_category_permissions(guild, voice_category)
+    await get_or_create_voice_channel(guild, "🔊 음성방 1", voice_category)
+    await get_or_create_voice_channel(guild, "🔊 음성방 2", voice_category)
+
+    game_category = await get_or_create_category(guild, "🎮 게임방")
+    await apply_member_category_permissions(guild, game_category)
+    await get_or_create_text_channel(guild, "🎮-게임채팅", game_category)
+    game_role_channel = await get_or_create_text_channel(guild, "🎮-게임역할선택", game_category)
+    game_role_panel_sent = await send_game_role_panel_to_channel(game_role_channel)
+    await get_or_create_voice_channel(guild, "🎮 게임 음성 1", game_category)
+
+    bot_command_layout = await create_bot_command_category_channels(guild, send_guides=True)
+
+    music_layout = await create_music_category_channels(guild, send_panel=True)
+    music_command_channel = music_layout.get("music_command_channel")
+    bot_command_channel = bot_command_layout.get("bot_command_channel")
+    attendance_channel = bot_command_layout.get("attendance_channel")
+    enhance_channel = bot_command_layout.get("enhance_channel")
+    shop_category = bot_command_layout.get("shop_category")
+    shop_channel = bot_command_layout.get("shop_channel")
+    point_channel = bot_command_layout.get("point_channel")
+
+    tts_category, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
+
+    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
+    await apply_member_category_permissions(guild, scrim_category)
+    await get_or_create_text_channel(guild, "⚔️-내전모집", scrim_category)
+    await get_or_create_voice_channel(guild, "⚔️ 내전 대기방", scrim_category)
+
+    busking_category = await get_or_create_category(guild, "🎤 버스킹")
+    await apply_member_category_permissions(guild, busking_category)
+    await get_or_create_text_channel(guild, "🎤-버스킹채팅", busking_category)
+    await get_or_create_voice_channel(guild, "🎤 버스킹 무대", busking_category)
+
+    adult_category = await get_or_create_category(guild, "🔞 수위방")
+    await apply_member_category_permissions(guild, adult_category)
+    await get_or_create_text_channel(guild, "🔞-수위채팅", adult_category)
+    await get_or_create_voice_channel(guild, "🔞 수위 음성", adult_category)
+
+    afk_category = await get_or_create_category(guild, TEMP_VOICE_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, afk_category)
+    await get_or_create_voice_channel(guild, "😴 잠수방", afk_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, afk_category)
+
+    welcome_channel = get_channel_by_id_or_name(guild, WELCOME_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "환영", "welcome"], "text")
+    goodbye_channel = get_channel_by_id_or_name(guild, GOODBYE_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "퇴장", "goodbye"], "text")
+    rule_channel = get_channel_by_id_or_name(guild, RULE_CHANNEL_ID, ["📌-필독", "필독", "규칙"], "text")
+    save_guild_settings(guild, welcome_channel=welcome_channel, goodbye_channel=goodbye_channel, rule_channel=rule_channel, game_role_channel=game_role_channel)
+
+    await interaction.followup.send(
+        "✅ 기본 카테고리와 채널 생성을 완료했습니다.\n"
+        f"🎫 티켓 생성 채널: {ticket_panel_channel.mention}\n"
+        f"📋 티켓 로그 채널: {ticket_log_channel.mention}\n"
+        f"🎫 티켓 패널: {'새로 전송됨' if panel_sent else '이미 있음'}\n"
+        f"🎮 게임역할 패널: {game_role_channel.mention} / {'새로 전송됨' if game_role_panel_sent else '이미 있음'}\n"
+        f"✅ 인증 채널: {verify_channel.mention} / 패널: {'새로 전송됨' if verify_panel_sent else '이미 있음'}\n"
+        f"📝 자기소개 채널: {intro_channel.mention} / 안내: {'새로 전송됨' if intro_message_sent else '이미 있음'}\n"
+        f"📌 필독 채널: {rule_channel.mention} / 규칙 채널: {rules_channel.mention} / 규칙 안내: {'새로 전송됨' if rules_message_sent else '이미 있음'}\n"
+        f"🤖 봇명령어방: {bot_command_channel.mention}\n"
+        f"🛒 상점 카테고리: {shop_category.mention if shop_category else '미설정'} / 상점: {shop_channel.mention if shop_channel else '미설정'} / 포인트: {point_channel.mention if point_channel else '미설정'}\n"
+        f"📅 출석체크 채널: {attendance_channel.mention}\n"
+        f"⚒️ 강화 채널: {enhance_channel.mention}\n"
+        f"🎵 뮤직명령어방: {music_command_channel.mention}\n"
+        f"🔊 TTS 채팅방: {tts_text_channel.mention} / 통방: {tts_voice_channel.mention} 외 2개 / 안내: {'새로 전송됨' if tts_guide_sent else '이미 있음'}\n"
+        "`➕ 음성방 생성`에 들어가면 개인 음성방이 자동으로 만들어집니다.",
+        ephemeral=True
+    )
+    await send_log(guild, f"📦 기본 카테고리 생성/확인\n관리자: {interaction.user.mention}", "general")
+
+
+def get_or_create_user(guild_id: int, user_id: int = None):
+    """서버별 포인트/출석 유저 데이터를 가져오거나 생성합니다."""
+    if user_id is None:
+        user_id = guild_id
+        guild_id = 0
+    c.execute(
+        "SELECT point, attendance_count, streak, last_attendance FROM users WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id)
+    )
+    user = c.fetchone()
+    if user is None:
+        c.execute("INSERT OR IGNORE INTO users(guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
+        conn.commit()
+        return 0, 0, 0, None
+    return user
+
+
+def get_user_point(guild_id: int, user_id: int = None):
+    if user_id is None:
+        user_id = guild_id
+        guild_id = 0
+    point, _, _, _ = get_or_create_user(guild_id, user_id)
+    return point
+
+
+def set_user_point(guild_id: int, user_id: int = None, point: int = None):
+    if point is None:
+        point = user_id
+        user_id = guild_id
+        guild_id = 0
+    get_or_create_user(guild_id, user_id)
+    c.execute(
+        "UPDATE users SET point=? WHERE guild_id=? AND user_id=?",
+        (max(point, 0), guild_id, user_id)
+    )
+    conn.commit()
+
+def get_or_create_level_user(user_id: int):
+    c.execute("SELECT exp, level FROM levels WHERE user_id=?", (user_id,))
+    data = c.fetchone()
+    if data is None:
+        c.execute("INSERT INTO levels(user_id, exp, level) VALUES (?, ?, ?)", (user_id, 0, 1))
+        conn.commit()
+        return 0, 1
+    return data
+
+
+def get_or_create_voice_level_user(user_id: int):
+    c.execute("SELECT exp, level, total_seconds FROM voice_levels WHERE user_id=?", (user_id,))
+    data = c.fetchone()
+    if data is None:
+        c.execute("INSERT INTO voice_levels(user_id, exp, level, total_seconds) VALUES (?, ?, ?, ?)", (user_id, 0, 1, 0))
+        conn.commit()
+        return 0, 1, 0
+    return data
+
+
+async def add_voice_level_exp(member: discord.Member, seconds: int):
+    """음성방에 머문 시간만큼 음성 EXP를 지급하고 레벨업은 레벨로그에 기록합니다."""
+    if member.bot or member.guild is None:
+        return
+
+    seconds = max(0, int(seconds or 0))
+    minutes = seconds // 60
+    if minutes <= 0:
+        return
+
+    exp_gain = minutes * VOICE_EXP_PER_MINUTE
+    if has_exp_booster(member.id):
+        exp_gain *= 2
+    exp, level, total_seconds = get_or_create_voice_level_user(member.id)
+    total_seconds += seconds
+    exp += exp_gain
+
+    leveled = False
+    old_level = level
+    while exp >= level * 100:
+        exp -= level * 100
+        level += 1
+        leveled = True
+
+    c.execute(
+        "UPDATE voice_levels SET exp=?, level=?, total_seconds=? WHERE user_id=?",
+        (exp, level, total_seconds, member.id)
+    )
+    conn.commit()
+
+    if leveled:
+        await send_log(
+            member.guild,
+            f"🎉 음성 레벨업!\n유저: {member.mention}\n음성 레벨: Lv.{old_level} → Lv.{level}\n획득 EXP: +{exp_gain}",
+            "level"
+        )
+
+
+async def update_warning_role(member: discord.Member):
+    warning_roles = ["경고 1회", "경고 2회", "경고 3회", "경고 4회", "경고 5회"]
+
+    for role_name in warning_roles:
+        role = discord.utils.get(member.guild.roles, name=role_name)
+        if role and role in member.roles:
+            await member.remove_roles(role)
+
+    c.execute("SELECT COUNT(*) FROM warnings WHERE user_id=?", (member.id,))
+    count = c.fetchone()[0]
+
+    if count <= 0:
+        return count
+
+    role = discord.utils.get(member.guild.roles, name=f"경고 {min(count, 5)}회")
+    if role:
+        await member.add_roles(role)
+
+    return count
+
+
+
+# =========================
+# 서버 스텟 시스템
+# =========================
+
+SERVER_STATS_CATEGORY_NAME = "📊 서버 스텟"
+
+
+def get_voice_member_count(guild: discord.Guild) -> int:
+    return len([
+        member for member in guild.members
+        if member.voice and member.voice.channel
+    ])
+
+
+async def update_server_stats_for_guild(guild: discord.Guild) -> bool:
+    """서버 스텟 카테고리가 있으면 채널 이름을 최신 상태로 갱신합니다."""
+    if guild is None:
+        return False
+
+    category = discord.utils.get(guild.categories, name=SERVER_STATS_CATEGORY_NAME)
+    if category is None:
+        return False
+
+    channels = category.voice_channels
+    if len(channels) < 4:
+        return False
+
+    total_members = guild.member_count
+    bot_count = len([member for member in guild.members if member.bot])
+    user_count = total_members - bot_count
+    voice_count = get_voice_member_count(guild)
+
+    names = [
+        f"👥 전체 멤버 : {total_members}",
+        f"👤 유저 : {user_count}",
+        f"🤖 봇 : {bot_count}",
+        f"🔊 음성 접속 : {voice_count}",
+    ]
+
+    for channel, name in zip(channels[:4], names):
+        if channel.name != name:
+            await channel.edit(name=name)
+
+    return True
+
+
+async def ensure_server_stats_channels(guild: discord.Guild):
+    """📊 서버 스텟 카테고리와 기본 스텟 채널 4개를 생성/확인합니다."""
+    if guild is None:
+        return None, 0
+
+    category = discord.utils.get(guild.categories, name=SERVER_STATS_CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(SERVER_STATS_CATEGORY_NAME)
+
+    base_names = [
+        "👥 전체 멤버 : 0",
+        "👤 유저 : 0",
+        "🤖 봇 : 0",
+        "🔊 음성 접속 : 0",
+    ]
+
+    created_count = 0
+    while len(category.voice_channels) < 4:
+        name = base_names[len(category.voice_channels)]
+        await guild.create_voice_channel(name, category=category)
+        created_count += 1
+
+    await update_server_stats_for_guild(guild)
+    return category, created_count
+
+
+@tasks.loop(minutes=30)
+async def update_server_stats():
+    """30분마다 모든 서버의 서버 스텟을 자동 갱신합니다. 채널 이름 변경 제한을 피하기 위해 너무 자주 갱신하지 않습니다."""
+    for guild in bot.guilds:
+        try:
+            await update_server_stats_for_guild(guild)
+        except Exception as e:
+            print(f"❌ 서버 스텟 자동 업데이트 실패 ({guild.name}): {e}")
+
+
+@tasks.loop(minutes=10)
+async def attendance_vip_expire_checker():
+    """출석 30일 보상으로 지급된 VIP 1일 역할을 만료 시간이 지나면 자동 회수합니다."""
+    now = datetime.datetime.now()
+    c.execute(
+        "SELECT user_id, effect_name, expires_at FROM user_effects WHERE effect_name LIKE ?",
+        ("출석VIP1일:%",)
+    )
+    rows = c.fetchall()
+
+    for user_id, effect_name, expires_at in rows:
+        if not expires_at:
+            continue
+        try:
+            expire_dt = datetime.datetime.fromisoformat(expires_at)
+        except ValueError:
+            continue
+        if now < expire_dt:
+            continue
+
+        try:
+            guild_id = int(str(effect_name).split(":", 1)[1])
+        except (IndexError, ValueError):
+            guild_id = 0
+
+        guild = bot.get_guild(guild_id) if guild_id else None
+        if guild:
+            member = guild.get_member(int(user_id))
+            role = discord.utils.get(guild.roles, name="VIP")
+            if member and role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="출석 30일 VIP 1일 만료")
+                    await send_log(guild, f"⌛ 출석 VIP 1일 만료\n대상: {member.mention}\n역할: {role.mention}", "general")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        c.execute("DELETE FROM user_effects WHERE user_id=? AND effect_name=?", (user_id, effect_name))
+        conn.commit()
+
+
+@bot.tree.command(name="서버스텟생성", description="서버 스텟 카테고리와 채널을 생성합니다.")
+async def create_server_stats(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(
+            "❌ 서버에서만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    category, created_count = await ensure_server_stats_channels(guild)
+
+    await interaction.followup.send(
+        "✅ 서버 스텟 카테고리와 채널을 생성/확인했습니다.\n"
+        f"새로 생성된 스텟 채널: **{created_count}개**",
+        ephemeral=True
+    )
+    await send_log(guild, f"📊 서버 스텟 생성\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="서버스텟업데이트", description="서버 스텟을 수동으로 갱신합니다.")
+async def update_server_stats_cmd(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+
+    updated = await update_server_stats_for_guild(interaction.guild)
+    if not updated:
+        return await interaction.response.send_message(
+            "❌ `📊 서버 스텟` 카테고리 또는 스텟 채널 4개를 찾을 수 없습니다.\n먼저 `/서버스텟생성`을 사용해주세요.",
+            ephemeral=True
+        )
+
+    await interaction.response.send_message(
+        "✅ 서버 스텟을 업데이트했습니다.",
+        ephemeral=True
+    )
+    await send_log(interaction.guild, f"📊 서버 스텟 수동 업데이트\n관리자: {interaction.user.mention}", "general")
+
+
+# =========================
+# 초대 추적 시스템
+# =========================
+
+async def refresh_invite_cache(guild: discord.Guild):
+    """서버 초대 링크 사용 횟수를 캐시에 저장합니다."""
+    if guild is None:
+        return False
+    try:
+        invites = await guild.invites()
+        INVITE_CACHE[guild.id] = {invite.code: invite.uses or 0 for invite in invites}
+        return True
+    except discord.Forbidden:
+        await send_log(guild, "❌ 초대 추적 실패\n사유: 봇에게 `초대 관리` 권한이 없습니다.", "general")
+    except discord.HTTPException as e:
+        print(f"❌ 초대 캐시 갱신 실패 ({guild.name}): {e}")
+    return False
+
+
+async def find_used_invite(guild: discord.Guild):
+    """입장 직후 어떤 초대 링크가 사용됐는지 확인합니다."""
+    old_cache = INVITE_CACHE.get(guild.id, {})
+    try:
+        invites = await guild.invites()
+    except discord.Forbidden:
+        await send_log(guild, "❌ 초대 추적 실패\n사유: 봇에게 `초대 관리` 권한이 없습니다.", "general")
+        return None
+    except discord.HTTPException:
+        return None
+
+    used_invite = None
+    new_cache = {}
+    for invite in invites:
+        uses = invite.uses or 0
+        new_cache[invite.code] = uses
+        if uses > old_cache.get(invite.code, 0):
+            used_invite = invite
+
+    INVITE_CACHE[guild.id] = new_cache
+    return used_invite
+
+
+def add_invite_join(guild_id: int, member_id: int, inviter_id: int, invite_code: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "INSERT OR IGNORE INTO invite_stats(guild_id, inviter_id, invite_count, fake_count, leave_count) VALUES (?, ?, 0, 0, 0)",
+        (guild_id, inviter_id)
+    )
+    c.execute(
+        "UPDATE invite_stats SET invite_count = invite_count + 1 WHERE guild_id=? AND inviter_id=?",
+        (guild_id, inviter_id)
+    )
+    c.execute(
+        "INSERT OR REPLACE INTO invite_joins(guild_id, member_id, inviter_id, invite_code, joined_at, left_at) VALUES (?, ?, ?, ?, ?, NULL)",
+        (guild_id, member_id, inviter_id, invite_code, now)
+    )
+    conn.commit()
+
+
+def mark_invite_leave(guild_id: int, member_id: int):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("SELECT inviter_id FROM invite_joins WHERE guild_id=? AND member_id=? AND left_at IS NULL", (guild_id, member_id))
+    row = c.fetchone()
+    if not row:
+        return None
+    inviter_id = row[0]
+    c.execute("UPDATE invite_joins SET left_at=? WHERE guild_id=? AND member_id=?", (now, guild_id, member_id))
+    c.execute(
+        "INSERT OR IGNORE INTO invite_stats(guild_id, inviter_id, invite_count, fake_count, leave_count) VALUES (?, ?, 0, 0, 0)",
+        (guild_id, inviter_id)
+    )
+    c.execute("UPDATE invite_stats SET leave_count = leave_count + 1 WHERE guild_id=? AND inviter_id=?", (guild_id, inviter_id))
+    conn.commit()
+    return inviter_id
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    if invite.guild:
+        await refresh_invite_cache(invite.guild)
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    if invite.guild:
+        await refresh_invite_cache(invite.guild)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    await refresh_invite_cache(guild)
+
+
+@bot.tree.command(name="초대랭킹", description="서버 초대 순위를 보여줍니다.")
+async def invite_ranking(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    c.execute(
+        """
+        SELECT inviter_id, invite_count, fake_count, leave_count
+        FROM invite_stats
+        WHERE guild_id=?
+        ORDER BY invite_count DESC
+        LIMIT 10
+        """,
+        (interaction.guild.id,)
+    )
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("아직 기록된 초대 정보가 없습니다.", ephemeral=True)
+
+    text = ""
+    for rank, (inviter_id, invite_count, fake_count, leave_count) in enumerate(rows, start=1):
+        net_count = max(invite_count - fake_count - leave_count, 0)
+        text += f"**{rank}.** <@{inviter_id}> — 총 `{invite_count}`명 / 퇴장 `{leave_count}`명 / 실초대 `{net_count}`명\n"
+
+    embed = create_embed("🏆 초대 랭킹 TOP 10", text)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="초대정보", description="유저의 초대 정보를 확인합니다.")
+async def invite_info(interaction: discord.Interaction, user: discord.Member = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    user = user or interaction.user
+    c.execute(
+        "SELECT invite_count, fake_count, leave_count FROM invite_stats WHERE guild_id=? AND inviter_id=?",
+        (interaction.guild.id, user.id)
+    )
+    row = c.fetchone() or (0, 0, 0)
+    invite_count, fake_count, leave_count = row
+    net_count = max(invite_count - fake_count - leave_count, 0)
+
+    embed = create_embed(
+        "📨 초대 정보",
+        f"대상: {user.mention}\n총 초대: `{invite_count}`명\n퇴장한 초대: `{leave_count}`명\n실초대: `{net_count}`명"
+    )
+    await interaction.response.send_message(embed=embed)
+
+# =========================
+# 봇 상태 메시지 자동 변경
+# =========================
+
+BOT_ACTIVITY_INDEX = 0
+
+def build_bot_activity_text():
+    protected_count = sum(guild.member_count or 0 for guild in bot.guilds)
+    return [
+        f"🛡️ {protected_count:,}명 보호 받는중",
+        "📌 /도움말 로 명령어 확인",
+        "🎵 /음악패널 로 노래 듣는중",
+        "🎉 /이벤트 로 이벤트 관리",
+        "💰 /잔액 으로 포인트 확인",
+    ]
+
+
+@tasks.loop(seconds=5)
+async def rotate_bot_presence():
+    global BOT_ACTIVITY_INDEX
+    if not bot.is_ready():
+        return
+
+    activities = build_bot_activity_text()
+    if not activities:
+        return
+
+    activity_text = activities[BOT_ACTIVITY_INDEX % len(activities)]
+    BOT_ACTIVITY_INDEX += 1
+
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Game(name=activity_text)
+        )
+    except discord.HTTPException:
+        pass
+
+
+# =========================
+# 봇 준비 완료
+# =========================
+
+@bot.event
+async def on_ready():
+    bot.add_view(UnifiedTicketView())
+    bot.add_view(CloseTicketView())
+    bot.add_view(GameRoleView())
+    bot.add_view(VerifyView())
+    bot.add_view(MusicPanelView())
+    try:
+        bot.add_view(DevAlertRoleView())
+    except Exception:
+        pass
+
+    # 플레이중 상태 메시지를 5초마다 자동 변경합니다.
+    if not rotate_bot_presence.is_running():
+        rotate_bot_presence.start()
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ 슬래시 명령어 동기화 완료: {len(synced)}개")
+    except Exception as e:
+        print(f"❌ 슬래시 명령어 동기화 실패: {e}")
+
+    print(f"✅ 로그인 완료: {bot.user}")
+
+    for guild in bot.guilds:
+        await refresh_invite_cache(guild)
+
+    if not update_server_stats.is_running():
+        update_server_stats.start()
+
+    if not auto_disconnect_empty_voice_clients.is_running():
+        auto_disconnect_empty_voice_clients.start()
+
+    if not scheduled_event_sender.is_running():
+        scheduled_event_sender.start()
+
+    if not attendance_vip_expire_checker.is_running():
+        attendance_vip_expire_checker.start()
+
+# =========================
+# 입장 / 퇴장
+# =========================
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    role = get_role_by_id_or_name(member.guild, 0, ["미인증"]) or get_role_by_id_or_name(member.guild, WELCOME_ROLE_ID, ["뉴페이스"])
+    if role:
+        await member.add_roles(role, reason="입장 기본 인증 역할 지급")
+
+    # 등록된 기본 역할 자동 지급
+    await give_default_roles(member)
+
+
+    security_settings = get_security_settings(member.guild.id)
+    registered_malicious = get_malicious_user(member.guild.id, member.id)
+    if security_settings.get("malicious_user_detection") and registered_malicious:
+        reason, added_by, added_at = registered_malicious
+        add_security_log(member.guild.id, member.id, "등록 악성유저 입장", reason or "등록 사유 없음", 0)
+        await send_log(
+            member.guild,
+            f"🚨 등록된 악성유저 입장\n대상: {member.mention} (`{member.id}`)\n등록 사유: `{reason or '없음'}`\n등록자: <@{added_by}>\n등록일: `{added_at}`",
+            "punishment"
+        )
+
+    created_days_for_guard = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
+    if security_settings.get("new_account_guard") and created_days_for_guard < SECURITY_NEW_ACCOUNT_DAYS:
+        add_security_log(member.guild.id, member.id, "새계정보호", f"계정 생성 {created_days_for_guard}일", 0)
+        await send_log(
+            member.guild,
+            f"🧊 새계정보호 알림\n대상: {member.mention} (`{member.id}`)\n계정 생성: `{created_days_for_guard}`일 전\n관리자는 인증/활동을 확인해주세요.",
+            "warning"
+        )
+        try:
+            await member.send(
+                f"안녕하세요! `{member.guild.name}` 서버는 새 계정 보호가 켜져 있어서 관리자 확인이 진행될 수 있어요. 규칙을 확인하고 천천히 인증해주세요."
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    if security_settings.get("malicious_user_detection"):
+        now_ts = datetime.datetime.now().timestamp()
+        join_key = member.guild.id
+        SECURITY_JOIN_TRACKER.setdefault(join_key, []).append(now_ts)
+        SECURITY_JOIN_TRACKER[join_key] = [t for t in SECURITY_JOIN_TRACKER[join_key] if now_ts - t <= 30]
+        recent_joins = len(SECURITY_JOIN_TRACKER[join_key])
+
+        created_days = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
+        suspicious_reasons = []
+        if created_days < 7:
+            suspicious_reasons.append(f"계정 생성 `{created_days}`일")
+        if recent_joins >= 6:
+            suspicious_reasons.append(f"30초 내 입장 `{recent_joins}`명")
+        if any(word in member.name.lower() for word in ["raid", "terror", "spam", "hack"]):
+            suspicious_reasons.append("의심 닉네임")
+
+        if suspicious_reasons:
+            add_security_log(member.guild.id, member.id, "악성유저감지", ", ".join(suspicious_reasons), 0)
+            await send_log(
+                member.guild,
+                f"🛡️ 악성유저감지\n대상: {member.mention}\n사유: {', '.join(suspicious_reasons)}\n관리자는 계정/활동을 확인해주세요.",
+                "warning"
+            )
+
+    used_invite = await find_used_invite(member.guild)
+    if used_invite and used_invite.inviter:
+        add_invite_join(member.guild.id, member.id, used_invite.inviter.id, used_invite.code)
+        await send_log(
+            member.guild,
+            f"📨 초대 입장\n입장: {member.mention}\n초대한 사람: {used_invite.inviter.mention}\n초대코드: `{used_invite.code}`\n총 사용: `{used_invite.uses}`회",
+            "general"
+        )
+    else:
+        await send_log(member.guild, f"📨 초대 입장\n입장: {member.mention}\n초대자를 확인하지 못했습니다.", "general")
+
+    saved_welcome_id = get_saved_channel_id(member.guild.id, "welcome_channel_id")
+    channel = get_channel_by_id_or_name(
+        member.guild,
+        saved_welcome_id or WELCOME_CHANNEL_ID,
+        ["👋-인사-퇴장", "인사-퇴장", "환영", "welcome"],
+        "text"
+    )
+    if channel:
+        await channel.send(embed=build_welcome_embed(member))
+
+    await send_welcome_dm(member)
+
+    await send_log(member.guild, f"👋 {member.mention} 님이 서버에 입장했습니다.")
+    await update_server_stats_for_guild(member.guild)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    channel = get_channel_by_id_or_name(member.guild, GOODBYE_CHANNEL_ID, ["👋-인사-퇴장", "인사-퇴장", "퇴장", "goodbye"], "text")
+    if channel:
+        embed = discord.Embed(
+            title="😢 잘가요...",
+            description=(
+                f"**{member}**님이 서버를 떠났습니다.\n\n"
+                f"함께한 시간 감사합니다 ⭐\n"
+                f"언젠가 다시 만날 수 있기를 바랍니다."
+            ),
+            color=discord.Color.red()
+        )
+        embed.add_field(name="👥 현재 인원", value=f"{member.guild.member_count}명", inline=False)
+        embed.set_footer(text="⭐ 만능 봇")
+        await channel.send(embed=embed)
+
+    inviter_id = mark_invite_leave(member.guild.id, member.id)
+    if inviter_id:
+        await send_log(member.guild, f"📨 초대 유저 퇴장\n퇴장: {member}\n초대한 사람: <@{inviter_id}>", "general")
+
+    await send_log(member.guild, f"😢 {member} 님이 서버를 떠났습니다.")
+    await update_server_stats_for_guild(member.guild)
+
+
+
+
+# =========================
+# 음악 / TTS 자동 퇴장 시스템
+# =========================
+
+async def disconnect_if_voice_empty(guild: discord.Guild):
+    """봇이 들어간 음성 채널에 사람이 없으면 음악/TTS를 정리하고 자동 퇴장합니다."""
+    if guild is None:
+        return False
+
+    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if voice_client is None or voice_client.channel is None:
+        return False
+
+    humans = [member for member in voice_client.channel.members if not member.bot]
+    if humans:
+        return False
+
+    guild_id = guild.id
+
+    # 음악 재생 중이면 정지
+    try:
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+    except Exception:
+        pass
+
+    # 뮤직 큐/상태 정리
+    try:
+        if "music_queues" in globals():
+            music_queues.pop(guild_id, None)
+        if "now_playing" in globals():
+            now_playing.pop(guild_id, None)
+        if "loop_enabled" in globals():
+            loop_enabled.pop(guild_id, None)
+    except Exception:
+        pass
+
+    try:
+        channel_name = voice_client.channel.name
+        await voice_client.disconnect(force=True)
+        await send_log(guild, f"👋 음악/TTS 자동 퇴장\n사유: 음성 채널에 유저가 없어 자동 퇴장했습니다.\n채널: `{channel_name}`", "voice")
+        return True
+    except Exception as e:
+        print(f"❌ 음악/TTS 자동 퇴장 실패 ({guild.name}): {e}")
+        return False
+
+
+@tasks.loop(seconds=30)
+async def auto_disconnect_empty_voice_clients():
+    """이벤트 누락 방지를 위해 30초마다 빈 음성 채널을 확인합니다."""
+    for voice_client in list(bot.voice_clients):
+        try:
+            await disconnect_if_voice_empty(voice_client.guild)
+        except Exception as e:
+            print(f"❌ 자동 퇴장 검사 실패: {e}")
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if before.channel != after.channel:
+        # 음성 레벨 계산
+        if not member.bot:
+            voice_key = (member.guild.id, member.id)
+            now_ts = datetime.datetime.now().timestamp()
+
+            if before.channel is not None:
+                joined_ts = voice_join_times.pop(voice_key, None)
+                if joined_ts is not None:
+                    await add_voice_level_exp(member, int(now_ts - joined_ts))
+
+            if after.channel is not None:
+                voice_join_times[voice_key] = now_ts
+
+        # 서버 스텟은 30분 자동 갱신 또는 /서버스텟업데이트로 갱신합니다.
+        # 음성 이동마다 채널명을 바꾸면 Discord API 제한이 걸릴 수 있어 자동 갱신은 막았습니다.
+
+        # 잠수방 자동 음성방 생성
+        if after.channel and after.channel.name == TEMP_VOICE_CREATE_CHANNEL_NAME:
+            category = discord.utils.get(member.guild.categories, name=TEMP_VOICE_CATEGORY_NAME)
+            if category:
+                overwrites = {
+                    member.guild.default_role: discord.PermissionOverwrite(connect=True, view_channel=True),
+                    member: discord.PermissionOverwrite(connect=True, manage_channels=True, move_members=True, view_channel=True),
+                    member.guild.me: discord.PermissionOverwrite(connect=True, manage_channels=True, move_members=True, view_channel=True),
+                }
+                new_channel = await member.guild.create_voice_channel(
+                    name=f"🔊 {member.display_name}님의 방",
+                    category=category,
+                    overwrites=overwrites,
+                    user_limit=0,
+                    reason=f"{member} 자동 음성방 생성"
+                )
+                TEMP_VOICE_CHANNELS[new_channel.id] = member.id
+                await member.move_to(new_channel)
+                await send_log(member.guild, f"➕ 자동 음성방 생성\n방장: {member.mention}\n채널: {new_channel.mention}", "voice")
+
+        # 비어있는 자동 생성 음성방 삭제
+        if before.channel and before.channel.id in TEMP_VOICE_CHANNELS and len(before.channel.members) == 0:
+            channel_name = before.channel.name
+            TEMP_VOICE_CHANNELS.pop(before.channel.id, None)
+            try:
+                await before.channel.delete(reason="자동 생성 음성방이 비어서 삭제")
+                await send_log(member.guild, f"➖ 자동 음성방 삭제\n채널명: `{channel_name}`", "voice")
+            except discord.HTTPException:
+                pass
+
+        # 음성 로그
+        if before.channel is None and after.channel is not None:
+            await send_log(member.guild, f"🔊 음성 입장\n유저: {member.mention}\n채널: {after.channel.mention}", "voice")
+        elif before.channel is not None and after.channel is None:
+            await send_log(member.guild, f"🔇 음성 퇴장\n유저: {member.mention}\n채널: {before.channel.mention}", "voice")
+        elif before.channel is not None and after.channel is not None:
+            await send_log(member.guild, f"🔁 음성 이동\n유저: {member.mention}\n이전: {before.channel.mention}\n이후: {after.channel.mention}", "voice")
+
+        # 음악/TTS 자동 퇴장: 마지막 유저가 나가면 봇도 자동으로 나갑니다.
+        await disconnect_if_voice_empty(member.guild)
+
+@bot.tree.command(name="환영테스트", description="저장된 서버 설정 기준으로 환영 메시지를 테스트합니다.")
+async def welcome_test(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    saved_welcome_id = get_saved_channel_id(guild.id, "welcome_channel_id")
+    welcome_channel = get_channel_by_id_or_name(
+        guild,
+        saved_welcome_id or WELCOME_CHANNEL_ID,
+        ["👋-인사-퇴장", "인사-퇴장", "환영", "welcome"],
+        "text"
+    )
+    if welcome_channel is None:
+        return await interaction.response.send_message(
+            "❌ 환영 채널을 찾을 수 없습니다. 먼저 `/친목섭` 또는 `/서버추가`를 실행해주세요.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    await welcome_channel.send(embed=build_welcome_embed(interaction.user, test=True))
+    await interaction.followup.send(f"✅ 환영 메시지 테스트 완료! 전송 채널: {welcome_channel.mention}", ephemeral=True)
+
+
+@bot.command(name="환영")
+async def welcome(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    await ctx.send(embed=build_welcome_embed(member, test=False))
+
+
+
+# =========================
+# 강화 시스템 공통 함수
+# =========================
+
+def get_enhance_rates(level: int, success_bonus: int = 0, destroy_reduction: int = 0):
+    """강화 단계별 확률을 계산합니다."""
+    level = max(0, int(level or 0))
+
+    if level <= 2:
+        base_success, base_fail, base_down, base_destroy = 80, 20, 0, 0
+    elif level <= 5:
+        base_success, base_fail, base_down, base_destroy = 60, 30, 10, 0
+    elif level <= 8:
+        base_success, base_fail, base_down, base_destroy = 45, 30, 20, 5
+    elif level <= 11:
+        base_success, base_fail, base_down, base_destroy = 30, 35, 25, 10
+    elif level <= 14:
+        base_success, base_fail, base_down, base_destroy = 20, 35, 30, 15
+    else:
+        base_success, base_fail, base_down, base_destroy = 10, 30, 35, 25
+
+    success = min(95, base_success + max(0, int(success_bonus or 0)))
+    destroy = max(0, base_destroy - max(0, int(destroy_reduction or 0)))
+
+    # 성공/파괴 보정 후 남은 확률을 실패와 하락에 분배
+    remain = max(0, 100 - success - destroy)
+    down_ratio = base_down / max(1, base_fail + base_down)
+    down = int(round(remain * down_ratio))
+    fail = max(0, remain - down)
+
+    return {"success": success, "fail": fail, "down": down, "destroy": destroy}
+
+
+def get_enhance_item(guild_id: int, user_id: int, item_name: str):
+    c.execute(
+        """
+        SELECT level, success_count, fail_count, down_count, destroy_count, total_attempts, best_level
+        FROM enhance_items
+        WHERE guild_id=? AND user_id=? AND item_name=?
+        """,
+        (guild_id, user_id, item_name)
+    )
+    row = c.fetchone()
+    if row is None:
+        return 0, 0, 0, 0, 0, 0, 0
+    return row
+
+
+def save_enhance_item(guild_id: int, user_id: int, item_name: str, level: int, success_count: int, fail_count: int, down_count: int, destroy_count: int, total_attempts: int, best_level: int):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO enhance_items(
+            guild_id, user_id, item_name, level, success_count, fail_count, down_count,
+            destroy_count, total_attempts, best_level, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (guild_id, user_id, item_name, level, success_count, fail_count, down_count, destroy_count, total_attempts, best_level, now)
+    )
+    conn.commit()
+
+
+def get_enhance_boost_for_member(member: discord.Member):
+    if member is None or member.guild is None:
+        return 0, 0
+
+    role_ids = [role.id for role in member.roles]
+    if not role_ids:
+        return 0, 0
+
+    placeholders = ",".join("?" for _ in role_ids)
+    c.execute(
+        f"""
+        SELECT success_bonus, destroy_reduction
+        FROM enhance_boosts
+        WHERE guild_id=? AND role_id IN ({placeholders})
+        """,
+        [member.guild.id, *role_ids]
+    )
+    rows = c.fetchall()
+    if not rows:
+        return 0, 0
+    return max(row[0] for row in rows), max(row[1] for row in rows)
+
+
+
+# =========================
+# 강화 결과 이미지 카드
+# =========================
+
+ENHANCE_RESULT_STYLES = {
+    "success": {
+        "bg": (214, 255, 230),
+        "accent": (46, 204, 113),
+        "emoji": "✨",
+        "label": "강화 성공",
+    },
+    "fail": {
+        "bg": (245, 245, 245),
+        "accent": (149, 165, 166),
+        "emoji": "💔",
+        "label": "강화 실패",
+    },
+    "down": {
+        "bg": (255, 239, 219),
+        "accent": (243, 156, 18),
+        "emoji": "📉",
+        "label": "강화 하락",
+    },
+    "protect": {
+        "bg": (224, 240, 255),
+        "accent": (52, 152, 219),
+        "emoji": "🛡️",
+        "label": "보호 발동",
+    },
+    "destroy": {
+        "bg": (255, 226, 226),
+        "accent": (231, 76, 60),
+        "emoji": "💥",
+        "label": "장비 파괴",
+    },
+}
+
+
+def _get_enhance_font(size: int, bold: bool = False):
+    if ImageFont is None:
+        return None
+
+    candidates = [
+        "C:/Windows/Fonts/malgunbd.ttf" if bold else "C:/Windows/Fonts/malgun.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    for font_path in candidates:
+        try:
+            if font_path and os.path.exists(font_path):
+                return ImageFont.truetype(font_path, size)
+        except Exception:
+            pass
+
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def create_enhance_result_image(member: discord.Member, item_name: str, result_key: str, old_level: int, level: int, rates: dict, total_attempts: int, best_level: int):
+    """강화 결과를 이미지 카드로 만들어 Discord 파일로 반환합니다. Pillow가 없으면 None을 반환합니다."""
+    if Image is None or ImageDraw is None or ImageFont is None:
+        return None
+
+    style = ENHANCE_RESULT_STYLES.get(result_key, ENHANCE_RESULT_STYLES["fail"])
+
+    width, height = 920, 520
+    img = Image.new("RGB", (width, height), style["bg"])
+    draw = ImageDraw.Draw(img)
+
+    accent = style["accent"]
+    white = (255, 255, 255)
+    dark = (42, 42, 42)
+    grey = (90, 90, 90)
+
+    title_font = _get_enhance_font(54, True)
+    big_font = _get_enhance_font(44, True)
+    mid_font = _get_enhance_font(30, True)
+    small_font = _get_enhance_font(24, False)
+
+    # 배경 장식
+    draw.rounded_rectangle((35, 35, width - 35, height - 35), radius=34, fill=white)
+    draw.rounded_rectangle((35, 35, width - 35, 125), radius=34, fill=accent)
+    draw.rectangle((35, 85, width - 35, 125), fill=accent)
+
+    draw.text((65, 55), f"{style['emoji']} {style['label']}", fill=white, font=title_font)
+    draw.text((65, 155), f"{item_name}", fill=dark, font=big_font)
+    draw.text((65, 215), f"+{old_level}  →  +{level}", fill=accent, font=big_font)
+
+    # 정보 박스
+    box_y = 300
+    boxes = [
+        ("현재 강화", f"+{level}"),
+        ("최고 기록", f"+{best_level}"),
+        ("총 시도", f"{total_attempts}회"),
+    ]
+    for i, (label, value) in enumerate(boxes):
+        x1 = 65 + i * 270
+        x2 = x1 + 235
+        draw.rounded_rectangle((x1, box_y, x2, box_y + 95), radius=22, fill=(250, 250, 250), outline=accent, width=3)
+        draw.text((x1 + 22, box_y + 16), label, fill=grey, font=small_font)
+        draw.text((x1 + 22, box_y + 47), value, fill=dark, font=mid_font)
+
+    rate_text = f"이번 확률  성공 {rates['success']}%  실패 {rates['fail']}%  하락 {rates['down']}%  파괴 {rates['destroy']}%"
+    draw.rounded_rectangle((65, 425, width - 65, 475), radius=18, fill=(250, 250, 250))
+    draw.text((90, 437), rate_text, fill=grey, font=small_font)
+
+    try:
+        filename = f"enhance_result_{member.id}.png"
+        temp_path = os.path.join(tempfile.gettempdir(), filename)
+        img.save(temp_path, "PNG")
+        return discord.File(temp_path, filename="enhance_result.png")
+    except Exception:
+        return None
+
+def build_enhance_result_embed(user: discord.User, item_name: str, result_title: str, result_desc: str, level: int, rates: dict, next_rates: dict, success_count: int, fail_count: int, down_count: int, destroy_count: int, total_attempts: int, best_level: int, color: discord.Color):
+    embed = discord.Embed(title=result_title, description=result_desc, color=color)
+    embed.add_field(
+        name="🎲 이번 확률",
+        value=f"성공 {rates['success']}% / 실패 {rates['fail']}% / 하락 {rates['down']}% / 파괴 {rates['destroy']}%",
+        inline=False
+    )
+    embed.add_field(name="📊 현재 강화", value=f"**+{level} {item_name}**", inline=True)
+    embed.add_field(name="🏆 최고 강화", value=f"**+{best_level}**", inline=True)
+    embed.add_field(name="📈 다음 확률", value=f"성공 {next_rates['success']}% / 파괴 {next_rates['destroy']}%", inline=True)
+    embed.add_field(
+        name="📜 누적 기록",
+        value=f"시도 {total_attempts}회 / 성공 {success_count}회 / 실패 {fail_count}회 / 하락 {down_count}회 / 파괴 {destroy_count}회",
+        inline=False
+    )
+    embed.set_footer(text=f"강화 시도자: {user}")
+    return embed
+
+
+def check_enhance_cooldown(member: discord.Member):
+    key = (member.guild.id, member.id)
+    now = datetime.datetime.now().timestamp()
+    last = ENHANCE_COOLDOWNS.get(key, 0)
+    remaining = ENHANCE_COOLDOWN_SECONDS - (now - last)
+    if remaining > 0:
+        return int(remaining) + 1
+    ENHANCE_COOLDOWNS[key] = now
+    return 0
+
+
+def perform_enhance(member: discord.Member, item_name: str):
+    item_name = item_name.strip()[:30]
+    level, success_count, fail_count, down_count, destroy_count, total_attempts, best_level = get_enhance_item(member.guild.id, member.id, item_name)
+    success_bonus, destroy_reduction = get_enhance_boost_for_member(member)
+    used_rate_ticket = False
+    used_protect_ticket = False
+    if get_inventory_amount(member.id, "강화확률업권") > 0:
+        consume_inventory_item(member.id, "강화확률업권", 1)
+        success_bonus += 15
+        used_rate_ticket = True
+    if get_inventory_amount(member.id, "강화보호권") > 0:
+        # 실제 파괴 결과가 나올 때 1개만 소모합니다.
+        used_protect_ticket = True
+    rates = get_enhance_rates(level, success_bonus, destroy_reduction)
+    roll = random.randint(1, 100)
+    old_level = level
+
+    if roll <= rates["success"]:
+        level += 1
+        success_count += 1
+        result_title = "✅ 강화 성공!"
+        result_desc = f"**{item_name}** 강화에 성공했습니다!\n`+{old_level}` → `+{level}`"
+        color = discord.Color.green()
+        result_key = "success"
+    elif roll <= rates["success"] + rates["fail"]:
+        fail_count += 1
+        result_title = "❌ 강화 실패"
+        result_desc = f"**{item_name}** 강화에 실패했습니다.\n강화 단계는 `+{level}` 그대로 유지됩니다."
+        color = discord.Color.light_grey()
+        result_key = "fail"
+    elif roll <= rates["success"] + rates["fail"] + rates["down"]:
+        level = max(0, level - 1)
+        down_count += 1
+        result_title = "📉 강화 하락"
+        result_desc = f"**{item_name}** 강화 단계가 하락했습니다.\n`+{old_level}` → `+{level}`"
+        color = discord.Color.orange()
+        result_key = "down"
+    else:
+        if used_protect_ticket and consume_inventory_item(member.id, "강화보호권", 1):
+            fail_count += 1
+            result_title = "🛡️ 강화 보호 발동"
+            result_desc = f"**{item_name}** 파괴가 발생했지만 `강화보호권` 1개가 소모되어 파괴를 막았습니다.\n강화 단계는 `+{level}` 그대로 유지됩니다."
+            color = discord.Color.blue()
+            result_key = "protect"
+        else:
+            level = 0
+            destroy_count += 1
+            result_title = "💥 장비 파괴"
+            result_desc = f"**{item_name}** 이/가 파괴되었습니다.\n`+{old_level}` → `+0` 으로 초기화됩니다."
+            color = discord.Color.red()
+            result_key = "destroy"
+
+    total_attempts += 1
+    best_level = max(best_level, level)
+    save_enhance_item(member.guild.id, member.id, item_name, level, success_count, fail_count, down_count, destroy_count, total_attempts, best_level)
+    next_rates = get_enhance_rates(level, success_bonus, destroy_reduction)
+    embed = build_enhance_result_embed(member, item_name, result_title, result_desc, level, rates, next_rates, success_count, fail_count, down_count, destroy_count, total_attempts, best_level, color)
+    image_file = create_enhance_result_image(member, item_name, result_key, old_level, level, rates, total_attempts, best_level)
+    if image_file:
+        embed.set_image(url="attachment://enhance_result.png")
+    if used_rate_ticket:
+        embed.add_field(name="🎯 강화확률업권", value="1개를 소모해서 이번 강화 성공률이 +15% 증가했습니다.", inline=False)
+    return embed, image_file
+
+
+# =========================
+# TTS 시스템 공통 함수
+# =========================
+
+async def speak_tts_in_voice(member: discord.Member, text: str, text_channel: discord.TextChannel = None):
+    if edge_tts is None and gTTS is None:
+        return False, "❌ TTS를 사용하려면 `pip install edge-tts` 또는 `pip install gTTS` 를 먼저 설치해주세요."
+
+    if member.guild is None:
+        return False, "❌ 서버에서만 사용할 수 있습니다."
+
+    voice_channel = find_auto_tts_voice_channel(member, text_channel)
+    if voice_channel is None:
+        return False, "❌ TTS 통방을 찾을 수 없습니다. 먼저 `/tts카테고리생성`을 실행해주세요."
+
+    text = (text or "").strip()
+    if not text:
+        return False, "❌ 읽을 내용을 입력해주세요."
+    if len(text) > 120:
+        return False, "❌ TTS는 120자 이하만 사용할 수 있습니다."
+
+    voice_client = member.guild.voice_client
+    if voice_client is None:
+        voice_client = await voice_channel.connect()
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    if voice_client.is_playing() or voice_client.is_paused():
+        return False, "❌ 현재 다른 음성이 재생 중입니다. 잠시 후 다시 시도해주세요."
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+            temp_path = fp.name
+
+        voice_config = get_tts_voice_config(member.guild.id)
+
+        if edge_tts is not None:
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=voice_config.get("voice", "ko-KR-SunHiNeural"),
+                rate=voice_config.get("rate", "+0%"),
+                pitch=voice_config.get("pitch", "+0Hz"),
+            )
+            await communicate.save(temp_path)
+        else:
+            # edge-tts가 없는 환경에서도 기존처럼 gTTS로 작동합니다.
+            tts = gTTS(text=text, lang=voice_config.get("lang", "ko"))
+            tts.save(temp_path)
+
+        source = discord.FFmpegPCMAudio(temp_path)
+        voice_client.play(source)
+        return True, f"✅ TTS를 재생했습니다. 현재 목소리: **{voice_config.get('label', '기본')}**"
+    except Exception as e:
+        return False, f"❌ TTS 재생 실패: `{e}`"
+
+# =========================
+# 강화 / TTS 시스템
+# =========================
+
+@bot.command(name="강화")
+async def enhance_item_command(ctx: commands.Context, *, item_name: str = None):
+    if ctx.guild is None:
+        return
+    if not item_name or not item_name.strip():
+        return await ctx.send("❌ 사용법: `!강화 <이름>` 또는 `/강화 아이템 이름:<이름>`")
+
+    remaining = check_enhance_cooldown(ctx.author)
+    if remaining > 0:
+        return await ctx.send(f"⏳ 강화는 1분에 한 번만 가능합니다. **{remaining}초** 뒤에 다시 시도해주세요.")
+
+    embed, image_file = perform_enhance(ctx.author, item_name)
+    if image_file:
+        await ctx.send(embed=embed, file=image_file)
+    else:
+        await ctx.send(embed=embed)
+
+
+enhance_group = app_commands.Group(name="강화", description="강화 시스템 명령어입니다.")
+
+
+@enhance_group.command(name="아이템", description="아이템을 확률적으로 강화합니다.")
+@app_commands.describe(이름="강화할 아이템 이름")
+async def enhance_slash_item(interaction: discord.Interaction, 이름: str):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if not 이름 or not 이름.strip():
+        return await interaction.response.send_message("❌ 강화할 이름을 입력해주세요.", ephemeral=True)
+
+    remaining = check_enhance_cooldown(interaction.user)
+    if remaining > 0:
+        return await interaction.response.send_message(f"⏳ 강화는 1분에 한 번만 가능합니다. **{remaining}초** 뒤에 다시 시도해주세요.", ephemeral=True)
+
+    embed, image_file = perform_enhance(interaction.user, 이름)
+    if image_file:
+        await interaction.response.send_message(embed=embed, file=image_file)
+    else:
+        await interaction.response.send_message(embed=embed)
+
+
+@enhance_group.command(name="보유", description="내 강화 아이템 목록을 보여줍니다.")
+async def enhance_slash_inventory(interaction: discord.Interaction):
+    c.execute(
+        """
+        SELECT item_name, level, best_level, total_attempts, success_count, fail_count, down_count, destroy_count
+        FROM enhance_items
+        WHERE guild_id=? AND user_id=?
+        ORDER BY level DESC, best_level DESC, item_name ASC
+        LIMIT 20
+        """,
+        (interaction.guild.id, interaction.user.id)
+    )
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("📦 보유 중인 강화 아이템이 없습니다. `/강화 아이템`으로 시작해보세요.", ephemeral=True)
+
+    text = ""
+    for item_name, level, best_level, total_attempts, success_count, fail_count, down_count, destroy_count in rows:
+        text += f"• **+{level} {item_name}** ㅣ 최고 +{best_level} ㅣ 시도 {total_attempts}회 ㅣ 성공 {success_count} / 실패 {fail_count} / 하락 {down_count} / 파괴 {destroy_count}\n"
+    embed = discord.Embed(title="🎒 강화 보유 아이템", description=text[:4000], color=BOT_COLOR)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@enhance_group.command(name="삭제", description="내 강화 아이템을 삭제합니다.")
+@app_commands.describe(이름="삭제할 아이템 이름")
+async def enhance_slash_delete(interaction: discord.Interaction, 이름: str):
+    c.execute("DELETE FROM enhance_items WHERE guild_id=? AND user_id=? AND item_name=?", (interaction.guild.id, interaction.user.id, 이름.strip()[:30]))
+    conn.commit()
+    await interaction.response.send_message(f"🗑️ **{이름.strip()[:30]}** 강화 아이템을 삭제했습니다.", ephemeral=True)
+
+
+@enhance_group.command(name="순위", description="현재 기록 기준으로 강화 순위를 보여줍니다.")
+async def enhance_slash_rank(interaction: discord.Interaction):
+    c.execute(
+        """
+        SELECT user_id, item_name, level, best_level, total_attempts
+        FROM enhance_items
+        WHERE guild_id=?
+        ORDER BY level DESC, best_level DESC, total_attempts ASC
+        LIMIT 10
+        """
+    , (interaction.guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("아직 강화 기록이 없습니다.", ephemeral=True)
+    text = ""
+    for idx, (user_id, item_name, level, best_level, total_attempts) in enumerate(rows, start=1):
+        text += f"**{idx}위** <@{user_id}> - **+{level} {item_name}** ㅣ 최고 +{best_level} ㅣ 시도 {total_attempts}회\n"
+    embed = discord.Embed(title="🏆 강화 순위 TOP 10", description=text[:4000], color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+
+@enhance_group.command(name="내기록", description="내 강화 누적 레벨과 횟수를 보여줍니다.")
+async def enhance_slash_my_record(interaction: discord.Interaction):
+    c.execute(
+        """
+        SELECT COUNT(*), COALESCE(SUM(level), 0), COALESCE(MAX(best_level), 0),
+               COALESCE(SUM(total_attempts), 0), COALESCE(SUM(success_count), 0),
+               COALESCE(SUM(fail_count), 0), COALESCE(SUM(down_count), 0), COALESCE(SUM(destroy_count), 0)
+        FROM enhance_items
+        WHERE guild_id=? AND user_id=?
+        """,
+        (interaction.guild.id, interaction.user.id)
+    )
+    count, total_level, best_level, attempts, successes, fails, downs, destroys = c.fetchone()
+    embed = discord.Embed(title="📜 내 강화 기록", color=BOT_COLOR)
+    embed.add_field(name="보유 아이템", value=f"{count}개", inline=True)
+    embed.add_field(name="누적 현재 레벨", value=f"+{total_level}", inline=True)
+    embed.add_field(name="최고 기록", value=f"+{best_level}", inline=True)
+    embed.add_field(name="시도", value=f"{attempts}회", inline=True)
+    embed.add_field(name="성공", value=f"{successes}회", inline=True)
+    embed.add_field(name="실패", value=f"{fails}회", inline=True)
+    embed.add_field(name="하락", value=f"{downs}회", inline=True)
+    embed.add_field(name="파괴", value=f"{destroys}회", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@enhance_group.command(name="기네스", description="베스트 최고 기록 기준으로 강화 순위를 보여줍니다.")
+async def enhance_slash_guinness(interaction: discord.Interaction):
+    c.execute(
+        """
+        SELECT user_id, item_name, best_level, level, total_attempts
+        FROM enhance_items
+        WHERE guild_id=?
+        ORDER BY best_level DESC, level DESC, total_attempts ASC
+        LIMIT 10
+        """
+    , (interaction.guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("아직 강화 기록이 없습니다.", ephemeral=True)
+    text = ""
+    for idx, (user_id, item_name, best_level, level, total_attempts) in enumerate(rows, start=1):
+        text += f"**{idx}위** <@{user_id}> - **{item_name}** 최고 **+{best_level}** / 현재 +{level} / 시도 {total_attempts}회\n"
+    embed = discord.Embed(title="👑 강화 기네스 TOP 10", description=text[:4000], color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+
+@enhance_group.command(name="내순위", description="내 닉네임과 현재 서버의 전체 순위를 보여줍니다.")
+async def enhance_slash_my_rank(interaction: discord.Interaction):
+    c.execute(
+        """
+        SELECT user_id, COALESCE(SUM(level), 0) AS total_level, COALESCE(MAX(best_level), 0) AS best_level,
+               COALESCE(SUM(total_attempts), 0) AS attempts
+        FROM enhance_items
+        WHERE guild_id=?
+        GROUP BY user_id
+        ORDER BY total_level DESC, best_level DESC, attempts ASC
+        """
+    , (interaction.guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("아직 강화 기록이 없습니다.", ephemeral=True)
+
+    my_rank = None
+    my_data = None
+    for idx, row in enumerate(rows, start=1):
+        if row[0] == interaction.user.id:
+            my_rank = idx
+            my_data = row
+            break
+
+    if my_rank is None:
+        return await interaction.response.send_message("아직 강화 기록이 없습니다. `/강화 아이템`으로 시작해보세요.", ephemeral=True)
+
+    _, total_level, best_level, attempts = my_data
+    embed = discord.Embed(title="📌 내 강화 순위", color=BOT_COLOR)
+    embed.add_field(name="내 순위", value=f"**{my_rank}위 / {len(rows)}명**", inline=False)
+    embed.add_field(name="누적 현재 레벨", value=f"+{total_level}", inline=True)
+    embed.add_field(name="최고 기록", value=f"+{best_level}", inline=True)
+    embed.add_field(name="총 시도", value=f"{attempts}회", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+boost_group = app_commands.Group(name="부스트", description="강화 부스트 설정")
+
+
+@boost_group.command(name="설정", description="특정 역할의 강화 부스트를 설정합니다. 관리자 전용입니다.")
+@app_commands.describe(역할="부스트를 받을 역할", 성공보너스="성공 확률 추가 %", 파괴감소="파괴 확률 감소 %")
+async def enhance_boost_setting(interaction: discord.Interaction, 역할: discord.Role, 성공보너스: int = 0, 파괴감소: int = 0):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    성공보너스 = max(0, min(50, 성공보너스))
+    파괴감소 = max(0, min(50, 파괴감소))
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO enhance_boosts(guild_id, role_id, success_bonus, destroy_reduction, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (interaction.guild.id, 역할.id, 성공보너스, 파괴감소, now)
+    )
+    conn.commit()
+    await interaction.response.send_message(
+        f"✅ {역할.mention} 강화 부스트를 설정했습니다.\n성공 +{성공보너스}% / 파괴 -{파괴감소}%",
+        ephemeral=True
+    )
+
+
+enhance_group.add_command(boost_group)
+try:
+    bot.tree.add_command(enhance_group)
+except Exception:
+    pass
+
+
+@bot.tree.command(name="강화채널생성", description="강화 전용 카테고리와 박스형 안내 패널을 생성합니다.")
+async def create_enhance_channel_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.manage_channels:
+        return await interaction.response.send_message(
+            "❌ 채널을 만들 수 있는 권한이 필요합니다.",
+            ephemeral=True
+        )
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    category = await get_or_create_category(guild, ENHANCE_CATEGORY_NAME)
+
+    # 강화방은 일반 유저가 보고 사용할 수 있게 열어두고, 봇은 메시지/임베드/버튼을 사용할 수 있게 합니다.
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            embed_links=True,
+            attach_files=True
+        ),
+    }
+    try:
+        await category.edit(overwrites=overwrites)
+    except discord.HTTPException:
+        pass
+
+    channel = await get_or_create_text_channel(guild, ENHANCE_CHANNEL_NAME, category)
+    try:
+        await channel.edit(
+            topic="⚒️ 강화 전용 채널입니다. /강화 아이템 또는 !강화 명령어로 아이템을 강화하세요.",
+            overwrites=overwrites
+        )
+    except discord.HTTPException:
+        pass
+
+    guide_sent = await send_enhance_guide_to_channel(channel)
+
+    await interaction.followup.send(
+        f"✅ 강화 채널 생성/정리 완료!\n"
+        f"카테고리: `{category.name}`\n"
+        f"채널: {channel.mention}\n"
+        f"안내 패널: {'새로 생성됨' if guide_sent else '이미 있음'}",
+        ephemeral=True
+    )
+    await send_log(guild, f"⚒️ 강화 채널 생성\n채널: {channel.mention}\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="tts카테고리생성", description="TTS 카테고리, TTS 채팅방 1개, TTS 통방 3개를 생성합니다.")
+async def create_tts_category_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    tts_category, tts_text_channel, first_voice_channel, guide_sent = await create_tts_category_channels(interaction.guild)
+    voice_mentions = []
+    for channel in get_tts_voice_channels(interaction.guild):
+        voice_mentions.append(channel.mention)
+
+    await interaction.followup.send(
+        "✅ TTS 카테고리 생성이 완료됐습니다.\n"
+        f"카테고리: **{tts_category.name}**\n"
+        f"채팅방: {tts_text_channel.mention}\n"
+        f"통방 3개: {' / '.join(voice_mentions) if voice_mentions else '미설정'}\n"
+        f"안내메시지: {'새로 전송됨' if guide_sent else '이미 있음'}\n\n"
+        "이제 TTS 통방에 들어간 뒤 `🔊-tts` 채팅방에 글을 쓰면 봇이 자동으로 들어와서 읽어줍니다.",
+        ephemeral=True
+    )
+    await send_log(interaction.guild, f"🔊 TTS 카테고리 생성\n관리자: {interaction.user.mention}\n채팅방: {tts_text_channel.mention}", "voice")
+
+
+@bot.tree.command(name="tts", description="입력한 문장을 음성 채널에서 TTS로 읽습니다.")
+async def tts_command(interaction: discord.Interaction, text: str):
+    await interaction.response.defer(ephemeral=True)
+    ok, message = await speak_tts_in_voice(interaction.user, text, interaction.channel)
+    await interaction.followup.send(message, ephemeral=True)
+    if ok:
+        await send_log(interaction.guild, f"🔊 TTS 사용\n유저: {interaction.user.mention}\n내용: {text[:100]}", "voice")
+
+
+@bot.tree.command(name="입장", description="봇을 내 음성 채널로 부릅니다.")
+async def tts_join_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    member = interaction.user
+    if not member.voice or not member.voice.channel:
+        return await interaction.response.send_message("❌ 먼저 음성 채널에 들어가주세요.", ephemeral=True)
+
+    voice_channel = member.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    try:
+        if voice_client is None:
+            await voice_channel.connect()
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+        await interaction.response.send_message(f"✅ {voice_channel.mention} 채널에 입장했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🔊 TTS 입장\n유저: {interaction.user.mention}\n채널: {voice_channel.mention}", "voice")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 입장 실패: `{e}`", ephemeral=True)
+
+
+@bot.tree.command(name="퇴장", description="봇을 음성 채널에서 내보냅니다.")
+async def tts_leave_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        return await interaction.response.send_message("❌ 봇이 음성 채널에 들어가 있지 않습니다.", ephemeral=True)
+
+    try:
+        channel_name = voice_client.channel.name if voice_client.channel else "알 수 없음"
+        await voice_client.disconnect(force=True)
+        await interaction.response.send_message("✅ 음성 채널에서 퇴장했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"👋 TTS 퇴장\n유저: {interaction.user.mention}\n채널: `{channel_name}`", "voice")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 퇴장 실패: `{e}`", ephemeral=True)
+
+
+@bot.tree.command(name="목소리변경", description="TTS 목소리를 연홍/연하 느낌 프리셋으로 변경합니다.")
+@app_commands.describe(목소리="사용할 TTS 목소리")
+@app_commands.choices(목소리=[
+    app_commands.Choice(name="연홍 느낌 · 밝고 또렷한 여성", value="yeonhong"),
+    app_commands.Choice(name="연하 느낌 · 차분하고 부드러운 여성", value="yeonha"),
+    app_commands.Choice(name="민준 느낌 · 깔끔한 남성", value="minjun"),
+    app_commands.Choice(name="귀여운 느낌 · 빠르고 높은 톤", value="cute"),
+    app_commands.Choice(name="차분한 느낌 · 느긋한 톤", value="calm"),
+    app_commands.Choice(name="영어 여성", value="en"),
+    app_commands.Choice(name="일본어 여성", value="ja"),
+])
+async def tts_voice_change_command(interaction: discord.Interaction, 목소리: app_commands.Choice[str]):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 변경할 수 있습니다.", ephemeral=True)
+
+    set_tts_voice_preset(interaction.guild.id, 목소리.value)
+    preset = TTS_VOICE_PRESETS.get(목소리.value, TTS_VOICE_PRESETS["yeonhong"])
+
+    embed = discord.Embed(
+        title="🔊 TTS 목소리 변경 완료",
+        description=(
+            f"이제 TTS가 **{preset['label']}** 으로 재생됩니다.\n"
+            f"{preset['desc']}\n\n"
+            "더 자연스러운 목소리를 쓰려면 서버/PC에 `edge-tts`가 설치되어 있어야 합니다.\n"
+            "설치가 안 되어 있으면 기존 gTTS 기본 목소리로 자동 대체됩니다."
+        ),
+        color=BOT_COLOR
+    )
+    embed.add_field(name="목소리 엔진", value=("edge-tts 자연음성" if edge_tts else "gTTS 기본음성"), inline=True)
+    embed.add_field(name="속도", value=preset.get("rate", "+0%"), inline=True)
+    embed.add_field(name="톤", value=preset.get("pitch", "+0Hz"), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🔊 TTS 목소리 변경\n목소리: {preset['label']}\n관리자: {interaction.user.mention}", "voice")
+
+
+@bot.tree.command(name="목소리목록", description="사용 가능한 TTS 목소리 목록을 확인합니다.")
+async def tts_voice_list_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    current = get_tts_voice_config(interaction.guild.id)
+    lines = []
+    for key, preset in TTS_VOICE_PRESETS.items():
+        mark = "✅ " if preset.get("voice") == current.get("voice") and preset.get("rate") == current.get("rate") and preset.get("pitch") == current.get("pitch") else "• "
+        lines.append(f"{mark}**{preset['label']}** - {preset['desc']}")
+
+    embed = discord.Embed(
+        title="🔊 TTS 목소리 목록",
+        description="\n".join(lines),
+        color=BOT_COLOR
+    )
+    embed.set_footer(text="/목소리변경 으로 원하는 목소리를 선택하세요.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
+# =========================
+# 메시지 처리: 초대링크 / 금지어 / 도배 / 레벨
+# =========================
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        await bot.process_commands(message)
+        return
+
+    if message.channel.name in TTS_CHANNEL_NAMES and not message.content.startswith(("!", ".", "/")):
+        ok, tts_message = await speak_tts_in_voice(message.author, message.content, message.channel)
+        if not ok:
+            try:
+                await message.channel.send(tts_message, delete_after=6)
+            except discord.HTTPException:
+                pass
+        else:
+            await send_log(message.guild, f"🔊 TTS 채널 자동 재생\n유저: {message.author.mention}\n채널: {message.channel.mention}", "voice")
+        return
+
+    user_id = message.author.id
+    now = datetime.datetime.now().timestamp()
+    content_lower = message.content.lower()
+
+    security_settings = get_security_settings(message.guild.id)
+    if security_settings.get("token_leak_guard") and not message.author.guild_permissions.manage_messages and looks_like_discord_token(message.content):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        warning_count = await add_auto_warning(message.author, "토큰 의심 문자열 게시")
+        add_security_log(message.guild.id, message.author.id, "토큰보호", "토큰 의심 문자열 자동 삭제", message.channel.id)
+        await message.channel.send(
+            f"🔐 {message.author.mention}님 토큰처럼 보이는 문자열이 감지되어 메시지를 삭제했습니다.\n누적 경고: {warning_count}회",
+            delete_after=8
+        )
+        await send_log(
+            message.guild,
+            f"🔐 토큰보호 감지\n대상: {message.author.mention}\n채널: {message.channel.mention}\n내용은 보안상 로그에 저장하지 않았습니다.\n누적 경고: {warning_count}회",
+            "warning"
+        )
+        return
+
+    if security_settings.get("dangerous_file_block") and not message.author.guild_permissions.manage_messages:
+        dangerous_filename = find_dangerous_attachment_name(message)
+        if dangerous_filename:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            warning_count = await add_auto_warning(message.author, "위험 첨부파일 게시")
+            add_security_log(message.guild.id, message.author.id, "위험파일차단", dangerous_filename[:200], message.channel.id)
+            await message.channel.send(
+                f"📎 {message.author.mention}님 위험할 수 있는 첨부파일이 감지되어 메시지를 삭제했습니다.\n파일: `{dangerous_filename[:80]}`\n누적 경고: {warning_count}회",
+                delete_after=8
+            )
+            await send_log(
+                message.guild,
+                f"📎 위험파일차단\n대상: {message.author.mention}\n채널: {message.channel.mention}\n파일: `{dangerous_filename[:200]}`\n누적 경고: {warning_count}회",
+                "warning"
+            )
+            return
+
+    if security_settings.get("mention_spam_detection") and not message.author.guild_permissions.manage_messages:
+        mention_count = len(message.mentions)
+        role_mention_count = len(message.role_mentions)
+        total_mentions = mention_count + role_mention_count
+        mention_reason = None
+
+        if message.mention_everyone:
+            mention_reason = "@everyone/@here 멘션 사용"
+        elif total_mentions >= SECURITY_MENTION_LIMIT:
+            mention_reason = f"대량 멘션 {total_mentions}개"
+        elif role_mention_count >= SECURITY_ROLE_MENTION_LIMIT:
+            mention_reason = f"역할 멘션 {role_mention_count}개"
+
+        if mention_reason:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            warning_count = await add_auto_warning(message.author, mention_reason)
+            add_security_log(message.guild.id, message.author.id, "멘션테러감지", mention_reason, message.channel.id)
+            await message.channel.send(
+                f"📣 {message.author.mention}님 멘션테러감지에 의해 메시지가 삭제되었습니다.\n사유: **{mention_reason}**\n누적 경고: {warning_count}회",
+                delete_after=8
+            )
+            await send_log(
+                message.guild,
+                f"📣 멘션테러감지\n대상: {message.author.mention}\n채널: {message.channel.mention}\n사유: {mention_reason}\n누적 경고: {warning_count}회",
+                "warning"
+            )
+            return
+
+    if security_settings.get("auto_filter") and not message.author.guild_permissions.manage_messages:
+        filter_reason = None
+        filter_log_title = None
+
+        if IP_BLOCK_REGEX.search(message.content):
+            filter_reason = "IP 주소 게시"
+            filter_log_title = "🛡️ IP 주소 차단"
+        elif any(word in content_lower for word in AUTO_FILTER_INVITE_WORDS):
+            filter_reason = "초대 링크 게시"
+            filter_log_title = "🚫 초대 링크 차단"
+        else:
+            matched_word = next((word for word in get_all_filter_words(message.guild.id) if word and word in content_lower), None)
+            if matched_word:
+                filter_reason = f"금지어 사용({matched_word})"
+                filter_log_title = "🤬 금지어 차단"
+
+        if filter_reason:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+
+            warning_count = await add_auto_warning(message.author, filter_reason)
+            add_security_log(message.guild.id, message.author.id, "자동검열", filter_reason, message.channel.id)
+            await message.channel.send(
+                f"🧹 {message.author.mention}님 자동검열에 의해 메시지가 삭제되었습니다.\n사유: **{filter_reason}**\n누적 경고: {warning_count}회",
+                delete_after=8
+            )
+            await send_log(
+                message.guild,
+                f"{filter_log_title}\n대상: {message.author.mention}\n채널: {message.channel.mention}\n내용: {message.content}\n누적 경고: {warning_count}회",
+                "warning"
+            )
+            return
+
+    if security_settings.get("spam_protection") and not message.author.guild_permissions.manage_messages:
+        spam_key = (message.guild.id, user_id)
+        spam_tracker.setdefault(spam_key, []).append(now)
+        spam_tracker[spam_key] = [t for t in spam_tracker[spam_key] if now - t <= SPAM_TIME]
+
+        if len(spam_tracker[spam_key]) >= SPAM_LIMIT:
+            spam_tracker[spam_key] = []
+            c.execute("INSERT INTO warnings VALUES (?, ?, ?, ?)", (user_id, bot.user.id, "도배 감지", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+            warning_count = await update_warning_role(message.author)
+            add_security_log(message.guild.id, message.author.id, "도배보호", f"{SPAM_TIME}초 내 {SPAM_LIMIT}회 메시지", message.channel.id)
+            await message.channel.send(f"⚠️ {message.author.mention}님 도배가 감지되었습니다.\n누적 경고: {warning_count}회")
+            await send_log(message.guild, f"⚠️ 자동 경고 지급\n대상: {message.author.mention}\n사유: 도배 감지\n누적 경고: {warning_count}회", "warning")
+            if warning_count >= 5:
+                try:
+                    await message.author.ban(reason="경고 5회 누적 자동 차단")
+                    await send_log(message.guild, f"⛔ 자동 밴\n대상: {message.author}\n사유: 경고 5회 누적", "punishment")
+                except (discord.Forbidden, discord.HTTPException):
+                    await send_log(message.guild, f"❌ 자동 밴 실패\n대상: {message.author}\n사유: 권한 부족 또는 API 오류", "punishment")
+                return
+
+    try:
+        add_daily_mission_message_progress(message.guild.id, user_id)
+    except Exception:
+        pass
+
+    last_exp_time = exp_cooldowns.get(user_id, 0)
+    if now - last_exp_time >= EXP_COOLDOWN:
+        exp_cooldowns[user_id] = now
+        exp, level = get_or_create_level_user(user_id)
+        exp_gain = 20 if has_exp_booster(user_id) else 10
+        exp += exp_gain
+        need_exp = level * 100
+        if exp >= need_exp:
+            old_level = level
+            level += 1
+            exp -= need_exp
+            await send_log(
+                message.guild,
+                f"🎉 채팅 레벨업!\n유저: {message.author.mention}\n채팅 레벨: Lv.{old_level} → Lv.{level}",
+                "level"
+            )
+        c.execute("UPDATE levels SET exp=?, level=? WHERE user_id=?", (exp, level, user_id))
+        conn.commit()
+
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if before.author.bot or before.guild is None:
+        return
+    await send_log(before.guild, f"✏️ 메시지 수정\n채널: {before.channel.mention}\n작성자: {before.author.mention}\n수정 전: {before.content}\n수정 후: {after.content}", "chat")
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+    await send_log(message.guild, f"🗑 삭제된 메시지\n채널: {message.channel.mention}\n작성자: {message.author.mention}\n내용: {message.content}", "chat")
+
+
+# =========================
+# 경고 시스템
+# =========================
+
+class WarnReasonModal(discord.ui.Modal, title="경고 사유 입력"):
+    reason = discord.ui.TextInput(label="경고 사유", placeholder="예: 도배, 욕설, 분쟁 유도", style=discord.TextStyle.paragraph, required=True, max_length=500)
+
+    def __init__(self, target: discord.Member):
+        super().__init__()
+        self.target = target
+
+    async def on_submit(self, interaction: discord.Interaction):
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("INSERT INTO warnings VALUES (?, ?, ?, ?)", (self.target.id, interaction.user.id, str(self.reason.value), now))
+        conn.commit()
+        warning_count = await update_warning_role(self.target)
+        await send_log(
+            interaction.guild,
+            f"⚠️ 경고 지급\n대상: {self.target.mention}\n관리자: {interaction.user.mention}\n사유: {self.reason.value}\n누적 경고: {warning_count}회",
+            "warning"
+        )
+        if warning_count >= 5:
+            await self.target.ban(reason="경고 5회 누적 자동 차단")
+            await send_log(interaction.guild, f"⛔ 경고 5회 누적 자동 밴\n대상: {self.target}\n관리자: {interaction.user}", "punishment")
+            return await interaction.response.send_message(f"⛔ {self.target.mention}님은 경고 5회 누적으로 자동 밴되었습니다.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ {self.target.mention}님에게 경고를 지급했습니다.\n누적 경고: {warning_count}회", ephemeral=True)
+
+
+class WarnDeleteModal(discord.ui.Modal, title="경고 삭제"):
+    number = discord.ui.TextInput(label="삭제할 경고 번호", placeholder="예: 1", required=True, max_length=3)
+
+    def __init__(self, target: discord.Member):
+        super().__init__()
+        self.target = target
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            number = int(self.number.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자만 입력해주세요.", ephemeral=True)
+
+        c.execute("SELECT rowid, reason FROM warnings WHERE user_id=?", (self.target.id,))
+        rows = c.fetchall()
+        if not rows:
+            return await interaction.response.send_message("✅ 경고 기록이 없습니다.", ephemeral=True)
+        if number < 1 or number > len(rows):
+            return await interaction.response.send_message(f"❌ 1부터 {len(rows)}까지 입력해주세요.", ephemeral=True)
+
+        row_id, reason = rows[number - 1]
+        c.execute("DELETE FROM warnings WHERE rowid=?", (row_id,))
+        conn.commit()
+        await update_warning_role(self.target)
+        await send_log(
+            interaction.guild,
+            f"🗑 경고 삭제\n대상: {self.target.mention}\n관리자: {interaction.user.mention}\n삭제 번호: {number}\n사유: {reason}",
+            "warning"
+        )
+        await interaction.response.send_message(f"🗑 {self.target.mention}님의 {number}번 경고를 삭제했습니다.\n사유: {reason}", ephemeral=True)
+
+
+class WarnActionSelect(discord.ui.UserSelect):
+    def __init__(self, action: str):
+        self.action = action
+        super().__init__(placeholder="대상 유저를 선택하세요.", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        target = self.values[0]
+        if not isinstance(target, discord.Member):
+            return await interaction.response.send_message("❌ 서버 멤버만 선택할 수 있습니다.", ephemeral=True)
+        if self.action == "give":
+            await interaction.response.send_modal(WarnReasonModal(target))
+        elif self.action == "delete":
+            await interaction.response.send_modal(WarnDeleteModal(target))
+        elif self.action == "check":
+            await send_warning_list(interaction, target, ephemeral=True)
+
+
+class WarnActionView(discord.ui.View):
+    def __init__(self, action: str):
+        super().__init__(timeout=60)
+        self.add_item(WarnActionSelect(action))
+
+
+class WarnManagePanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="⚠️ 경고 지급", style=discord.ButtonStyle.danger)
+    async def give_warning(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("경고를 줄 유저를 선택하세요.", view=WarnActionView("give"), ephemeral=True)
+
+    @discord.ui.button(label="📋 경고 조회", style=discord.ButtonStyle.blurple)
+    async def check_warning(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("경고 기록을 조회할 유저를 선택하세요.", view=WarnActionView("check"), ephemeral=True)
+
+    @discord.ui.button(label="🗑 경고 삭제", style=discord.ButtonStyle.gray)
+    async def delete_warning(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("경고를 삭제할 유저를 선택하세요.", view=WarnActionView("delete"), ephemeral=True)
+
+
+async def send_warning_list(interaction: discord.Interaction, user: discord.Member, ephemeral: bool = False):
+    c.execute("SELECT moderator_id, reason, time FROM warnings WHERE user_id=?", (user.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message(f"✅ {user.mention}님의 경고 기록이 없습니다.", ephemeral=ephemeral)
+    text = ""
+    for index, (moderator_id, reason, time) in enumerate(rows, start=1):
+        text += f"**{index}.** {reason}\n관리자: <@{moderator_id}>\n`{time}`\n\n"
+    embed = discord.Embed(title=f"📋 {user.display_name} 경고 기록", description=text[:4000], color=discord.Color.orange())
+    await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="경고패널", description="경고 관리 패널을 엽니다.")
+async def warn_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.moderate_members:
+        return await interaction.response.send_message("❌ 권한이 없습니다.", ephemeral=True)
+    embed = discord.Embed(title="⚠️ 경고 관리 패널", description="아래 버튼으로 경고를 관리하세요.", color=discord.Color.orange())
+    await interaction.response.send_message(embed=embed, view=WarnManagePanel(), ephemeral=True)
+
+
+@bot.tree.command(name="경고조회", description="유저의 경고 기록 조회")
+async def warn_check(interaction: discord.Interaction, user: discord.Member):
+    await send_warning_list(interaction, user)
+
+
+# =========================
+# 경제 / 상점 / 출석 / 프로필 / 랭킹
+# =========================
+
+class PointManageModal(discord.ui.Modal):
+    def __init__(self, action: str):
+        super().__init__(title="포인트 지급" if action == "give" else "포인트 차감")
+        self.action = action
+        self.user_id = discord.ui.TextInput(label="유저 ID", placeholder="예: 123456789012345678", required=True)
+        self.amount = discord.ui.TextInput(label="포인트", placeholder="예: 1000", required=True)
+        self.add_item(self.user_id)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        try:
+            user_id = int(self.user_id.value)
+            amount = int(self.amount.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID와 포인트는 숫자로 입력해주세요.", ephemeral=True)
+        if amount <= 0:
+            return await interaction.response.send_message("❌ 1P 이상 입력해주세요.", ephemeral=True)
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+        point = get_user_point(interaction.guild.id, user_id)
+        if self.action == "give":
+            point += amount
+            title = "💰 포인트 지급 완료"
+        else:
+            point -= amount
+            title = "💸 포인트 차감 완료"
+        set_user_point(interaction.guild.id, user_id, point)
+        embed = discord.Embed(title=title, description=f"대상: {member.mention}\n금액: **{amount}P**\n현재 포인트: **{max(point, 0)}P**", color=BOT_COLOR)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await send_log(interaction.guild, f"💰 {title}\n대상: {member.mention}\n관리자: {interaction.user.mention}\n금액: {amount}P")
+
+
+class EconomyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="💰 포인트 지급", style=discord.ButtonStyle.green)
+    async def give_point(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PointManageModal("give"))
+
+    @discord.ui.button(label="💸 포인트 차감", style=discord.ButtonStyle.danger)
+    async def take_point(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PointManageModal("take"))
+
+    @discord.ui.button(label="🎁 일일 보상", style=discord.ButtonStyle.blurple)
+    async def daily_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        c.execute("SELECT last_reward FROM daily_rewards WHERE guild_id=? AND user_id=?", (interaction.guild.id, user_id))
+        data = c.fetchone()
+        if data and data[0] == today:
+            return await interaction.response.send_message("❌ 오늘은 이미 일일 보상을 받았습니다.", ephemeral=True)
+        reward = random.randint(50, 300)
+        point = get_user_point(interaction.guild.id, user_id) + reward
+        set_user_point(interaction.guild.id, user_id, point)
+        c.execute("INSERT OR REPLACE INTO daily_rewards(guild_id, user_id, last_reward) VALUES (?, ?, ?)", (interaction.guild.id, user_id, today))
+        conn.commit()
+        await interaction.response.send_message(f"🎁 일일 보상 획득!\n+**{reward}P**\n보유 포인트: **{point}P**", ephemeral=True)
+
+    @discord.ui.button(label="🎰 가챠 안내", style=discord.ButtonStyle.gray)
+    async def gacha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🎰 가챠 안내",
+            description=(
+                "원하는 포인트를 걸어서 가챠를 할 수 있어요.\n\n"
+                "사용법: `/가챠 금액 횟수`\n"
+                "예시: `/가챠 500 5`\n"
+                "횟수는 1회부터 최대 5회까지 가능합니다.\n\n"
+                "확률표\n"
+                "• ⭐⭐⭐⭐⭐ 신화 보상: 0.5% / 걸은 금액의 10배\n"
+                "• ⭐⭐⭐⭐ 초전설 보상: 1.5% / 걸은 금액의 7배\n"
+                "• ⭐⭐⭐ 초전설 보상: 3% / 걸은 금액의 5배\n"
+                "• ⭐⭐⭐ 전설 보상: 5% / 걸은 금액의 3배\n"
+                "• ⭐⭐ 희귀 보상: 10% / 걸은 금액의 2배\n"
+                "• ⭐ 일반 보상: 30% / 걸은 금액의 1.5배"
+                "• 💥 꽝: 50% / 걸은 금액 차감\n"
+            ),
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎯 일일미션", style=discord.ButtonStyle.green, row=1)
+    async def daily_mission_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_daily_mission_status(interaction, interaction.user)
+
+    @discord.ui.button(label="🎟️ 쿠폰 안내", style=discord.ButtonStyle.gray, row=1)
+    async def coupon_help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🎟️ 쿠폰 시스템 안내",
+            description=(
+                "관리자가 만든 쿠폰 코드를 입력하면 포인트나 아이템을 받을 수 있어요.\n\n"
+                "사용자: `/쿠폰사용 코드`\n"
+                "관리자: `/쿠폰생성`, `/쿠폰목록`, `/쿠폰삭제`\n\n"
+                "예시: `/쿠폰사용 WELCOME1000`"
+            ),
+            color=BOT_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🏷️ 칭호/업적", style=discord.ButtonStyle.blurple, row=2)
+    async def title_achievement_help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🏷️ 칭호 · 업적 안내",
+            description=(
+                "서버 활동을 하면서 칭호와 업적 보상을 얻을 수 있어요.\n\n"
+                "🏆 `/업적` - 업적 진행도 확인\n"
+                "🎁 `/업적보상` - 완료한 업적 보상 받기\n"
+                "🏷️ `/칭호` - 구매 가능한 칭호 확인\n"
+                "🛒 `/칭호` - 포인트로 칭호 구매\n"
+                "🌟 `/칭호` - 프로필 대표 칭호 설정\n"
+                "📦 `/칭호` - 보유 칭호 확인"
+            ),
+            color=discord.Color.purple()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="💾 DB 백업", style=discord.ButtonStyle.blurple, row=2)
+    async def backup_db(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        os.makedirs("backup", exist_ok=True)
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"backup/database_{now}.db"
+        shutil.copy("database.db", backup_path)
+        await interaction.response.send_message(f"💾 백업 완료!\n`{backup_path}`", ephemeral=True)
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="경제패널", description="포인트, 보상, 가챠, 백업 패널을 엽니다.")
+async def economy_panel(interaction: discord.Interaction):
+    embed = discord.Embed(title="💰 만능 봇 경제 패널", description="아래 버튼으로 경제 기능을 사용할 수 있습니다.\n\n💰 포인트 지급 - 관리자 전용\n💸 포인트 차감 - 관리자 전용\n🎁 일일 보상 - 하루 1회\n🎰 가챠 - `/가챠 금액 횟수`로 원하는 포인트 배팅, 최대 5회\n🎯 일일미션 - 채팅/출석 미션 확인\n🏷️ 칭호/업적 - 성장 보상과 대표 칭호\n🎟️ 쿠폰 - 쿠폰 사용 안내\n💾 DB 백업 - 관리자 전용", color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed, view=EconomyView(), ephemeral=True)
+
+
+@bot.tree.command(name="가챠", description="원하는 포인트를 걸어서 가챠를 돌립니다. 최대 5회까지 가능합니다.")
+@app_commands.describe(
+    금액="가챠 1회에 걸 포인트를 입력하세요. 예: 500",
+    횟수="가챠를 돌릴 횟수입니다. 1~5회까지 가능합니다."
+)
+async def point_gacha(interaction: discord.Interaction, 금액: int, 횟수: int = 1):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    user_id = interaction.user.id
+    bet = 금액
+    count = 횟수
+
+    if bet <= 0:
+        return await interaction.response.send_message("❌ 1P 이상 입력해주세요.", ephemeral=True)
+    if count < 1:
+        return await interaction.response.send_message("❌ 횟수는 1회 이상 입력해주세요.", ephemeral=True)
+    if count > 5:
+        return await interaction.response.send_message("❌ /가챠는 최대 5회까지만 사용할 수 있습니다.", ephemeral=True)
+
+    total_bet = bet * count
+    point = get_user_point(interaction.guild.id, user_id)
+    if point < total_bet:
+        return await interaction.response.send_message(
+            f"❌ 포인트가 부족합니다.\n1회 금액: **{bet}P**\n횟수: **{count}회**\n필요 포인트: **{total_bet}P**\n보유 포인트: **{point}P**",
+            ephemeral=True
+        )
+
+    # 유저가 적어준 확률 그대로 적용
+    # 꽝 50% / 신화 0.5% / 초전설 1.5% / 초전설 3% / 전설 5% / 희귀 10% / 일반 30%
+    gacha_rewards = [
+        {"limit": 500, "name": "💥 꽝", "multiplier": 0, "color": 0xFF3333},
+        {"limit": 505, "name": "⭐⭐⭐⭐⭐ 신화 보상", "multiplier": 10, "color": 0xFF4FD8},
+        {"limit": 520, "name": "⭐⭐⭐⭐ 초전설 보상", "multiplier": 7, "color": 0xA855F7},
+        {"limit": 550, "name": "⭐⭐⭐ 초전설 보상", "multiplier": 5, "color": 0xFF8C00},
+        {"limit": 600, "name": "⭐⭐⭐ 전설 보상", "multiplier": 3, "color": 0xFFD700},
+        {"limit": 700, "name": "⭐⭐ 희귀 보상", "multiplier": 2, "color": 0x87CEFA},
+        {"limit": 1000, "name": "⭐ 일반 보상", "multiplier": 1.5, "color": BOT_COLOR},
+    ]
+
+    point -= total_bet
+    total_reward = 0
+    result_lines = []
+    best_color = BOT_COLOR
+
+    for i in range(1, count + 1):
+        roll = random.randint(1, 1000)  # 0.5% 확률 처리를 위해 1000분율 사용
+        selected = gacha_rewards[-1]
+        for reward_info in gacha_rewards:
+            if roll <= reward_info["limit"]:
+                selected = reward_info
+                break
+
+        reward_point = int(bet * selected["multiplier"])
+        total_reward += reward_point
+        if selected["name"] != "💥 꽝":
+            best_color = selected["color"]
+        result_lines.append(f"`{i}회차` {selected['name']} / +{reward_point}P")
+
+    point += total_reward
+    if point < 0:
+        point = 0
+    set_user_point(interaction.guild.id, user_id, point)
+
+    profit = total_reward - total_bet
+    profit_text = f"+{profit}P" if profit >= 0 else f"{profit}P"
+    result_title = "💥 가챠 결과" if total_reward == 0 else "🎰 가챠 결과"
+
+    embed = discord.Embed(
+        title=result_title,
+        description=(
+            f"{interaction.user.mention} 님의 가챠 결과입니다.\n\n"
+            f"1회 금액: **{bet}P**\n"
+            f"사용 횟수: **{count}회**\n"
+            f"사용 포인트: **-{total_bet}P**\n"
+            f"획득 포인트: **+{total_reward}P**\n"
+            f"손익: **{profit_text}**\n\n"
+            f"**결과 목록**\n" + "\n".join(result_lines) + "\n\n"
+            f"현재 포인트: **{point}P**"
+        ),
+        color=best_color
+    )
+    embed.add_field(
+        name="📌 확률표",
+        value=(
+            "꽝 50% / 신화 0.5% / 초전설 1.5% / 초전설 3%\n"
+            "전설 5% / 희귀 10% / 일반 30%"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="/가챠는 최대 5회까지 사용할 수 있습니다.")
+    await interaction.response.send_message(embed=embed)
+
+
+SHOP_ITEMS = {
+    "닉네임색변경권": 500,
+    "칭호권": 1000,
+    "VIP권": 3000,
+    "VVIP권": 6000,
+    "랜덤박스": 300,
+    "경험치부스터": 800,
+    "출석보너스권": 700,
+    "강화보호권": 1200,
+    "강화확률업권": 1500,
+    "프로필꾸미기권": 900,
+    "상점할인권": 1600,
+}
+
+SHOP_ALIASES = {
+    "닉네임색": "닉네임색변경권",
+    "닉네임색권": "닉네임색변경권",
+    "색변경권": "닉네임색변경권",
+    "VIP": "VIP권",
+    "vip": "VIP권",
+    "VVIP": "VVIP권",
+    "vvip": "VVIP권",
+    "강화보호": "강화보호권",
+    "강화확률업": "강화확률업권",
+    "프로필꾸미기": "프로필꾸미기권",
+    "상점할인": "상점할인권",
+}
+
+COLOR_PRESETS = {
+    "빨강": 0xFF0000, "빨간색": 0xFF0000, "레드": 0xFF0000,
+    "주황": 0xFF8C00, "주황색": 0xFF8C00, "오렌지": 0xFF8C00,
+    "노랑": 0xFFD700, "노란색": 0xFFD700, "옐로우": 0xFFD700,
+    "초록": 0x00C853, "초록색": 0x00C853, "그린": 0x00C853,
+    "파랑": 0x1E90FF, "파란색": 0x1E90FF, "블루": 0x1E90FF,
+    "보라": 0x9C27B0, "보라색": 0x9C27B0, "퍼플": 0x9C27B0,
+    "분홍": 0xFF69B4, "핑크": 0xFF69B4,
+    "검정": 0x2F3136, "검은색": 0x2F3136,
+    "비공개": 0x292929,
+    "하양": 0xFFFFFF, "흰색": 0xFFFFFF, "화이트": 0xFFFFFF,
+    "민트": 0x00E5B0, "하늘": 0x87CEEB, "골드": 0xFFD700,
+}
+
+
+def normalize_shop_item(item_name: str):
+    item_name = (item_name or "").strip()
+    return SHOP_ALIASES.get(item_name, item_name)
+
+
+def parse_color_value(value: str):
+    raw = (value or "").strip().lower().replace(" ", "")
+    if raw in COLOR_PRESETS:
+        return COLOR_PRESETS[raw]
+    raw = raw.replace("#", "").replace("0x", "")
+    if len(raw) in (3, 6) and all(ch in "0123456789abcdef" for ch in raw):
+        if len(raw) == 3:
+            raw = "".join(ch * 2 for ch in raw)
+        return int(raw, 16)
+    return None
+
+
+def safe_role_text(value: str, *, max_len: int = 20):
+    value = (value or "").strip()
+    value = value.replace("@everyone", "").replace("@here", "")
+    value = re.sub(r"[\n\r\t]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:max_len]
+
+
+def get_inventory_amount(user_id: int, item_name: str):
+    item_name = normalize_shop_item(item_name)
+    names = [item_name]
+    if item_name == "닉네임색변경권":
+        names.append("닉네임색")
+    q = ",".join("?" for _ in names)
+    c.execute(f"SELECT COALESCE(SUM(amount), 0) FROM inventory WHERE user_id=? AND item_name IN ({q})", (user_id, *names))
+    row = c.fetchone()
+    return int(row[0] or 0)
+
+
+def consume_inventory_item(user_id: int, item_name: str, amount: int = 1):
+    item_name = normalize_shop_item(item_name)
+    names = [item_name]
+    if item_name == "닉네임색변경권":
+        names.append("닉네임색")
+
+    remaining = amount
+    for name in names:
+        c.execute("SELECT rowid, amount FROM inventory WHERE user_id=? AND item_name=? AND amount > 0 ORDER BY rowid", (user_id, name))
+        for rowid, have in c.fetchall():
+            if remaining <= 0:
+                break
+            use = min(have, remaining)
+            new_amount = have - use
+            if new_amount <= 0:
+                c.execute("DELETE FROM inventory WHERE rowid=?", (rowid,))
+            else:
+                c.execute("UPDATE inventory SET amount=? WHERE rowid=?", (new_amount, rowid))
+            remaining -= use
+        if remaining <= 0:
+            break
+
+    if remaining > 0:
+        conn.rollback()
+        return False
+    conn.commit()
+    return True
+
+
+def add_user_effect(user_id: int, effect_name: str, amount: int = 1, *, expires_at: str = None):
+    c.execute("SELECT amount FROM user_effects WHERE user_id=? AND effect_name=?", (user_id, effect_name))
+    row = c.fetchone()
+    if row:
+        c.execute(
+            "UPDATE user_effects SET amount=amount+?, expires_at=? WHERE user_id=? AND effect_name=?",
+            (amount, expires_at, user_id, effect_name)
+        )
+    else:
+        c.execute(
+            "INSERT INTO user_effects(user_id, effect_name, amount, expires_at) VALUES (?, ?, ?, ?)",
+            (user_id, effect_name, amount, expires_at)
+        )
+    conn.commit()
+
+
+def get_user_effect_amount(user_id: int, effect_name: str):
+    c.execute("SELECT amount, expires_at FROM user_effects WHERE user_id=? AND effect_name=?", (user_id, effect_name))
+    row = c.fetchone()
+    if not row:
+        return 0
+    amount, expires_at = row
+    if expires_at:
+        try:
+            expire_dt = datetime.datetime.fromisoformat(expires_at)
+            if datetime.datetime.now() >= expire_dt:
+                c.execute("DELETE FROM user_effects WHERE user_id=? AND effect_name=?", (user_id, effect_name))
+                conn.commit()
+                return 0
+        except ValueError:
+            pass
+    return int(amount or 0)
+
+
+def consume_user_effect(user_id: int, effect_name: str, amount: int = 1):
+    have = get_user_effect_amount(user_id, effect_name)
+    if have < amount:
+        return False
+    new_amount = have - amount
+    if new_amount <= 0:
+        c.execute("DELETE FROM user_effects WHERE user_id=? AND effect_name=?", (user_id, effect_name))
+    else:
+        c.execute("UPDATE user_effects SET amount=? WHERE user_id=? AND effect_name=?", (new_amount, user_id, effect_name))
+    conn.commit()
+    return True
+
+
+def has_exp_booster(user_id: int):
+    return get_user_effect_amount(user_id, "경험치부스터") > 0
+
+
+def get_profile_custom(user_id: int):
+    c.execute("SELECT title, description, color, image_url FROM profile_customs WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    return {"title": row[0] or "", "description": row[1] or "", "color": row[2] or "", "image_url": row[3] or ""}
+
+
+def save_profile_custom(user_id: int, title: str, description: str, color: str, image_url: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "INSERT OR REPLACE INTO profile_customs(user_id, title, description, color, image_url, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, title, description, color, image_url, now)
+    )
+    conn.commit()
+
+
+async def get_or_create_simple_role(guild: discord.Guild, name: str, *, color=discord.Color.default(), hoist=False, mentionable=True):
+    role = discord.utils.get(guild.roles, name=name)
+    if role:
+        try:
+            await role.edit(color=color, hoist=hoist, mentionable=mentionable, reason="상점 보상 역할 정리")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return role
+    return await guild.create_role(name=name, color=color, hoist=hoist, mentionable=mentionable, reason="상점 보상 역할 생성")
+
+
+
+def format_shop_items_text():
+    return "".join(f"🛒 **{item}** - {price}P\n" for item, price in SHOP_ITEMS.items())
+
+
+def build_shop_embed():
+    return discord.Embed(
+        title="🛒 만능 봇 통합 상점",
+        description=(
+            f"{format_shop_items_text()}\n"
+            "`/구매`를 입력하면 박스가 뜨고, 상품명과 구매 개수를 직접 적을 수 있어요.\n"
+            "구매한 아이템은 `/인벤토리`에서 확인할 수 있습니다."
+        ),
+        color=BOT_COLOR
+    )
+
+
+def get_inventory_rows(user_id: int):
+    c.execute("SELECT item_name, SUM(amount) FROM inventory WHERE user_id=? GROUP BY item_name ORDER BY item_name", (user_id,))
+    return c.fetchall()
+
+
+def build_inventory_embed(user: discord.User):
+    rows = get_inventory_rows(user.id)
+    embed = discord.Embed(title="🎒 내 인벤토리", color=BOT_COLOR)
+    embed.set_footer(text="/통합상점에서 구매한 아이템이 표시됩니다.")
+    if not rows:
+        embed.description = "비어있습니다. `/통합상점`에서 아이템을 구매해보세요."
+        return embed
+
+    lines = []
+    for item_name, amount in rows:
+        item_name = normalize_shop_item(item_name)
+        lines.append(f"🎁 **{item_name}** x{int(amount or 0)}")
+    embed.description = "\n".join(lines)
+    return embed
+
+
+async def purchase_shop_item(interaction: discord.Interaction, item_name: str, quantity: int = 1):
+    user_id = interaction.user.id
+    item_name = normalize_shop_item(item_name)
+
+    if item_name not in SHOP_ITEMS:
+        return await interaction.response.send_message("❌ 없는 상품입니다. `/통합상점`에서 상품명을 확인해주세요.", ephemeral=True)
+
+    if quantity < 1:
+        return await interaction.response.send_message("❌ 구매 개수는 1개 이상이어야 합니다.", ephemeral=True)
+    if quantity > 99:
+        return await interaction.response.send_message("❌ 한 번에 최대 99개까지만 구매할 수 있습니다.", ephemeral=True)
+
+    original_total = SHOP_ITEMS[item_name] * quantity
+    total_price = original_total
+    point = get_user_point(interaction.guild.id, user_id)
+    discount_used = False
+
+    if item_name != "상점할인권" and get_inventory_amount(user_id, "상점할인권") > 0:
+        total_price = int(original_total * 0.8)
+        discount_used = True
+
+    if point < total_price:
+        return await interaction.response.send_message(
+            f"❌ 포인트가 부족합니다.\n필요 포인트: **{total_price}P**\n보유 포인트: **{point}P**",
+            ephemeral=True
+        )
+
+    point -= total_price
+    set_user_point(interaction.guild.id, user_id, point)
+
+    if discount_used:
+        consume_inventory_item(user_id, "상점할인권", 1)
+
+    c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, item_name, quantity))
+    conn.commit()
+
+    discount_text = "\n🎫 상점할인권 1개 사용: 20% 할인 적용" if discount_used else ""
+    embed = discord.Embed(
+        title="✅ 구매 완료",
+        description=(
+            f"상품: **{item_name}**\n"
+            f"개수: **{quantity}개**\n"
+            f"결제 금액: **{total_price}P**{discount_text}\n"
+            f"남은 포인트: **{point}P**"
+        ),
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class PurchaseModal(discord.ui.Modal, title="🛒 상품 구매"):
+    def __init__(self, default_item: str = ""):
+        super().__init__()
+        self.item_input = discord.ui.TextInput(
+            label="상품명",
+            placeholder="예: 랜덤박스, 경험치부스터, 강화보호권",
+            default=default_item,
+            required=True,
+            max_length=30,
+        )
+        self.amount_input = discord.ui.TextInput(
+            label="구매 개수",
+            placeholder="예: 1",
+            default="1",
+            required=True,
+            max_length=3,
+        )
+        self.add_item(self.item_input)
+        self.add_item(self.amount_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            quantity = int(str(self.amount_input.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("❌ 구매 개수는 숫자로 입력해주세요.", ephemeral=True)
+        await purchase_shop_item(interaction, str(self.item_input.value), quantity)
+
+
+class ShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def open_purchase_modal(self, interaction: discord.Interaction, item_name: str = ""):
+        await interaction.response.send_modal(PurchaseModal(item_name))
+
+    async def show_inventory(self, interaction: discord.Interaction):
+        await interaction.response.send_message(embed=build_inventory_embed(interaction.user), ephemeral=True)
+
+    @discord.ui.button(label="직접 구매", emoji="🛒", style=discord.ButtonStyle.green)
+    async def buy_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.open_purchase_modal(interaction)
+
+    @discord.ui.button(label="랜덤박스", emoji="🎲", style=discord.ButtonStyle.blurple)
+    async def buy_random_box(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.open_purchase_modal(interaction, "랜덤박스")
+
+    @discord.ui.button(label="경험치부스터", emoji="✨", style=discord.ButtonStyle.blurple)
+    async def buy_exp_booster(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.open_purchase_modal(interaction, "경험치부스터")
+
+    @discord.ui.button(label="강화보호권", emoji="🛡️", style=discord.ButtonStyle.gray)
+    async def buy_protect(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.open_purchase_modal(interaction, "강화보호권")
+
+    @discord.ui.button(label="🎒 인벤토리 보기", style=discord.ButtonStyle.secondary)
+    async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_inventory(interaction)
+
+
+@bot.tree.command(name="통합상점", description="통합 상점 패널을 엽니다.")
+async def integrated_shop(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_shop_embed(), view=ShopView(), ephemeral=True)
+
+
+@bot.tree.command(name="구매", description="박스에 상품명과 개수를 입력해서 구매합니다.")
+async def buy_shop_item_command(interaction: discord.Interaction):
+    await interaction.response.send_modal(PurchaseModal())
+
+
+@bot.tree.command(name="인벤토리", description="/통합상점에서 구매한 아이템을 확인합니다.")
+async def inventory_command(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_inventory_embed(interaction.user), ephemeral=True)
+
+
+@bot.tree.command(name="닉네임색변경권", description="구매한 닉네임색변경권으로 원하는 닉네임 색 역할을 받습니다.")
+@app_commands.describe(색상="원하는 색상 예: 핑크, 파랑, 골드, #FFB6C1")
+async def use_nickname_color_ticket(interaction: discord.Interaction, 색상: str):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    color_value = parse_color_value(색상)
+    if color_value is None:
+        return await interaction.response.send_message("❌ 색상은 `핑크`, `파랑`, `골드` 또는 `#FFB6C1` 같은 HEX로 입력해주세요.", ephemeral=True)
+
+    if get_inventory_amount(interaction.user.id, "닉네임색변경권") < 1:
+        return await interaction.response.send_message("❌ 인벤토리에 `닉네임색변경권`이 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+
+    if not consume_inventory_item(interaction.user.id, "닉네임색변경권", 1):
+        return await interaction.response.send_message("❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+
+    role_name = f"🎨 색상-{interaction.user.id}"
+    try:
+        role = await get_or_create_simple_role(
+            interaction.guild,
+            role_name,
+            color=discord.Color(color_value),
+            hoist=False,
+            mentionable=False,
+        )
+        await interaction.user.add_roles(role, reason="닉네임색변경권 사용")
+    except discord.Forbidden:
+        return await interaction.response.send_message("❌ 봇 역할 위치 또는 권한이 부족해서 색상 역할을 줄 수 없습니다.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ 색상 변경 실패: `{e}`", ephemeral=True)
+
+    await interaction.response.send_message(f"✅ 닉네임 색상을 `{색상}` 으로 변경했습니다!\n색이 안 보이면 봇 역할을 색상 역할보다 위로 올려주세요.", ephemeral=True)
+
+
+@bot.tree.command(name="칭호권", description="구매한 칭호권으로 원하는 칭호 역할을 만듭니다.")
+@app_commands.describe(칭호="원하는 칭호 예: 귀요미, 서버요정, 전설의냥이")
+async def use_title_ticket(interaction: discord.Interaction, 칭호: str):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    title = safe_role_text(칭호, max_len=20)
+    if len(title) < 1:
+        return await interaction.response.send_message("❌ 사용할 수 없는 칭호입니다.", ephemeral=True)
+
+    if get_inventory_amount(interaction.user.id, "칭호권") < 1:
+        return await interaction.response.send_message("❌ 인벤토리에 `칭호권`이 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+
+    if not consume_inventory_item(interaction.user.id, "칭호권", 1):
+        return await interaction.response.send_message("❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+
+    role_name = f"🏷️ {title}"
+    try:
+        role = await get_or_create_simple_role(
+            interaction.guild,
+            role_name[:100],
+            color=discord.Color.random(),
+            hoist=False,
+            mentionable=True,
+        )
+        await interaction.user.add_roles(role, reason="칭호권 사용")
+    except discord.Forbidden:
+        return await interaction.response.send_message("❌ 봇 역할 위치 또는 권한이 부족해서 칭호 역할을 줄 수 없습니다.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ 칭호 생성 실패: `{e}`", ephemeral=True)
+
+    await interaction.response.send_message(f"✅ 칭호 {role.mention} 를 지급했습니다!", ephemeral=True)
+
+
+@bot.tree.command(name="vip", description="구매한 VIP권으로 VIP 역할을 받습니다.")
+async def use_vip_ticket(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    if get_inventory_amount(interaction.user.id, "VIP권") < 1:
+        return await interaction.response.send_message("❌ 인벤토리에 `VIP권`이 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+
+    if not consume_inventory_item(interaction.user.id, "VIP권", 1):
+        return await interaction.response.send_message("❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+
+    try:
+        role = await get_or_create_simple_role(interaction.guild, "VIP", color=discord.Color.gold(), hoist=True, mentionable=True)
+        await interaction.user.add_roles(role, reason="VIP권 사용")
+    except discord.Forbidden:
+        return await interaction.response.send_message("❌ 봇 역할 위치 또는 권한이 부족해서 VIP 역할을 줄 수 없습니다.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ VIP 지급 실패: `{e}`", ephemeral=True)
+
+    await interaction.response.send_message(f"✅ {role.mention} 역할을 지급했습니다!", ephemeral=True)
+
+
+
+RANDOM_BOX_POINT_REWARDS = list(range(100, 301))  # 100~300P 랜덤
+RANDOM_BOX_RARE_ITEMS = [
+    item_name
+    for item_name in SHOP_ITEMS.keys()
+    if item_name != "랜덤박스"
+]
+
+RANDOM_BOX_RARE_ITEMS.extend([
+    "강화 보호권",
+    "칭호권"
+])
+
+
+@bot.tree.command(name="랜덤박스", description="랜덤박스를 열어 포인트/상자/아이템 중 하나를 얻습니다. 최대 5개까지 연속 사용 가능합니다.")
+@app_commands.describe(횟수="사용할 랜덤박스 개수 (1~5개)")
+async def use_random_box(interaction: discord.Interaction, 횟수: int = 1):
+    user_id = interaction.user.id
+
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    if 횟수 < 1 or 횟수 > 5:
+        return await interaction.response.send_message("❌ 랜덤박스는 1~5개까지만 연속으로 사용할 수 있습니다.", ephemeral=True)
+
+    box_amount = get_inventory_amount(user_id, "랜덤박스")
+    if box_amount < 횟수:
+        return await interaction.response.send_message(
+            f"❌ 랜덤박스가 부족합니다. 현재 보유: `{box_amount}개` / 필요: `{횟수}개`",
+            ephemeral=True
+        )
+
+    point = get_user_point(interaction.guild.id, user_id)
+    total_point_reward = 0
+    result_lines = []
+    color = BOT_COLOR
+
+    for i in range(1, 횟수 + 1):
+        if not consume_inventory_item(user_id, "랜덤박스", 1):
+            return await interaction.response.send_message("❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+
+        roll = random.randint(1, 100)
+
+        if roll <= 60:
+            reward = random.randint(100, 500)
+            total_point_reward += reward
+            result_lines.append(f"`{i}회차` 💰 포인트 보상 **+{reward}P** `60%`")
+            color = 0xFFD700
+
+        elif roll <= 89:
+            c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, "랜덤박스", 1))
+            conn.commit()
+            result_lines.append(f"`{i}회차` 🎁 랜덤박스 **1개 재당첨** `29%`")
+
+        elif roll <= 99:
+            reward = 10
+            total_point_reward += reward
+            result_lines.append(f"`{i}회차` 💥 꽝... 그래도 **+{reward}P** `10%`")
+
+        else:
+            item_name = random.choice(RANDOM_BOX_RARE_ITEMS)
+            c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, item_name, 1))
+            conn.commit()
+            result_lines.append(f"`{i}회차` 🌈 레어 아이템 **{item_name} 1개** `1%`")
+            color = 0x9B59B6
+
+    if total_point_reward:
+        point += total_point_reward
+        set_user_point(interaction.guild.id, user_id, point)
+
+    remaining_boxes = get_inventory_amount(user_id, "랜덤박스")
+
+    embed = discord.Embed(
+        title=f"🎁 랜덤박스 {횟수}회 결과",
+        description=f"{interaction.user.mention} 님이 랜덤박스를 열었습니다!\n\n" + "\n".join(result_lines),
+        color=color
+    )
+    embed.add_field(name="총 획득 포인트", value=f"**{total_point_reward}P**", inline=True)
+    embed.add_field(name="현재 포인트", value=f"**{point}P**", inline=True)
+    embed.add_field(name="남은 랜덤박스", value=f"**{remaining_boxes}개**", inline=True)
+    embed.set_footer(text="확률: 포인트 60% / 랜덤박스 29% / 꽝+10P 10% / 레어 아이템 1%")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="경험치부스터", description="경험치부스터를 사용해 24시간 동안 채팅/음성 경험치를 2배로 받습니다.")
+async def use_exp_booster(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    if get_inventory_amount(user_id, "경험치부스터") < 1:
+        return await interaction.response.send_message("❌ 인벤토리에 `경험치부스터`가 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+    if not consume_inventory_item(user_id, "경험치부스터", 1):
+        return await interaction.response.send_message("❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+    expires_at = (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
+    add_user_effect(user_id, "경험치부스터", 1, expires_at=expires_at)
+    await interaction.response.send_message("✅ 경험치부스터 사용 완료! 24시간 동안 채팅/음성 경험치가 2배로 지급됩니다.", ephemeral=True)
+
+
+@bot.tree.command(name="출석보너스권", description="다음 출석 보상을 300P 추가로 받을 수 있게 안내합니다.")
+async def use_attendance_bonus_ticket(interaction: discord.Interaction):
+    amount = get_inventory_amount(interaction.user.id, "출석보너스권")
+    if amount < 1:
+        return await interaction.response.send_message("❌ 인벤토리에 `출석보너스권`이 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+    await interaction.response.send_message(f"🎁 출석보너스권 보유: **{amount}개**\n`/출석` 또는 `/출첵`을 하면 자동으로 1개가 소모되고 +300P를 추가로 받습니다.", ephemeral=True)
+
+
+@bot.tree.command(name="강화보호권", description="보유한 강화보호권 개수를 확인합니다. 강화 파괴 시 자동으로 1개 소모됩니다.")
+async def use_enhance_protect_ticket(interaction: discord.Interaction):
+    amount = get_inventory_amount(interaction.user.id, "강화보호권")
+    await interaction.response.send_message(f"🛡️ 강화보호권 보유: **{amount}개**\n`/강화 아이템`에서 파괴가 뜨면 자동으로 1개 소모되어 파괴를 막습니다.", ephemeral=True)
+
+
+@bot.tree.command(name="강화확률업권", description="보유한 강화확률업권 개수를 확인합니다. /강화 시 자동으로 1개 소모됩니다.")
+async def use_enhance_rate_ticket(interaction: discord.Interaction):
+    amount = get_inventory_amount(interaction.user.id, "강화확률업권")
+    await interaction.response.send_message(f"🎯 강화확률업권 보유: **{amount}개**\n`/강화 아이템`을 할 때마다 자동으로 1개 소모되고 성공률이 +15% 올라갑니다.", ephemeral=True)
+
+
+class ProfileCustomModal(discord.ui.Modal, title="프로필 꾸미기"):
+    def __init__(self):
+        super().__init__()
+        self.title_input = discord.ui.TextInput(label="프로필 제목", placeholder="예: 🌸 냥이의 프로필", required=False, max_length=80)
+        self.description_input = discord.ui.TextInput(label="소개 문구", placeholder="예: 오늘도 즐거운 하루!", required=False, max_length=300, style=discord.TextStyle.paragraph)
+        self.color_input = discord.ui.TextInput(label="색상", placeholder="예: 핑크 또는 #FFB6C1", required=False, max_length=20)
+        self.image_input = discord.ui.TextInput(label="이미지 URL", placeholder="https://...", required=False, max_length=400)
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        if get_inventory_amount(user_id, "프로필꾸미기권") < 1:
+            return await interaction.response.send_message("❌ 인벤토리에 `프로필꾸미기권`이 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+        color_raw = str(self.color_input.value).strip()
+        if color_raw and parse_color_value(color_raw) is None:
+            return await interaction.response.send_message("❌ 색상은 `핑크`, `파랑`, `#FFB6C1` 같은 형식으로 입력해주세요.", ephemeral=True)
+        image_url = safe_url(str(self.image_input.value)) if str(self.image_input.value).strip() else ""
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지 URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, "프로필꾸미기권", 1):
+            return await interaction.response.send_message("❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        save_profile_custom(
+            user_id,
+            str(self.title_input.value).strip() or "⭐ 만능 봇 프로필",
+            str(self.description_input.value).strip(),
+            color_raw,
+            image_url,
+        )
+        await interaction.response.send_message("✅ 프로필 꾸미기를 저장했습니다! 이제 `/프로필`에 적용됩니다.", ephemeral=True)
+
+
+@bot.tree.command(name="프로필꾸미기권", description="프로필꾸미기권으로 /프로필 표시를 꾸밉니다.")
+async def use_profile_custom_ticket(interaction: discord.Interaction):
+    if get_inventory_amount(interaction.user.id, "프로필꾸미기권") < 1:
+        return await interaction.response.send_message("❌ 인벤토리에 `프로필꾸미기권`이 없습니다. `/통합상점`에서 구매해주세요.", ephemeral=True)
+    await interaction.response.send_modal(ProfileCustomModal())
+
+
+@bot.tree.command(name="상점할인권", description="상점할인권 사용법을 확인합니다. 구매 시 자동으로 20% 할인됩니다.")
+async def use_shop_discount_ticket(interaction: discord.Interaction):
+    amount = get_inventory_amount(interaction.user.id, "상점할인권")
+    await interaction.response.send_message(f"🎫 상점할인권 보유: **{amount}개**\n다음 `/구매` 구매 때 자동으로 1개가 소모되고 20% 할인됩니다.", ephemeral=True)
+
+@bot.tree.command(name="출석", description="하루 한 번 출석하고 포인트를 받습니다.")
+async def attendance(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    user_id = interaction.user.id
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    point, attendance_count, streak, last_attendance = get_or_create_user(interaction.guild.id, user_id)
+
+    if last_attendance == today:
+        return await interaction.response.send_message("❌ 오늘은 이미 출석했습니다!", ephemeral=True)
+
+    yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    streak = streak + 1 if last_attendance == yesterday else 1
+    attendance_count += 1
+
+    base_reward = 100
+    reward = base_reward
+    bonus_lines = []
+    milestone_lines = []
+
+    # 🎁 출석보너스권: 기본 보상에 추가 지급
+    if get_inventory_amount(user_id, "출석보너스권") > 0:
+        consume_inventory_item(user_id, "출석보너스권", 1)
+        reward += 300
+        bonus_lines.append("🎁 출석보너스권 1개 사용: +300P 추가")
+
+    # 🎊 누적 출석 마일스톤 보상
+    # 10일마다 2배, 30일마다 3배, 50일마다 5배, 100일마다 10배로 보상 강화
+    if attendance_count % 100 == 0:
+        reward = base_reward * 10 + (300 if "🎁 출석보너스권 1개 사용: +300P 추가" in bonus_lines else 0)
+        milestone_lines.append("👑 100일 누적 출석 달성: 기본 보상 10배 지급")
+    elif attendance_count % 50 == 0:
+        reward = base_reward * 5 + (300 if "🎁 출석보너스권 1개 사용: +300P 추가" in bonus_lines else 0)
+        milestone_lines.append("💎 50일 누적 출석 달성: 기본 보상 5배 지급")
+    elif attendance_count % 30 == 0:
+        reward = base_reward * 3 + (300 if "🎁 출석보너스권 1개 사용: +300P 추가" in bonus_lines else 0)
+        milestone_lines.append("🌟 30일 누적 출석 달성: 기본 보상 3배 지급")
+    elif attendance_count % 10 == 0:
+        reward = base_reward * 2 + (300 if "🎁 출석보너스권 1개 사용: +300P 추가" in bonus_lines else 0)
+        milestone_lines.append("🎉 10일 누적 출석 달성: 기본 보상 2배 지급")
+
+    # 10일마다 랜덤박스 지급
+    if attendance_count % 10 == 0:
+        box_amount = 3 if attendance_count % 50 == 0 else 1
+        c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, "랜덤박스", box_amount))
+        milestone_lines.append(f"🎁 랜덤박스 {box_amount}개 지급")
+
+    # 30일마다 VIP 1일 지급
+    if attendance_count % 30 == 0:
+        expires_at = (datetime.datetime.now() + datetime.timedelta(days=1)).isoformat()
+        add_user_effect(user_id, f"출석VIP1일:{interaction.guild.id}", 1, expires_at=expires_at)
+        try:
+            vip_role = await get_or_create_simple_role(
+                interaction.guild,
+                "VIP",
+                color=discord.Color.gold(),
+                hoist=True,
+                mentionable=True
+            )
+            await interaction.user.add_roles(vip_role, reason="30일 출석 보상 VIP 1일")
+            milestone_lines.append(f"💎 {vip_role.mention} 1일 지급")
+        except discord.Forbidden:
+            milestone_lines.append("⚠️ VIP 역할 지급 실패: 봇 역할 위치 또는 권한 부족")
+        except discord.HTTPException:
+            milestone_lines.append("⚠️ VIP 역할 지급 실패: 디스코드 처리 오류")
+
+    # 100일마다 특별 칭호 지급
+    if attendance_count % 100 == 0:
+        try:
+            title_role = await get_or_create_simple_role(
+                interaction.guild,
+                "👑 출석 100일",
+                color=discord.Color.purple(),
+                hoist=False,
+                mentionable=True
+            )
+            await interaction.user.add_roles(title_role, reason="100일 출석 특별 칭호")
+            milestone_lines.append(f"👑 특별 칭호 {title_role.mention} 지급")
+        except discord.Forbidden:
+            milestone_lines.append("⚠️ 100일 칭호 지급 실패: 봇 역할 위치 또는 권한 부족")
+        except discord.HTTPException:
+            milestone_lines.append("⚠️ 100일 칭호 지급 실패: 디스코드 처리 오류")
+
+    point += reward
+    c.execute(
+        "UPDATE users SET point=?, attendance_count=?, streak=?, last_attendance=? WHERE guild_id=? AND user_id=?",
+        (point, attendance_count, streak, today, interaction.guild.id, user_id)
+    )
+    conn.commit()
+    try:
+        mark_daily_mission_attendance(interaction.guild.id, user_id)
+    except Exception:
+        pass
+
+    embed = discord.Embed(
+        title="🎀 출석 완료!",
+        description=(
+            f"{interaction.user.mention} 님 출석이 완료됐어요!\n\n"
+            f"💰 획득 포인트: **+{reward:,}P**\n"
+            f"📅 누적 출석: **{attendance_count}일**\n"
+            f"🔥 연속 출석: **{streak}일**\n"
+            f"💎 보유 포인트: **{point:,}P**"
+        ),
+        color=BOT_COLOR
+    )
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+    if bonus_lines:
+        embed.add_field(name="🎫 사용된 아이템", value="\n".join(bonus_lines), inline=False)
+
+    if milestone_lines:
+        embed.add_field(name="🎊 출석 마일스톤 보상", value="\n".join(milestone_lines), inline=False)
+
+    embed.set_footer(text="10일마다 2배 보상, 30일마다 VIP 1일, 100일마다 특별 칭호가 지급됩니다.")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="출첵", description="하루 한 번 출석하고 포인트를 받습니다. /출석과 같습니다.")
+async def attendance_short(interaction: discord.Interaction):
+    await attendance(interaction)
+
+
+@bot.tree.command(name="프로필", description="유저 프로필을 확인합니다.")
+async def profile(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    exp, level = get_or_create_level_user(target.id)
+    point, attendance_count, streak, _ = get_or_create_user(interaction.guild.id, target.id)
+    c.execute("SELECT COUNT(*) FROM warnings WHERE user_id=?", (target.id,))
+    warning_count = c.fetchone()[0]
+    custom = get_profile_custom(target.id)
+    profile_title = custom["title"] if custom and custom.get("title") else "⭐ 만능 봇 프로필"
+    profile_color = normalize_embed_color(custom.get("color", "")) if custom else BOT_COLOR
+    embed = discord.Embed(title=profile_title, color=profile_color)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    if custom and custom.get("image_url"):
+        embed.set_image(url=custom["image_url"])
+    if custom and custom.get("description"):
+        embed.description = custom["description"][:300]
+    embed.add_field(name="닉네임", value=target.mention, inline=False)
+    embed.add_field(name="레벨", value=f"Lv.{level}", inline=True)
+    embed.add_field(name="경험치", value=f"{exp} / {level * 100} EXP", inline=True)
+    embed.add_field(name="경고횟수", value=f"{warning_count}회", inline=True)
+    embed.add_field(name="포인트", value=f"{point}P", inline=True)
+    embed.add_field(name="출석일수", value=f"{attendance_count}일", inline=True)
+    embed.add_field(name="연속출석", value=f"{streak}일", inline=True)
+    equipped_title = get_equipped_title(interaction.guild.id, target.id)
+    owned_title_count = count_user_titles(interaction.guild.id, target.id)
+    embed.add_field(name="대표 칭호", value=f"`{equipped_title}`" if equipped_title else "미장착", inline=True)
+    embed.add_field(name="보유 칭호", value=f"{owned_title_count}개", inline=True)
+    embed.add_field(name="가입일", value=target.joined_at.strftime("%Y-%m-%d") if target.joined_at else "알 수 없음", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="레벨", description="내 레벨을 확인합니다.")
+async def level_check(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    exp, level = get_or_create_level_user(target.id)
+    embed = discord.Embed(title="📊 레벨 정보", color=BOT_COLOR)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="유저", value=target.mention, inline=False)
+    embed.add_field(name="레벨", value=f"Lv.{level}", inline=True)
+    embed.add_field(name="경험치", value=f"{exp} / {level * 100} EXP", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+async def send_ranking(interaction, query, title, formatter, color=discord.Color.gold()):
+    c.execute(query)
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("아직 데이터가 없습니다.")
+    text = "".join(formatter(i, row) for i, row in enumerate(rows, start=1))
+    embed = discord.Embed(title=title, description=text, color=color)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="포인트랭킹", description="포인트 TOP 10을 확인합니다.")
+async def point_ranking(interaction: discord.Interaction):
+    await send_ranking(interaction, "SELECT user_id, point FROM users WHERE guild_id=%d ORDER BY point DESC LIMIT 10" % interaction.guild.id, "🏆 포인트 랭킹 TOP 10", lambda i, row: f"**{i}위** <@{row[0]}> - {row[1]}P\n")
+
+
+# =========================
+# 가상 주식 시스템
+# =========================
+
+STOCK_LIST = {
+    "RIZE": {"name": "리제전자", "base": 1200, "emoji": "💗"},
+    "NYANG": {"name": "냥코푸드", "base": 900, "emoji": "🐾"},
+    "MOON": {"name": "달빛게임즈", "base": 1500, "emoji": "🌙"},
+    "STAR": {"name": "별빛엔터", "base": 700, "emoji": "⭐"},
+    "CLOUD": {"name": "구름소프트", "base": 2000, "emoji": "☁️"},
+}
+
+
+def normalize_stock_code(value: str):
+    value = (value or "").strip().upper()
+    for code, info in STOCK_LIST.items():
+        if value == code or value == info["name"].upper() or value == info["name"]:
+            return code
+    return None
+
+
+def ensure_stock_market(guild_id: int):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for code, info in STOCK_LIST.items():
+        c.execute("SELECT stock_code FROM stock_prices WHERE guild_id=? AND stock_code=?", (guild_id, code))
+        if c.fetchone() is None:
+            c.execute(
+                "INSERT INTO stock_prices(guild_id, stock_code, stock_name, price, last_price, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, code, info["name"], info["base"], info["base"], now)
+            )
+    conn.commit()
+
+
+def update_stock_prices(guild_id: int, force: bool = False):
+    """서버별 가상 주식 가격을 일정 시간마다 랜덤 변동합니다."""
+    ensure_stock_market(guild_id)
+    now_dt = datetime.datetime.now()
+    now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    updated = False
+
+    for code, info in STOCK_LIST.items():
+        c.execute(
+            "SELECT price, updated_at FROM stock_prices WHERE guild_id=? AND stock_code=?",
+            (guild_id, code)
+        )
+        row = c.fetchone()
+        if not row:
+            continue
+        price, updated_at = row
+        should_update = force
+        if not should_update:
+            try:
+                last_dt = datetime.datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S") if updated_at else None
+                should_update = last_dt is None or (now_dt - last_dt).total_seconds() >= 1800
+            except ValueError:
+                should_update = True
+
+        if should_update:
+            change_percent = random.randint(-15, 15)
+            if change_percent == 0:
+                change_percent = random.choice([-3, 3])
+            new_price = max(10, int(price * (100 + change_percent) / 100))
+            c.execute(
+                "UPDATE stock_prices SET last_price=?, price=?, updated_at=? WHERE guild_id=? AND stock_code=?",
+                (price, new_price, now, guild_id, code)
+            )
+            updated = True
+
+    if updated:
+        conn.commit()
+
+
+def get_stock_rows(guild_id: int):
+    update_stock_prices(guild_id)
+    c.execute(
+        "SELECT stock_code, stock_name, price, last_price, updated_at FROM stock_prices WHERE guild_id=? ORDER BY stock_code",
+        (guild_id,)
+    )
+    return c.fetchall()
+
+
+def get_stock_price(guild_id: int, stock_code: str):
+    update_stock_prices(guild_id)
+    c.execute("SELECT price FROM stock_prices WHERE guild_id=? AND stock_code=?", (guild_id, stock_code))
+    row = c.fetchone()
+    return row[0] if row else None
+
+
+def stock_change_text(price: int, last_price: int):
+    diff = price - last_price
+    if diff > 0:
+        return f"📈 +{diff}P"
+    if diff < 0:
+        return f"📉 {diff}P"
+    return "➖ 0P"
+
+
+def build_stock_market_embed(guild: discord.Guild):
+    rows = get_stock_rows(guild.id)
+    embed = discord.Embed(
+        title="📈 가상 주식 시장",
+        description=(
+            "포인트로 사고파는 **서버 전용 가상 주식**입니다.\n"
+            "실제 투자 기능이 아니라 서버 게임용이에요.\n\n"
+            "`/주식매수 종목 수량` 으로 구매\n"
+            "`/주식매도 종목 수량` 으로 판매\n"
+            "`/내주식` 으로 보유 주식 확인"
+        ),
+        color=discord.Color.gold()
+    )
+    for code, name, price, last_price, updated_at in rows:
+        emoji = STOCK_LIST.get(code, {}).get("emoji", "📦")
+        embed.add_field(
+            name=f"{emoji} {name} `{code}`",
+            value=f"현재가 **{price:,}P**\n변동 {stock_change_text(price, last_price)}",
+            inline=True
+        )
+    embed.set_footer(text="가격은 약 30분마다 자동 변동됩니다.")
+    return embed
+
+
+stock_choices = [
+    app_commands.Choice(name=f"{info['emoji']} {info['name']} ({code})", value=code)
+    for code, info in STOCK_LIST.items()
+]
+
+
+@bot.tree.command(name="주식", description="서버 가상 주식 시장을 박스 형태로 확인합니다.")
+async def stock_market(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    await interaction.response.send_message(embed=build_stock_market_embed(interaction.guild))
+
+
+@bot.tree.command(name="주식새로고침", description="관리자 전용: 가상 주식 가격을 즉시 변동합니다.")
+async def stock_refresh(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_bot_manager(interaction):
+        return
+    update_stock_prices(interaction.guild.id, force=True)
+    await interaction.response.send_message(embed=build_stock_market_embed(interaction.guild))
+
+
+@bot.tree.command(name="주식매수", description="포인트로 가상 주식을 구매합니다.")
+@app_commands.choices(종목=stock_choices)
+async def stock_buy(interaction: discord.Interaction, 종목: app_commands.Choice[str], 수량: int):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if 수량 <= 0:
+        return await interaction.response.send_message("❌ 수량은 1개 이상 입력해주세요.", ephemeral=True)
+
+    code = normalize_stock_code(종목.value)
+    if code is None:
+        return await interaction.response.send_message("❌ 없는 종목입니다. `/주식`으로 종목을 확인해주세요.", ephemeral=True)
+
+    price = get_stock_price(interaction.guild.id, code)
+    total = price * 수량
+    user_id = interaction.user.id
+    point = get_user_point(interaction.guild.id, user_id)
+
+    if point < total:
+        return await interaction.response.send_message(
+            f"❌ 포인트가 부족합니다.\n필요 포인트: **{total:,}P**\n보유 포인트: **{point:,}P**",
+            ephemeral=True
+        )
+
+    c.execute(
+        "SELECT amount, avg_price FROM stock_holdings WHERE guild_id=? AND user_id=? AND stock_code=?",
+        (interaction.guild.id, user_id, code)
+    )
+    row = c.fetchone()
+    if row:
+        old_amount, old_avg = row
+        new_amount = old_amount + 수량
+        new_avg = int(((old_amount * old_avg) + total) / new_amount)
+        c.execute(
+            "UPDATE stock_holdings SET amount=?, avg_price=? WHERE guild_id=? AND user_id=? AND stock_code=?",
+            (new_amount, new_avg, interaction.guild.id, user_id, code)
+        )
+    else:
+        new_amount = 수량
+        new_avg = price
+        c.execute(
+            "INSERT INTO stock_holdings(guild_id, user_id, stock_code, amount, avg_price) VALUES (?, ?, ?, ?, ?)",
+            (interaction.guild.id, user_id, code, 수량, price)
+        )
+
+    set_user_point(interaction.guild.id, user_id, point - total)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "INSERT INTO stock_logs(guild_id, user_id, stock_code, action, amount, price, total, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (interaction.guild.id, user_id, code, "BUY", 수량, price, total, now)
+    )
+    conn.commit()
+
+    info = STOCK_LIST[code]
+    embed = discord.Embed(title="🛒 주식 매수 완료", color=discord.Color.green())
+    embed.add_field(name="종목", value=f"{info['emoji']} **{info['name']}** `{code}`", inline=False)
+    embed.add_field(name="수량", value=f"**{수량:,}주**", inline=True)
+    embed.add_field(name="매수가", value=f"**{price:,}P**", inline=True)
+    embed.add_field(name="총 사용", value=f"**{total:,}P**", inline=True)
+    embed.add_field(name="보유 수량", value=f"**{new_amount:,}주**", inline=True)
+    embed.add_field(name="평균 단가", value=f"**{new_avg:,}P**", inline=True)
+    embed.add_field(name="남은 포인트", value=f"**{get_user_point(interaction.guild.id, user_id):,}P**", inline=True)
+    embed.set_footer(text="가상 주식은 실제 투자와 관련 없는 서버 게임입니다.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="주식매도", description="보유한 가상 주식을 판매합니다.")
+@app_commands.choices(종목=stock_choices)
+async def stock_sell(interaction: discord.Interaction, 종목: app_commands.Choice[str], 수량: int):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if 수량 <= 0:
+        return await interaction.response.send_message("❌ 수량은 1개 이상 입력해주세요.", ephemeral=True)
+
+    code = normalize_stock_code(종목.value)
+    if code is None:
+        return await interaction.response.send_message("❌ 없는 종목입니다. `/주식`으로 종목을 확인해주세요.", ephemeral=True)
+
+    user_id = interaction.user.id
+    c.execute(
+        "SELECT amount, avg_price FROM stock_holdings WHERE guild_id=? AND user_id=? AND stock_code=?",
+        (interaction.guild.id, user_id, code)
+    )
+    row = c.fetchone()
+    if not row or row[0] < 수량:
+        have = row[0] if row else 0
+        return await interaction.response.send_message(f"❌ 보유 수량이 부족합니다.\n현재 보유: **{have:,}주**", ephemeral=True)
+
+    amount, avg_price = row
+    price = get_stock_price(interaction.guild.id, code)
+    total = price * 수량
+    new_amount = amount - 수량
+    if new_amount <= 0:
+        c.execute(
+            "DELETE FROM stock_holdings WHERE guild_id=? AND user_id=? AND stock_code=?",
+            (interaction.guild.id, user_id, code)
+        )
+    else:
+        c.execute(
+            "UPDATE stock_holdings SET amount=? WHERE guild_id=? AND user_id=? AND stock_code=?",
+            (new_amount, interaction.guild.id, user_id, code)
+        )
+
+    point = get_user_point(interaction.guild.id, user_id)
+    set_user_point(interaction.guild.id, user_id, point + total)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "INSERT INTO stock_logs(guild_id, user_id, stock_code, action, amount, price, total, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (interaction.guild.id, user_id, code, "SELL", 수량, price, total, now)
+    )
+    conn.commit()
+
+    profit = (price - avg_price) * 수량
+    profit_text = f"+{profit:,}P" if profit >= 0 else f"{profit:,}P"
+    info = STOCK_LIST[code]
+    embed = discord.Embed(title="💸 주식 매도 완료", color=discord.Color.blue())
+    embed.add_field(name="종목", value=f"{info['emoji']} **{info['name']}** `{code}`", inline=False)
+    embed.add_field(name="수량", value=f"**{수량:,}주**", inline=True)
+    embed.add_field(name="매도가", value=f"**{price:,}P**", inline=True)
+    embed.add_field(name="총 획득", value=f"**{total:,}P**", inline=True)
+    embed.add_field(name="손익", value=f"**{profit_text}**", inline=True)
+    embed.add_field(name="남은 수량", value=f"**{new_amount:,}주**", inline=True)
+    embed.add_field(name="보유 포인트", value=f"**{get_user_point(interaction.guild.id, user_id):,}P**", inline=True)
+    embed.set_footer(text="가상 주식은 실제 투자와 관련 없는 서버 게임입니다.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="내주식", description="내가 보유한 가상 주식을 확인합니다.")
+async def my_stocks(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    update_stock_prices(interaction.guild.id)
+    user_id = interaction.user.id
+    c.execute(
+        "SELECT stock_code, amount, avg_price FROM stock_holdings WHERE guild_id=? AND user_id=? AND amount > 0",
+        (interaction.guild.id, user_id)
+    )
+    rows = c.fetchall()
+    point = get_user_point(interaction.guild.id, user_id)
+    embed = discord.Embed(title="📦 내 주식 보유 현황", color=BOT_COLOR)
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.add_field(name="💰 보유 포인트", value=f"**{point:,}P**", inline=False)
+
+    if not rows:
+        embed.description = "아직 보유한 주식이 없습니다. `/주식`에서 종목을 확인해보세요."
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    total_eval = 0
+    total_buy = 0
+    for code, amount, avg_price in rows:
+        price = get_stock_price(interaction.guild.id, code)
+        eval_value = price * amount
+        buy_value = avg_price * amount
+        profit = eval_value - buy_value
+        total_eval += eval_value
+        total_buy += buy_value
+        profit_text = f"+{profit:,}P" if profit >= 0 else f"{profit:,}P"
+        info = STOCK_LIST.get(code, {"name": code, "emoji": "📦"})
+        embed.add_field(
+            name=f"{info['emoji']} {info['name']} `{code}`",
+            value=(
+                f"보유 **{amount:,}주**\n"
+                f"평단 **{avg_price:,}P** / 현재 **{price:,}P**\n"
+                f"평가 **{eval_value:,}P** / 손익 **{profit_text}**"
+            ),
+            inline=False
+        )
+
+    total_profit = total_eval - total_buy
+    total_profit_text = f"+{total_profit:,}P" if total_profit >= 0 else f"{total_profit:,}P"
+    embed.add_field(name="📊 총 평가금액", value=f"**{total_eval:,}P**", inline=True)
+    embed.add_field(name="📈 총 손익", value=f"**{total_profit_text}**", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="주식랭킹", description="가상 주식 평가금액 TOP 10을 확인합니다.")
+async def stock_ranking(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    update_stock_prices(interaction.guild.id)
+    c.execute(
+        "SELECT user_id, stock_code, amount FROM stock_holdings WHERE guild_id=? AND amount > 0",
+        (interaction.guild.id,)
+    )
+    totals = {}
+    for user_id, code, amount in c.fetchall():
+        price = get_stock_price(interaction.guild.id, code) or 0
+        totals[user_id] = totals.get(user_id, 0) + price * amount
+
+    ranking = sorted(totals.items(), key=lambda x: x[1], reverse=True)[:10]
+    if not ranking:
+        return await interaction.response.send_message("아직 주식 보유 데이터가 없습니다.", ephemeral=True)
+
+    text = ""
+    for index, (user_id, value) in enumerate(ranking, start=1):
+        text += f"**{index}위** <@{user_id}> - 평가금액 **{value:,}P**\n"
+
+    embed = discord.Embed(title="🏆 주식 평가금액 랭킹 TOP 10", description=text, color=discord.Color.gold())
+    embed.set_footer(text="포인트 잔액은 제외하고 주식 평가금액만 계산합니다.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="레벨랭킹", description="레벨 TOP 10을 확인합니다.")
+async def level_ranking(interaction: discord.Interaction):
+    await send_ranking(interaction, "SELECT user_id, level, exp FROM levels ORDER BY level DESC, exp DESC LIMIT 10", "📊 레벨 랭킹 TOP 10", lambda i, row: f"**{i}위** <@{row[0]}> - Lv.{row[1]} / {row[2]} EXP\n", BOT_COLOR)
+
+
+@bot.tree.command(name="출석랭킹", description="출석 TOP 10을 확인합니다.")
+async def attendance_ranking(interaction: discord.Interaction):
+    await send_ranking(interaction, "SELECT user_id, attendance_count, streak FROM users WHERE guild_id=%d ORDER BY attendance_count DESC, streak DESC LIMIT 10" % interaction.guild.id, "🎀 출석 랭킹 TOP 10", lambda i, row: f"**{i}위** <@{row[0]}> - 출석 {row[1]}일 / 연속 {row[2]}일\n", BOT_COLOR)
+
+
+# =========================
+# 관리 명령어
+# =========================
+
+
+
+def get_clean_settings(guild_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    try:
+        c.execute("SELECT max_delete, batch_size, delay_seconds, log_enabled FROM clean_settings WHERE guild_id=?", (guild_id,))
+        row = c.fetchone()
+        if row:
+            return {
+                "max_delete": max(0, int(row[0] or 0)),
+                "batch_size": min(100, max(1, int(row[1] or 100))),
+                "delay_seconds": max(0.0, float(row[2] if row[2] is not None else 0.8)),
+                "log_enabled": bool(row[3]) if row[3] is not None else True,
+            }
+    except sqlite3.Error:
+        pass
+    return {"max_delete": 0, "batch_size": 100, "delay_seconds": 0.8, "log_enabled": True}
+
+
+async def purge_messages_unlimited(channel: discord.abc.Messageable, amount: int, *, batch_size: int = 100, delay_seconds: float = 0.8):
+    """Discord API 안전 범위(100개 단위)로 나눠서 요청한 개수만큼 메시지를 삭제합니다."""
+    if amount < 1:
+        return 0
+
+    deleted_total = 0
+    remaining = amount
+
+    while remaining > 0:
+        batch_limit = min(remaining, max(1, min(100, int(batch_size or 100))))
+        deleted = await channel.purge(limit=batch_limit)
+        deleted_count = len(deleted)
+        deleted_total += deleted_count
+        remaining -= deleted_count
+
+        # 더 이상 삭제할 메시지가 없으면 멈춥니다.
+        if deleted_count < batch_limit:
+            break
+
+        # 대량 삭제 때 API 제한을 줄이기 위해 잠깐 쉬어갑니다.
+        if remaining > 0:
+            await asyncio.sleep(max(0.0, float(delay_seconds or 0)))
+
+    return deleted_total
+
+@bot.tree.command(name="청소", description="최근 메시지를 삭제합니다.")
+async def clear_messages(interaction: discord.Interaction, amount: int):
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message("❌ 메시지 관리 권한이 없습니다.", ephemeral=True)
+    if amount < 1:
+        return await interaction.response.send_message("❌ 1개 이상 입력해주세요.", ephemeral=True)
+    clean_settings = get_clean_settings(interaction.guild.id)
+    if clean_settings["max_delete"] and amount > clean_settings["max_delete"]:
+        return await interaction.response.send_message(f"❌ 이 서버의 최대 청소 개수는 {clean_settings['max_delete']}개입니다.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    deleted_count = await purge_messages_unlimited(interaction.channel, amount, batch_size=clean_settings["batch_size"], delay_seconds=clean_settings["delay_seconds"])
+    await interaction.followup.send(f"🧹 메시지 {deleted_count}개를 삭제했습니다.", ephemeral=True)
+    if clean_settings.get("log_enabled", True):
+        await send_log(interaction.guild, f"🧹 채팅 청소\n관리자: {interaction.user.mention}\n채널: {interaction.channel.mention}\n삭제 개수: {deleted_count}개", "clean")
+
+
+@bot.tree.command(name="킥", description="유저를 서버에서 추방합니다.")
+async def kick_member(interaction: discord.Interaction, user: discord.Member, reason: str = "사유 없음"):
+    if not interaction.user.guild_permissions.kick_members:
+        return await interaction.response.send_message("❌ 킥 권한이 없습니다.", ephemeral=True)
+    if user == interaction.user:
+        return await interaction.response.send_message("❌ 자기 자신은 킥할 수 없습니다.", ephemeral=True)
+    await user.kick(reason=reason)
+    await send_log(interaction.guild, f"🔨 킥\n대상: {user}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+    await interaction.response.send_message(f"🔨 {user} 님을 킥했습니다.\n사유: {reason}")
+
+
+@bot.tree.command(name="밴", description="유저를 서버에서 차단합니다.")
+async def ban_member(interaction: discord.Interaction, user: discord.Member, reason: str = "사유 없음"):
+    if not interaction.user.guild_permissions.ban_members:
+        return await interaction.response.send_message("❌ 밴 권한이 없습니다.", ephemeral=True)
+    if user == interaction.user:
+        return await interaction.response.send_message("❌ 자기 자신은 밴할 수 없습니다.", ephemeral=True)
+    await user.ban(reason=reason)
+    await send_log(interaction.guild, f"⛔ 밴\n대상: {user}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+    await interaction.response.send_message(f"⛔ {user} 님을 밴했습니다.\n사유: {reason}")
+
+
+# =========================
+# 티켓 시스템
+# =========================
+
+async def send_ticket_log(guild, message):
+    saved_ticket_log_id = get_saved_channel_id(guild.id, "ticket_log_channel_id") if guild else 0
+    channel = get_channel_by_id_or_name(guild, saved_ticket_log_id or TICKET_LOG_CHANNEL_ID, ["📋-일반로그", "🎫-티켓로그", "티켓로그"], "text")
+    if channel:
+        await channel.send(message)
+    else:
+        await send_log(guild, message, "general")
+
+
+class AddStaffModal(discord.ui.Modal, title="담당자 추가"):
+    staff_id = discord.ui.TextInput(label="담당자 유저 ID", placeholder="예: 123456789012345678", required=True, max_length=30)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.staff_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자 ID만 입력해주세요.", ephemeral=True)
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+        await interaction.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+        await interaction.response.send_message(f"✅ {member.mention}님이 담당자로 추가되었습니다.")
+        await send_ticket_log(interaction.guild, f"👤 담당자 추가\n채널: {interaction.channel.mention}\n담당자: {member.mention}\n추가한 사람: {interaction.user.mention}")
+
+
+class TicketCloseConfirm(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=30)
+
+    @discord.ui.button(label="✅ 닫기 확정", style=discord.ButtonStyle.danger)
+    async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        messages = []
+        async for msg in channel.history(limit=100, oldest_first=True):
+            content = msg.content if msg.content else ""
+            messages.append(f"[{msg.created_at}] {msg.author}: {content}")
+        log_text = "\n".join(messages)
+        if len(log_text) > 1900:
+            log_text = log_text[:1900] + "\n...로그가 너무 길어 일부만 저장됨"
+        await send_ticket_log(interaction.guild, f"🔒 티켓 닫힘\n채널명: {channel.name}\n닫은 사람: {interaction.user.mention}\n\n```{log_text}```")
+        await interaction.response.send_message("🔒 티켓을 닫습니다.")
+        await channel.delete(reason=f"{interaction.user} 티켓 닫기")
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 티켓 닫기", style=discord.ButtonStyle.danger, custom_id="ticket_close_confirm_open")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_channels:
+            return await interaction.response.send_message("❌ 관리자만 티켓을 닫을 수 있어요.", ephemeral=True)
+        await interaction.response.send_message("정말 이 티켓을 닫을까요?", view=TicketCloseConfirm(), ephemeral=True)
+
+    @discord.ui.button(label="👤 담당자 추가", style=discord.ButtonStyle.blurple, custom_id="ticket_add_staff")
+    async def add_staff(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_channels:
+            return await interaction.response.send_message("❌ 채널 관리 권한이 필요합니다.", ephemeral=True)
+        await interaction.response.send_modal(AddStaffModal())
+
+
+class CloseTicketView(TicketControlView):
+    pass
+
+
+class UnifiedTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def create_ticket(self, interaction: discord.Interaction, ticket_type: str, emoji: str):
+        guild = interaction.guild
+        user = interaction.user
+        if guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+        category = guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
+        if category is None:
+            category = discord.utils.get(guild.categories, name="🎫 티켓")
+        if category is None:
+            category = await guild.create_category("🎫 티켓")
+
+        staff_role = get_role_by_id_or_name(guild, STAFF_ROLE_ID, ["총관리자", "부관리자", "대표", "부대표"])
+        if staff_role is None:
+            return await interaction.response.send_message("❌ 관리자 역할을 찾을 수 없어요. 먼저 `/친목섭` 또는 `/역할자동생성`을 실행해주세요.", ephemeral=True)
+        channel_name = f"{ticket_type}-{user.id}".lower()
+        existing = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing:
+            return await interaction.response.send_message(f"이미 열린 티켓이 있어요: {existing.mention}", ephemeral=True)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            staff_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+        }
+        channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites, topic=f"{ticket_type} 티켓 | 생성자: {user.id}", reason=f"{user} {ticket_type} 티켓 생성")
+        embed = create_embed(f"{emoji} {ticket_type} 티켓", f"{user.mention}님, 내용을 자세히 적어주세요.\n\n관리자가 확인 후 답변드릴게요.")
+        await channel.send(content=f"{user.mention} {staff_role.mention}", embed=embed, view=TicketControlView())
+        await send_ticket_log(guild, f"{emoji} `{ticket_type}` 티켓 생성: {channel.mention} / 생성자: {user.mention}")
+        await interaction.response.send_message(f"{emoji} 티켓이 생성되었어요: {channel.mention}", ephemeral=True)
+
+    @discord.ui.button(label="일반 티켓", emoji="🎫", style=discord.ButtonStyle.green, custom_id="ticket_general")
+    async def general_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.create_ticket(interaction, "일반", "🎫")
+
+    @discord.ui.button(label="문의 티켓", emoji="💬", style=discord.ButtonStyle.blurple, custom_id="ticket_question")
+    async def question_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.create_ticket(interaction, "문의", "💬")
+
+    @discord.ui.button(label="신고 티켓", emoji="🚨", style=discord.ButtonStyle.red, custom_id="ticket_report")
+    async def report_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.create_ticket(interaction, "신고", "🚨")
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="티켓패널", description="통합 티켓 패널을 보냅니다.")
+async def ticket_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 사용할 수 있어요.", ephemeral=True)
+    embed = create_embed("🎫 만능 봇 통합 티켓 패널", "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n🎫 **일반 티켓**\n💬 **문의 티켓**\n🚨 **신고 티켓**\n\n관리자에게만 보이는 개인 채널이 생성됩니다.")
+    await interaction.response.send_message(embed=embed, view=UnifiedTicketView())
+
+
+
+# =========================
+# 뮤직 시스템
+# =========================
+
+music_queues = {}
+now_playing = {}
+loop_enabled = {}
+volume_levels = {}
+skip_vote_users = {}
+
+YTDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "extract_flat": False,
+}
+
+FFMPEG_OPTIONS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+
+
+def get_music_queue(guild_id: int):
+    if guild_id not in music_queues:
+        music_queues[guild_id] = deque()
+    return music_queues[guild_id]
+
+
+def get_music_volume(guild_id: int):
+    return volume_levels.get(guild_id, 0.5)
+
+
+def get_skip_vote_required(voice_channel: discord.VoiceChannel):
+    """현재 봇이 들어간 음성방의 실제 사람 수만큼 스킵 필요 표를 계산합니다."""
+    if voice_channel is None:
+        return 1
+    humans = [member for member in voice_channel.members if not member.bot]
+    return max(1, len(humans))
+
+
+def clean_skip_votes(guild_id: int, voice_channel: discord.VoiceChannel):
+    """음성방을 나간 사람의 스킵 투표는 자동으로 제거합니다."""
+    votes = skip_vote_users.setdefault(guild_id, set())
+    valid_user_ids = {member.id for member in voice_channel.members if not member.bot}
+    votes.intersection_update(valid_user_ids)
+    return votes
+
+
+def format_duration(seconds):
+    if not seconds:
+        return "알 수 없음"
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{sec:02d}"
+    return f"{minutes}:{sec:02d}"
+
+
+MUSIC_SERVICE_KEYWORDS = {
+    "soundcloud": ["soundcloud.com"],
+    "melon": ["melon.com", "멜론", "melon"],
+    "genie": ["genie.co.kr", "지니뮤직", "지니", "genie"],
+    "youtube": ["youtube.com", "youtu.be", "유튜브", "youtube"],
+}
+
+
+def detect_music_service(query: str, info: dict | None = None):
+    text = (query or "").lower()
+    extractor = ((info or {}).get("extractor_key") or (info or {}).get("extractor") or "").lower()
+    if "soundcloud" in extractor or any(word in text for word in MUSIC_SERVICE_KEYWORDS["soundcloud"]):
+        return "SoundCloud", "🟧"
+    if any(word in text for word in MUSIC_SERVICE_KEYWORDS["melon"]):
+        return "Melon", "🍈"
+    if any(word in text for word in MUSIC_SERVICE_KEYWORDS["genie"]):
+        return "Genie Music", "🧞"
+    if "youtube" in extractor or any(word in text for word in MUSIC_SERVICE_KEYWORDS["youtube"]):
+        return "YouTube", "▶️"
+    return "검색", "🎧"
+
+
+def clean_music_title(title: str):
+    title = html.unescape(title or "").strip()
+    for suffix in ["- Melon", "| Melon", "- genie", "| 지니", "- YouTube"]:
+        title = title.replace(suffix, "")
+    return re.sub(r"\s+", " ", title).strip() or "제목 없음"
+
+
+def fetch_page_title(url: str):
+    """멜론/지니뮤직 링크처럼 직접 재생이 어려운 페이지에서 제목만 가져와 검색어로 사용합니다."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read(250000)
+        page = raw.decode("utf-8", errors="ignore")
+        patterns = [
+            r'<meta[^>]+property=["\\\']og:title["\\\'][^>]+content=["\\\']([^"\\\']+)',
+            r'<meta[^>]+content=["\\\']([^"\\\']+)["\\\'][^>]+property=["\\\']og:title["\\\']',
+            r'<title[^>]*>(.*?)</title>',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page, re.I | re.S)
+            if match:
+                return clean_music_title(match.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def build_music_search_query(query: str):
+    query = (query or "").strip()
+    service, _emoji = detect_music_service(query)
+    lower = query.lower()
+
+    if service in {"Melon", "Genie Music"}:
+        page_title = fetch_page_title(query) if lower.startswith(("http://", "https://")) else None
+        keyword = page_title or query
+        keyword = re.sub(r"https?://\S+", "", keyword).strip() or query
+        return f"ytsearch1:{keyword}", service, keyword
+
+    return query, service, query
+
+
+async def extract_music_info(query: str):
+    loop = asyncio.get_running_loop()
+
+    def run_extract():
+        search_query, requested_service, searched_keyword = build_music_search_query(query)
+        info = ytdl.extract_info(search_query, download=False)
+        if "entries" in info:
+            entries = [entry for entry in info["entries"] if entry]
+            if not entries:
+                raise ValueError("검색 결과가 없습니다.")
+            info = entries[0]
+
+        detected_service, service_emoji = detect_music_service(query, info)
+        if requested_service in {"Melon", "Genie Music"}:
+            detected_service = requested_service
+            service_emoji = "🍈" if requested_service == "Melon" else "🧞"
+
+        return {
+            "title": clean_music_title(info.get("title", "제목 없음")),
+            "url": info.get("url"),
+            "webpage_url": info.get("webpage_url", query),
+            "duration": info.get("duration", 0),
+            "thumbnail": info.get("thumbnail"),
+            "service": detected_service,
+            "service_emoji": service_emoji,
+            "requested_query": query,
+            "searched_keyword": searched_keyword,
+            "uploader": info.get("uploader") or info.get("channel") or "알 수 없음",
+        }
+
+    return await loop.run_in_executor(None, run_extract)
+
+
+def build_now_playing_embed(track: dict, *, queued: bool = False):
+    status = "대기열 추가" if queued else "현재 재생 중"
+    service = track.get("service", "검색")
+    service_emoji = track.get("service_emoji", "🎧")
+    embed = discord.Embed(
+        title=f"{service_emoji} {status} · {service}",
+        description=f"**{track.get('title', '제목 없음')}**",
+        color=BOT_COLOR,
+        url=track.get("webpage_url") or None,
+    )
+    embed.add_field(name="⏱️ 길이", value=f"`{format_duration(track.get('duration'))}`", inline=True)
+    embed.add_field(name="🎤 업로더", value=str(track.get("uploader", "알 수 없음"))[:100], inline=True)
+    if service in {"Melon", "Genie Music"}:
+        embed.add_field(
+            name="📌 안내",
+            value="멜론/지니뮤직 링크·검색어는 제목을 기준으로 유튜브/사운드클라우드에서 찾아 재생해요.",
+            inline=False,
+        )
+    if track.get("thumbnail"):
+        embed.set_thumbnail(url=track["thumbnail"])
+    embed.set_footer(text="🎵 만능 봇 뮤직 패널")
+    return embed
+
+
+async def send_music_now_playing_box(guild: discord.Guild, track: dict, *, queued: bool = False):
+    channel = get_channel_by_id_or_name(guild, 0, [MUSIC_NOW_PLAYING_CHANNEL_NAME, "현재재생", "now-playing"], "text")
+    if not channel:
+        return
+    try:
+        await channel.send(embed=build_now_playing_embed(track, queued=queued))
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def ensure_music_voice_after_defer(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.followup.send("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+        return None
+
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send("❌ 먼저 음성 채널에 들어가주세요.", ephemeral=True)
+        return None
+
+    voice_channel = interaction.user.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    if voice_client is None:
+        return await voice_channel.connect()
+
+    if voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    return voice_client
+
+
+async def play_music_next(guild: discord.Guild):
+    voice_client = guild.voice_client
+    if voice_client is None:
+        return
+
+    guild_id = guild.id
+    queue = get_music_queue(guild_id)
+
+    if loop_enabled.get(guild_id) and now_playing.get(guild_id):
+        queue.appendleft(now_playing[guild_id])
+
+    if not queue:
+        now_playing[guild_id] = None
+        return
+
+    track = queue.popleft()
+    now_playing[guild_id] = track
+    skip_vote_users.pop(guild_id, None)
+    await send_music_now_playing_box(guild, track, queued=False)
+
+    source = discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS)
+    source = discord.PCMVolumeTransformer(source, volume=get_music_volume(guild_id))
+
+    def after_play(error):
+        if error:
+            print(f"재생 오류: {error}")
+        future = asyncio.run_coroutine_threadsafe(play_music_next(guild), bot.loop)
+        try:
+            future.result()
+        except Exception as e:
+            print(f"다음 곡 재생 오류: {e}")
+
+    voice_client.play(source, after=after_play)
+
+
+class PlayMusicModal(discord.ui.Modal, title="🎶 음악 재생"):
+    query = discord.ui.TextInput(
+        label="노래 제목 또는 링크",
+        placeholder="예: 아이유 좋은날 / 유튜브 / 사운드클라우드 / 멜론 / 지니뮤직",
+        required=True,
+        max_length=300,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        voice_client = await ensure_music_voice_after_defer(interaction)
+        if voice_client is None:
+            return
+
+        query_text = str(self.query.value).strip()
+
+        try:
+            track = await extract_music_info(query_text)
+        except Exception as e:
+            return await interaction.followup.send(
+                f"❌ 노래 정보를 가져오지 못했어요.\n`{e}`",
+                ephemeral=True,
+            )
+
+        queue = get_music_queue(interaction.guild.id)
+        queue.append(track)
+
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await play_music_next(interaction.guild)
+            msg = f"🎶 바로 재생을 시작했어요!\n{track.get('service_emoji', '🎧')} **{track['title']}**\n서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track['duration'])}`"
+        else:
+            await send_music_now_playing_box(interaction.guild, track, queued=True)
+            msg = f"✅ 대기열에 추가했어요!\n{track.get('service_emoji', '🎧')} **{track['title']}**\n서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track['duration'])}`"
+
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+class MusicVolumeModal(discord.ui.Modal, title="🔊 볼륨 설정"):
+    volume = discord.ui.TextInput(
+        label="볼륨 1~100",
+        placeholder="예: 50",
+        required=True,
+        max_length=3,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = int(str(self.volume.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자만 입력해주세요.", ephemeral=True)
+
+        if value < 1 or value > 100:
+            return await interaction.response.send_message("❌ 1부터 100까지만 입력해주세요.", ephemeral=True)
+
+        guild_id = interaction.guild.id
+        volume_levels[guild_id] = value / 100
+
+        voice_client = interaction.guild.voice_client
+        if voice_client and voice_client.source and isinstance(voice_client.source, discord.PCMVolumeTransformer):
+            voice_client.source.volume = value / 100
+
+        await interaction.response.send_message(f"🔊 볼륨을 **{value}%** 로 설정했어요.", ephemeral=True)
+
+
+class MusicPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="재생", emoji="🎶", style=discord.ButtonStyle.green, custom_id="music_play")
+    async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PlayMusicModal())
+
+    @discord.ui.button(label="일시정지", emoji="⏸️", style=discord.ButtonStyle.gray, custom_id="music_pause")
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.pause()
+            return await interaction.response.send_message("⏸️ 음악을 일시정지했어요.", ephemeral=True)
+        await interaction.response.send_message("❌ 현재 재생 중인 음악이 없어요.", ephemeral=True)
+
+    @discord.ui.button(label="다시재생", emoji="▶️", style=discord.ButtonStyle.blurple, custom_id="music_resume")
+    async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_paused():
+            vc.resume()
+            return await interaction.response.send_message("▶️ 음악을 다시 재생했어요.", ephemeral=True)
+        await interaction.response.send_message("❌ 일시정지된 음악이 없어요.", ephemeral=True)
+
+    @discord.ui.button(label="스킵 투표", emoji="⏭️", style=discord.ButtonStyle.red, custom_id="music_skip")
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            return await interaction.response.send_message("❌ 스킵할 음악이 없어요.", ephemeral=True)
+
+        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+            return await interaction.response.send_message("❌ 같은 음성 채널에 있어야 스킵 투표를 할 수 있어요.", ephemeral=True)
+
+        guild_id = interaction.guild.id
+        required_votes = get_skip_vote_required(vc.channel)
+        votes = clean_skip_votes(guild_id, vc.channel)
+
+        if interaction.user.id in votes:
+            return await interaction.response.send_message(
+                f"⏭️ 이미 스킵 투표했어요. 현재 **{len(votes)}/{required_votes}**",
+                ephemeral=True
+            )
+
+        votes.add(interaction.user.id)
+        vote_count = len(votes)
+
+        if vote_count >= required_votes:
+            skip_vote_users.pop(guild_id, None)
+            vc.stop()
+            return await interaction.response.send_message(
+                f"⏭️ 스킵 투표 **{vote_count}/{required_votes}** 완료! 현재 곡을 스킵했어요.",
+                ephemeral=False
+            )
+
+        await interaction.response.send_message(
+            f"⏭️ 스킵 투표 완료! 현재 **{vote_count}/{required_votes}**\n음성방에 있는 사람 수만큼 투표하면 현재 곡이 스킵됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="대기열", emoji="📜", style=discord.ButtonStyle.gray, custom_id="music_queue")
+    async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        queue = get_music_queue(guild_id)
+        current = now_playing.get(guild_id)
+
+        text = ""
+        if current:
+            text += f"🎵 **현재 재생 중**\n{current.get('service_emoji', '🎧')} {current['title']} `[{format_duration(current['duration'])}]`\n\n"
+
+        if queue:
+            text += "📜 **대기열**\n"
+            for i, track in enumerate(list(queue)[:10], start=1):
+                text += f"{i}. {track.get('service_emoji', '🎧')} {track['title']} `[{format_duration(track['duration'])}]`\n"
+        else:
+            text += "대기 중인 곡이 없어요."
+
+        embed = create_embed("📜 만능 봇 뮤직 대기열", text[:4000])
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="반복", emoji="🔁", style=discord.ButtonStyle.green, custom_id="music_loop")
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        loop_enabled[guild_id] = not loop_enabled.get(guild_id, False)
+        state = "켜짐" if loop_enabled[guild_id] else "꺼짐"
+        await interaction.response.send_message(f"🔁 반복 재생: **{state}**", ephemeral=True)
+
+    @discord.ui.button(label="셔플", emoji="🔀", style=discord.ButtonStyle.gray, custom_id="music_shuffle")
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        queue = get_music_queue(interaction.guild.id)
+        if len(queue) < 2:
+            return await interaction.response.send_message("❌ 섞을 대기열이 부족해요. 노래가 2곡 이상 있어야 합니다.", ephemeral=True)
+        items = list(queue)
+        random.shuffle(items)
+        queue.clear()
+        queue.extend(items)
+        await interaction.response.send_message(f"🔀 대기열 **{len(queue)}곡**을 랜덤으로 섞었어요.", ephemeral=True)
+
+    @discord.ui.button(label="볼륨", emoji="🔊", style=discord.ButtonStyle.blurple, custom_id="music_volume")
+    async def volume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MusicVolumeModal())
+
+    @discord.ui.button(label="종료", emoji="❌", style=discord.ButtonStyle.red, custom_id="music_leave")
+    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc:
+            music_queues.pop(interaction.guild.id, None)
+            now_playing.pop(interaction.guild.id, None)
+            loop_enabled.pop(interaction.guild.id, None)
+            skip_vote_users.pop(interaction.guild.id, None)
+            await vc.disconnect()
+            return await interaction.response.send_message("❌ 음악을 종료하고 음성 채널에서 나갔어요.", ephemeral=True)
+        await interaction.response.send_message("❌ 봇이 음성 채널에 없어요.", ephemeral=True)
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="뮤직", description="뮤직 카테고리/채널과 뮤직 패널을 자동 생성합니다.")
+async def music_panel(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    # 관리자나 봇 세팅 권한자는 뮤직방 전체를 자동 생성합니다.
+    if interaction.user.guild_permissions.administrator and not await reject_if_not_setup_manager(interaction):
+        await interaction.response.defer(ephemeral=True)
+        layout = await create_music_category_channels(interaction.guild, send_panel=True)
+        await interaction.followup.send(
+            "✅ 뮤직 카테고리 자동 생성을 완료했습니다.\n"
+            f"🎵 카테고리: {layout.get('music_category').mention if layout.get('music_category') else '미설정'}\n"
+            f"🎵 명령어 채널: {layout.get('music_command_channel').mention if layout.get('music_command_channel') else '미설정'}\n"
+            f"🎶 현재재생 채널: {layout.get('music_now_playing_channel').mention if layout.get('music_now_playing_channel') else '미설정'}\n"
+            f"📜 재생목록 채널: {layout.get('music_queue_channel').mention if layout.get('music_queue_channel') else '미설정'}\n"
+            f"🔊 음악감상 음성: {layout.get('music_voice_channel').mention if layout.get('music_voice_channel') else '미설정'}\n"
+            f"🎛️ 뮤직 패널: {'새로 전송됨' if layout.get('music_panel_sent') else '이미 있음'}",
+            ephemeral=True
+        )
+        await send_log(interaction.guild, f"🎵 뮤직 카테고리 생성/확인\n관리자: {interaction.user.mention}", "general")
+        return
+
+    # 일반 유저는 현재 채널에서 뮤직 패널만 열 수 있습니다.
+    await interaction.response.send_message(embed=await build_music_panel_embed(), view=MusicPanelView())
+
+# =========================
+# 투표 / 추첨 / 정보
+# =========================
+
+class VoteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.yes = 0
+        self.no = 0
+        self.voters = set()
+
+    @discord.ui.button(label="👍 찬성", style=discord.ButtonStyle.green)
+    async def vote_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id in self.voters:
+            return await interaction.response.send_message("❌ 이미 투표했습니다.", ephemeral=True)
+        self.voters.add(interaction.user.id)
+        self.yes += 1
+        await interaction.response.send_message(f"✅ 찬성 투표 완료!\n찬성: {self.yes}표 / 반대: {self.no}표", ephemeral=True)
+
+    @discord.ui.button(label="👎 반대", style=discord.ButtonStyle.danger)
+    async def vote_no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id in self.voters:
+            return await interaction.response.send_message("❌ 이미 투표했습니다.", ephemeral=True)
+        self.voters.add(interaction.user.id)
+        self.no += 1
+        await interaction.response.send_message(f"✅ 반대 투표 완료!\n찬성: {self.yes}표 / 반대: {self.no}표", ephemeral=True)
+
+
+@bot.tree.command(name="투표", description="찬반 투표를 생성합니다.")
+async def vote(interaction: discord.Interaction, title: str):
+    embed = discord.Embed(title="📊 투표", description=f"**{title}**\n\n👍 찬성\n👎 반대", color=discord.Color.blurple())
+    embed.set_footer(text=f"투표 생성자: {interaction.user}")
+    await interaction.response.send_message(embed=embed, view=VoteView())
+
+
+@bot.tree.command(name="추첨", description="온라인 멤버 중 랜덤으로 추첨합니다.")
+async def draw(interaction: discord.Interaction, count: int):
+    if count < 1:
+        return await interaction.response.send_message("❌ 1명 이상 입력해주세요.", ephemeral=True)
+    members = [member for member in interaction.guild.members if not member.bot and member.status != discord.Status.offline]
+    if not members:
+        return await interaction.response.send_message("❌ 추첨 가능한 온라인 멤버가 없습니다.", ephemeral=True)
+    winners = random.sample(members, min(count, len(members)))
+    text = "".join(f"**{i}.** {member.mention}\n" for i, member in enumerate(winners, start=1))
+    embed = discord.Embed(title="🎉 추첨 결과", description=text, color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="서버상세정보", description="서버 상세 정보를 확인합니다.")
+async def server_detail(interaction: discord.Interaction):
+    guild = interaction.guild
+    embed = discord.Embed(title="⭐ 서버 상세 정보", color=BOT_COLOR)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="서버명", value=guild.name, inline=True)
+    embed.add_field(name="서버 ID", value=guild.id, inline=True)
+    embed.add_field(name="서버장", value=guild.owner.mention if guild.owner else "알 수 없음", inline=True)
+    embed.add_field(name="전체 인원", value=f"{guild.member_count}명", inline=True)
+    embed.add_field(name="채널 수", value=f"{len(guild.channels)}개", inline=True)
+    embed.add_field(name="역할 수", value=f"{len(guild.roles)}개", inline=True)
+    embed.add_field(name="생성일", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="유저정보", description="유저 상세 정보를 확인합니다.")
+async def user_info(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    embed = discord.Embed(title="👤 유저 정보", color=BOT_COLOR)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="닉네임", value=target.mention, inline=False)
+    embed.add_field(name="유저 ID", value=target.id, inline=True)
+    embed.add_field(name="계정 생성일", value=target.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="서버 가입일", value=target.joined_at.strftime("%Y-%m-%d") if target.joined_at else "알 수 없음", inline=True)
+    embed.add_field(name="가장 높은 역할", value=target.top_role.mention if target.top_role else "없음", inline=True)
+    embed.add_field(name="봇 여부", value="봇" if target.bot else "사람", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+
+# =========================
+# 송금 / 잔액 / 예약 이벤트
+# =========================
+
+@bot.tree.command(name="잔액", description="내 포인트 또는 다른 유저의 포인트를 확인합니다.")
+@app_commands.describe(유저="잔액을 확인할 유저")
+async def balance_command(interaction: discord.Interaction, 유저: discord.Member = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    target = 유저 or interaction.user
+    point = get_user_point(interaction.guild.id, target.id)
+
+    embed = discord.Embed(
+        title="💰 포인트 잔액",
+        description=f"{target.mention} 님의 현재 잔액입니다.",
+        color=BOT_COLOR
+    )
+    embed.add_field(name="보유 포인트", value=f"**{point:,}P**", inline=False)
+    embed.set_footer(text="/송금 명령어로 다른 유저에게 포인트를 보낼 수 있어요.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="송금", description="내 포인트를 다른 유저에게 송금합니다.")
+@app_commands.describe(유저="포인트를 받을 유저", 금액="보낼 포인트 금액")
+async def transfer_point_command(interaction: discord.Interaction, 유저: discord.Member, 금액: int):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    if 유저.bot:
+        return await interaction.response.send_message("❌ 봇에게는 송금할 수 없습니다.", ephemeral=True)
+
+    if 유저.id == interaction.user.id:
+        return await interaction.response.send_message("❌ 자기 자신에게는 송금할 수 없습니다.", ephemeral=True)
+
+    if 금액 <= 0:
+        return await interaction.response.send_message("❌ 송금 금액은 1P 이상이어야 합니다.", ephemeral=True)
+
+    sender_point = get_user_point(interaction.guild.id, interaction.user.id)
+    if sender_point < 금액:
+        return await interaction.response.send_message(
+            f"❌ 포인트가 부족합니다. 현재 보유: `{sender_point:,}P`",
+            ephemeral=True
+        )
+
+    receiver_point = get_user_point(interaction.guild.id, 유저.id)
+
+    set_user_point(interaction.guild.id, interaction.user.id, sender_point - 금액)
+    set_user_point(interaction.guild.id, 유저.id, receiver_point + 금액)
+
+    embed = discord.Embed(
+        title="💸 송금 완료",
+        description=f"{interaction.user.mention} → {유저.mention}",
+        color=BOT_COLOR
+    )
+    embed.add_field(name="송금 금액", value=f"**{금액:,}P**", inline=False)
+    embed.add_field(name="내 남은 잔액", value=f"{sender_point - 금액:,}P", inline=True)
+    embed.add_field(name="상대 잔액", value=f"{receiver_point + 금액:,}P", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+    await send_log(
+        interaction.guild,
+        f"💸 포인트 송금\n보낸 사람: {interaction.user.mention}\n받은 사람: {유저.mention}\n금액: `{금액:,}P`",
+        "general"
+    )
+
+
+def parse_event_datetime(value: str):
+    """YYYY-MM-DD HH:MM 형식의 한국 시간 문자열을 datetime으로 변환합니다."""
+    value = (value or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+
+# =========================
+# 박스형 이벤트 생성 패널
+# =========================
+
+EVENT_DRAFTS = {}
+
+
+def get_event_draft(user_id: int):
+    draft = EVENT_DRAFTS.setdefault(user_id, {
+        "title": "",
+        "description": "",
+        "time": "",
+        "reward_1": "",
+        "reward_2": "",
+        "reward_3": "",
+        "participant_reward": "",
+        "win_reward": "",
+        "lose_reward": "",
+        "color": "FFD700",
+        "image_url": "",
+        "footer": "이벤트 안내 | 자세한 내용은 관리자 공지를 확인해주세요.",
+        "channel_id": 0,
+    })
+    return draft
+
+
+def build_event_reward_text_from_draft(draft: dict):
+    personal_lines = []
+    if draft.get("reward_1"):
+        personal_lines.append(f"🥇 **1등**: {draft['reward_1']}")
+    if draft.get("reward_2"):
+        personal_lines.append(f"🥈 **2등**: {draft['reward_2']}")
+    if draft.get("reward_3"):
+        personal_lines.append(f"🥉 **3등**: {draft['reward_3']}")
+    if draft.get("participant_reward"):
+        personal_lines.append(f"🎁 **참가보상**: {draft['participant_reward']}")
+
+    team_lines = []
+    if draft.get("win_reward"):
+        team_lines.append(f"🏆 **승리팀**: {draft['win_reward']}")
+    if draft.get("lose_reward"):
+        team_lines.append(f"💀 **패배팀**: {draft['lose_reward']}")
+
+    result = []
+    if personal_lines:
+        result.append("**개인 순위 보상**\n" + "\n".join(personal_lines))
+    if team_lines:
+        result.append("**팀 보상**\n" + "\n".join(team_lines))
+
+    return "\n\n".join(result) if result else "아직 보상이 설정되지 않았습니다."
+
+
+def build_event_preview_embed(interaction: discord.Interaction):
+    draft = get_event_draft(interaction.user.id)
+    title = draft.get("title") or "이벤트 제목 미설정"
+    description = draft.get("description") or "이벤트 설명이 아직 설정되지 않았습니다."
+
+    embed = discord.Embed(
+        title=f"🎉 {title}",
+        description=description,
+        color=normalize_embed_color(draft.get("color") or "FFD700")
+    )
+
+    event_time = draft.get("time") or "즉시 전송"
+    target_channel = interaction.guild.get_channel(draft.get("channel_id") or 0) if interaction.guild else None
+
+    embed.add_field(name="⏰ 예약 시간", value=f"`{event_time}`", inline=True)
+    embed.add_field(name="📢 전송 채널", value=target_channel.mention if target_channel else "현재 채널", inline=True)
+    embed.add_field(name="🏆 이벤트 보상", value=build_event_reward_text_from_draft(draft), inline=False)
+
+    image_url = safe_url(draft.get("image_url") or "")
+    if image_url:
+        embed.set_image(url=image_url)
+
+    footer = draft.get("footer") or "이벤트 안내 | 자세한 내용은 관리자 공지를 확인해주세요."
+    embed.set_footer(text=footer[:2048])
+
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    return embed
+
+
+def build_final_event_embed_from_draft(draft: dict, creator: discord.Member, status_text: str):
+    title = draft.get("title") or "이벤트"
+    description = draft.get("description") or "이벤트 설명이 없습니다."
+
+    embed = discord.Embed(
+        title=f"🎉 {title}",
+        description=description,
+        color=normalize_embed_color(draft.get("color") or "FFD700")
+    )
+    embed.add_field(name="상태", value=status_text, inline=True)
+
+    personal_lines = []
+    if draft.get("reward_1"):
+        personal_lines.append(f"🥇 **1등**: {draft['reward_1']}")
+    if draft.get("reward_2"):
+        personal_lines.append(f"🥈 **2등**: {draft['reward_2']}")
+    if draft.get("reward_3"):
+        personal_lines.append(f"🥉 **3등**: {draft['reward_3']}")
+    if draft.get("participant_reward"):
+        personal_lines.append(f"🎁 **참가보상**: {draft['participant_reward']}")
+
+    team_lines = []
+    if draft.get("win_reward"):
+        team_lines.append(f"🏆 **승리팀**: {draft['win_reward']}")
+    if draft.get("lose_reward"):
+        team_lines.append(f"💀 **패배팀**: {draft['lose_reward']}")
+
+    embed.add_field(
+        name="🏆 개인/참가 보상",
+        value="\n".join(personal_lines) if personal_lines else "관리자가 추후 안내합니다.",
+        inline=False
+    )
+    if team_lines:
+        embed.add_field(
+            name="⚔️ 팀 보상",
+            value="\n".join(team_lines),
+            inline=False
+        )
+    embed.add_field(name="등록 관리자", value=creator.mention, inline=False)
+
+    image_url = safe_url(draft.get("image_url") or "")
+    if image_url:
+        embed.set_image(url=image_url)
+
+    footer = draft.get("footer") or "이벤트 안내 | 자세한 내용은 관리자 공지를 확인해주세요."
+    embed.set_footer(text=footer[:2048])
+    return embed
+
+
+class EventBasicModal(discord.ui.Modal, title="🎉 이벤트 기본 정보"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        draft = get_event_draft(user_id)
+        self.user_id = user_id
+        self.title_input = discord.ui.TextInput(
+            label="이벤트 제목",
+            default=draft.get("title", "")[:100],
+            placeholder="예: 주말 출석 이벤트",
+            required=True,
+            max_length=100
+        )
+        self.description_input = discord.ui.TextInput(
+            label="이벤트 설명",
+            default=draft.get("description", "")[:4000],
+            placeholder="이벤트 내용을 입력해주세요.",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        draft = get_event_draft(self.user_id)
+        draft["title"] = str(self.title_input.value)
+        draft["description"] = str(self.description_input.value)
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+class EventRewardModal(discord.ui.Modal, title="🏆 이벤트 보상 설정"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        draft = get_event_draft(user_id)
+        self.user_id = user_id
+        self.reward_1 = discord.ui.TextInput(
+            label="🥇 1등 보상",
+            default=draft.get("reward_1", "")[:100],
+            placeholder="예: 5000P / VIP권",
+            required=False,
+            max_length=100
+        )
+        self.reward_2 = discord.ui.TextInput(
+            label="🥈 2등 보상",
+            default=draft.get("reward_2", "")[:100],
+            placeholder="예: 3000P / 랜덤박스 5개",
+            required=False,
+            max_length=100
+        )
+        self.reward_3 = discord.ui.TextInput(
+            label="🥉 3등 보상",
+            default=draft.get("reward_3", "")[:100],
+            placeholder="예: 1000P / 칭호권",
+            required=False,
+            max_length=100
+        )
+        self.participant_reward = discord.ui.TextInput(
+            label="🎁 참가보상",
+            default=draft.get("participant_reward", "")[:100],
+            placeholder="예: 참가자 전원 300P / 랜덤박스 1개",
+            required=False,
+            max_length=100
+        )
+        self.add_item(self.participant_reward)
+        self.add_item(self.reward_1)
+        self.add_item(self.reward_2)
+        self.add_item(self.reward_3)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        draft = get_event_draft(self.user_id)
+        draft["reward_1"] = str(self.reward_1.value).strip()
+        draft["reward_2"] = str(self.reward_2.value).strip()
+        draft["reward_3"] = str(self.reward_3.value).strip()
+        draft["participant_reward"] = str(self.participant_reward.value).strip()
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+class EventTeamRewardModal(discord.ui.Modal, title="⚔️ 이벤트 팀 보상 설정"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        draft = get_event_draft(user_id)
+        self.user_id = user_id
+        self.win_reward = discord.ui.TextInput(
+            label="🏆 승리팀 보상",
+            default=draft.get("win_reward", "")[:100],
+            placeholder="예: 팀원 전체 5000P / 랜덤박스 10개",
+            required=False,
+            max_length=100
+        )
+        self.lose_reward = discord.ui.TextInput(
+            label="💀 패배팀 보상",
+            default=draft.get("lose_reward", "")[:100],
+            placeholder="예: 팀원 전체 1000P / 참가상",
+            required=False,
+            max_length=100
+        )
+        self.add_item(self.win_reward)
+        self.add_item(self.lose_reward)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        draft = get_event_draft(self.user_id)
+        draft["win_reward"] = str(self.win_reward.value).strip()
+        draft["lose_reward"] = str(self.lose_reward.value).strip()
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+class EventStyleModal(discord.ui.Modal, title="🖼️ 이벤트 임베드 꾸미기"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        draft = get_event_draft(user_id)
+        self.user_id = user_id
+        self.color_input = discord.ui.TextInput(
+            label="색상 HEX",
+            default=draft.get("color", "FFD700")[:10],
+            placeholder="예: FFD700 / FF69B4",
+            required=False,
+            max_length=10
+        )
+        self.image_input = discord.ui.TextInput(
+            label="이미지/GIF URL",
+            default=draft.get("image_url", "")[:500],
+            placeholder="https://...",
+            required=False,
+            max_length=500
+        )
+        self.footer_input = discord.ui.TextInput(
+            label="하단 문구",
+            default=draft.get("footer", "")[:200],
+            required=False,
+            max_length=200
+        )
+        self.add_item(self.color_input)
+        self.add_item(self.image_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = str(self.color_input.value).strip().replace("#", "") or "FFD700"
+        if len(color_value) not in (3, 6) or not all(ch in "0123456789abcdefABCDEF" for ch in color_value):
+            return await interaction.response.send_message("❌ 색상은 `FFD700` 같은 HEX 값으로 입력해주세요.", ephemeral=True)
+
+        image_url = safe_url(str(self.image_input.value))
+        if str(self.image_input.value).strip() and not image_url:
+            return await interaction.response.send_message("❌ 이미지/GIF URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+
+        draft = get_event_draft(self.user_id)
+        draft["color"] = color_value
+        draft["image_url"] = image_url
+        draft["footer"] = str(self.footer_input.value).strip() or "이벤트 안내 | 자세한 내용은 관리자 공지를 확인해주세요."
+
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+class EventScheduleModal(discord.ui.Modal, title="📅 이벤트 예약 설정"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        draft = get_event_draft(user_id)
+        self.user_id = user_id
+        self.time_input = discord.ui.TextInput(
+            label="예약 시간",
+            default=draft.get("time", "")[:20],
+            placeholder="예: 2026-06-12 20:30 / 비우면 즉시 전송",
+            required=False,
+            max_length=20
+        )
+        self.add_item(self.time_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        time_value = str(self.time_input.value).strip()
+        if time_value:
+            event_dt = parse_event_datetime(time_value)
+            if event_dt is None:
+                return await interaction.response.send_message(
+                    "❌ 시간 형식이 올바르지 않습니다.\n예시: `2026-06-12 20:30`",
+                    ephemeral=True
+                )
+            if event_dt <= datetime.datetime.now():
+                return await interaction.response.send_message("❌ 예약 시간은 현재 시간보다 뒤여야 합니다.", ephemeral=True)
+
+        draft = get_event_draft(self.user_id)
+        draft["time"] = time_value
+
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+class EventChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="이벤트를 전송할 채널 선택",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if await reject_if_not_bot_manager(interaction):
+            return
+
+        draft = get_event_draft(interaction.user.id)
+        draft["channel_id"] = self.values[0].id
+
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+class EventChannelSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(EventChannelSelect())
+
+
+class EventCreatePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="기본정보", emoji="📝", style=discord.ButtonStyle.blurple)
+    async def basic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventBasicModal(interaction.user.id))
+
+    @discord.ui.button(label="보상설정", emoji="🏆", style=discord.ButtonStyle.green)
+    async def reward_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventRewardModal(interaction.user.id))
+
+    @discord.ui.button(label="팀보상", emoji="⚔️", style=discord.ButtonStyle.green)
+    async def team_reward_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventTeamRewardModal(interaction.user.id))
+
+    @discord.ui.button(label="꾸미기", emoji="🖼️", style=discord.ButtonStyle.gray)
+    async def style_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventStyleModal(interaction.user.id))
+
+    @discord.ui.button(label="예약시간", emoji="📅", style=discord.ButtonStyle.gray)
+    async def schedule_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventScheduleModal(interaction.user.id))
+
+    @discord.ui.button(label="채널선택", emoji="📢", style=discord.ButtonStyle.gray)
+    async def channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "📢 이벤트를 전송할 채널을 선택해주세요.",
+            view=EventChannelSelectView(),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="이벤트 생성", emoji="✅", style=discord.ButtonStyle.green, row=1)
+    async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        draft = get_event_draft(interaction.user.id)
+
+        if not draft.get("title") or not draft.get("description"):
+            return await interaction.response.send_message(
+                "❌ 먼저 `기본정보` 버튼으로 제목과 설명을 입력해주세요.",
+                ephemeral=True
+            )
+
+        target_channel = interaction.guild.get_channel(draft.get("channel_id") or 0) or interaction.channel
+        time_value = (draft.get("time") or "").strip()
+
+        if time_value:
+            event_dt = parse_event_datetime(time_value)
+            if event_dt is None:
+                return await interaction.response.send_message("❌ 예약 시간 형식이 올바르지 않습니다.", ephemeral=True)
+            if event_dt <= datetime.datetime.now():
+                return await interaction.response.send_message("❌ 예약 시간은 현재 시간보다 뒤여야 합니다.", ephemeral=True)
+
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            c.execute(
+                """
+                INSERT INTO scheduled_events(
+                    guild_id, channel_id, creator_id, title, description,
+                    event_time, reward_point, reward_1, reward_2, reward_3,
+                    participant_reward, win_reward, lose_reward, embed_color, image_url, footer, is_sent, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    interaction.guild.id,
+                    target_channel.id,
+                    interaction.user.id,
+                    draft.get("title"),
+                    draft.get("description"),
+                    event_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    draft.get("reward_1", ""),
+                    draft.get("reward_2", ""),
+                    draft.get("reward_3", ""),
+                    draft.get("participant_reward", ""),
+                    draft.get("win_reward", ""),
+                    draft.get("lose_reward", ""),
+                    draft.get("color", "FFD700"),
+                    safe_url(draft.get("image_url", "")),
+                    draft.get("footer", ""),
+                    now
+                )
+            )
+            conn.commit()
+
+            await interaction.response.send_message(
+                f"✅ 이벤트가 예약되었습니다.\n채널: {target_channel.mention}\n시간: `{event_dt.strftime('%Y-%m-%d %H:%M')}`",
+                ephemeral=True
+            )
+            await send_log(
+                interaction.guild,
+                f"🎉 이벤트 예약\n관리자: {interaction.user.mention}\n채널: {target_channel.mention}\n제목: `{draft.get('title')}`\n시간: `{event_dt.strftime('%Y-%m-%d %H:%M')}`",
+                "general"
+            )
+        else:
+            await target_channel.send(embed=build_final_event_embed_from_draft(draft, interaction.user, "진행 중"))
+            await interaction.response.send_message(f"✅ 이벤트 공지를 {target_channel.mention} 에 전송했습니다.", ephemeral=True)
+            await send_log(
+                interaction.guild,
+                f"🎉 이벤트 즉시 전송\n관리자: {interaction.user.mention}\n채널: {target_channel.mention}\n제목: `{draft.get('title')}`",
+                "general"
+            )
+
+        EVENT_DRAFTS.pop(interaction.user.id, None)
+
+    @discord.ui.button(label="초기화", emoji="🗑️", style=discord.ButtonStyle.red, row=1)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        EVENT_DRAFTS.pop(interaction.user.id, None)
+        get_event_draft(interaction.user.id)
+        await interaction.response.edit_message(
+            embed=build_event_preview_embed(interaction),
+            view=EventCreatePanelView()
+        )
+
+
+@bot.tree.command(name="이벤트", description="박스형 패널로 이벤트 공지를 만들거나 예약합니다.")
+async def event_schedule_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 이벤트를 등록할 수 있습니다.", ephemeral=True)
+
+    get_event_draft(interaction.user.id)
+    await interaction.response.send_message(
+        embed=build_event_preview_embed(interaction),
+        view=EventCreatePanelView(),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="이벤트목록", description="예약된 이벤트 목록을 임베드로 확인합니다.")
+async def event_list_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    c.execute(
+        """
+        SELECT event_id, channel_id, creator_id, title, event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward, is_sent
+        FROM scheduled_events
+        WHERE guild_id=?
+        ORDER BY is_sent ASC, event_time ASC
+        LIMIT 10
+        """,
+        (interaction.guild.id,)
+    )
+    rows = c.fetchall()
+
+    embed = discord.Embed(
+        title="📅 이벤트 목록",
+        description="최근 예약/등록된 이벤트 목록입니다.",
+        color=BOT_COLOR
+    )
+
+    if not rows:
+        embed.add_field(
+            name="예약된 이벤트 없음",
+            value="아직 등록된 이벤트가 없습니다.\n관리자는 `/이벤트` 명령어로 이벤트를 만들 수 있어요.",
+            inline=False
+        )
+    else:
+        for event_id, channel_id, creator_id, title, event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward, is_sent in rows:
+            reward_lines = []
+            if reward_1:
+                reward_lines.append(f"🥇 {reward_1}")
+            if reward_2:
+                reward_lines.append(f"🥈 {reward_2}")
+            if reward_3:
+                reward_lines.append(f"🥉 {reward_3}")
+            if participant_reward:
+                reward_lines.append(f"🎁 참가 {participant_reward}")
+            if win_reward:
+                reward_lines.append(f"🏆 승리팀 {win_reward}")
+            if lose_reward:
+                reward_lines.append(f"💀 패배팀 {lose_reward}")
+
+            status = "✅ 전송 완료" if int(is_sent or 0) else "⏰ 예약 중"
+            value = (
+                f"상태: **{status}**\n"
+                f"시간: `{event_time}`\n"
+                f"채널: <#{channel_id}>\n"
+                f"등록자: <@{creator_id}>\n"
+                f"보상: {', '.join(reward_lines) if reward_lines else '추후 안내'}"
+            )
+            embed.add_field(
+                name=f"#{event_id} · {title}",
+                value=value[:1024],
+                inline=False
+            )
+
+    embed.set_footer(text="관리자는 /이벤트 명령어로 임베드를 직접 꾸며 예약할 수 있어요.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# =========================
+# 이벤트 종료 / 보상 지급 명령어
+# =========================
+
+def get_scheduled_event(guild_id: int, event_id: int):
+    c.execute(
+        """
+        SELECT event_id, guild_id, channel_id, creator_id, title, description,
+               event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward
+        FROM scheduled_events
+        WHERE guild_id=? AND event_id=?
+        """,
+        (guild_id, event_id)
+    )
+    return c.fetchone()
+
+
+def get_event_result_channel(guild: discord.Guild, fallback_channel: discord.TextChannel = None):
+    return get_channel_by_id_or_name(
+        guild,
+        0,
+        ["🏆-당첨자발표", "당첨자발표", "🎁-이벤트보상", "📢-이벤트공지"],
+        "text"
+    ) or fallback_channel
+
+
+def add_event_reward_point(guild_id: int, user_id: int, amount: int):
+    if amount <= 0:
+        return 0
+    now_point = get_user_point(guild_id, user_id)
+    set_user_point(guild_id, user_id, now_point + amount)
+    return amount
+
+
+def add_inventory_reward(user_id: int, item_text: str):
+    """쉼표로 적은 아이템을 인벤토리에 1개씩 넣습니다. 예: 랜덤박스, 강화보호권"""
+    item_text = (item_text or "").strip()
+    if not item_text:
+        return []
+    items = []
+    for raw in re.split(r"[,/|]", item_text):
+        item = normalize_shop_item(raw.strip())
+        if not item:
+            continue
+        c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, item, 1))
+        items.append(item)
+    if items:
+        conn.commit()
+    return items
+
+
+def event_reward_text(value: str, fallback: str = "관리자 지정 보상"):
+    value = (value or "").strip()
+    return value if value else fallback
+
+
+
+EVENT_END_DRAFTS = {}
+
+
+def get_event_end_draft(user_id: int):
+    draft = EVENT_END_DRAFTS.get(user_id)
+    if draft is None:
+        draft = {
+            "event_id": "",
+            "winner_team": "",
+            "loser_team": "",
+            "note": "",
+        }
+        EVENT_END_DRAFTS[user_id] = draft
+    return draft
+
+
+def build_event_end_preview_embed(interaction: discord.Interaction):
+    draft = get_event_end_draft(interaction.user.id)
+    event_id_text = str(draft.get("event_id") or "").strip()
+    row = None
+    if event_id_text.isdigit() and interaction.guild:
+        row = get_scheduled_event(interaction.guild.id, int(event_id_text))
+
+    embed = discord.Embed(
+        title="🏁 이벤트 종료 패널",
+        description=(
+            "아래 버튼으로 이벤트 종료 임베드를 만들 수 있어요.\n\n"
+            "1️⃣ **이벤트 종료 내용 입력** 버튼 클릭\n"
+            "2️⃣ 이벤트 번호, 우승팀, 패배팀, 결과 설명 입력\n"
+            "3️⃣ **종료 발표하기** 버튼 클릭"
+        ),
+        color=BOT_COLOR
+    )
+
+    embed.add_field(name="이벤트 번호", value=f"`{event_id_text}`" if event_id_text else "미입력", inline=True)
+    embed.add_field(name="발표 채널", value=(get_event_result_channel(interaction.guild, interaction.channel).mention if interaction.guild else "자동"), inline=True)
+
+    if row:
+        event_id, guild_id, channel_id, creator_id, title, description, event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward = row
+        embed.add_field(name="선택된 이벤트", value=f"**#{event_id} · {title}**\n예약/등록 시간: `{event_time}`", inline=False)
+        reward_lines = []
+        if reward_1:
+            reward_lines.append(f"🥇 1등: {reward_1}")
+        if reward_2:
+            reward_lines.append(f"🥈 2등: {reward_2}")
+        if reward_3:
+            reward_lines.append(f"🥉 3등: {reward_3}")
+        if participant_reward:
+            reward_lines.append(f"🎁 참가보상: {participant_reward}")
+        if win_reward:
+            reward_lines.append(f"🏆 승리팀: {win_reward}")
+        if lose_reward:
+            reward_lines.append(f"💀 패배팀: {lose_reward}")
+        embed.add_field(name="등록된 보상", value="\n".join(reward_lines) if reward_lines else "추후 안내", inline=False)
+    elif event_id_text:
+        embed.add_field(name="선택된 이벤트", value="❌ 해당 이벤트 번호를 찾을 수 없습니다. `/이벤트목록`에서 확인해주세요.", inline=False)
+
+    embed.add_field(name="🏆 우승팀", value=draft.get("winner_team") or "미입력", inline=True)
+    embed.add_field(name="💀 패배팀", value=draft.get("loser_team") or "미입력", inline=True)
+    embed.add_field(name="📝 결과 설명", value=(draft.get("note") or "미입력")[:1024], inline=False)
+    embed.set_footer(text="종료 발표 후 /개인보상 또는 /팀보상으로 보상을 지급할 수 있어요.")
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    return embed
+
+
+class EventEndEditModal(discord.ui.Modal, title="이벤트 종료 임베드 입력"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        draft = get_event_end_draft(user_id)
+        self.event_id_input = discord.ui.TextInput(
+            label="이벤트 번호",
+            placeholder="/이벤트목록에서 보이는 번호 예: 5",
+            default=str(draft.get("event_id") or "")[:20],
+            required=True,
+            max_length=20
+        )
+        self.winner_input = discord.ui.TextInput(
+            label="우승팀",
+            placeholder="예: 블루팀 / 1팀 / 우승자 없음",
+            default=str(draft.get("winner_team") or "")[:100],
+            required=False,
+            max_length=100
+        )
+        self.loser_input = discord.ui.TextInput(
+            label="패배팀",
+            placeholder="예: 레드팀 / 2팀 / 패배팀 없음",
+            default=str(draft.get("loser_team") or "")[:100],
+            required=False,
+            max_length=100
+        )
+        self.note_input = discord.ui.TextInput(
+            label="결과 설명",
+            placeholder="예: 모두 수고하셨습니다! 보상은 곧 지급됩니다.",
+            default=str(draft.get("note") or "")[:1000],
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=1000
+        )
+        self.add_item(self.event_id_input)
+        self.add_item(self.winner_input)
+        self.add_item(self.loser_input)
+        self.add_item(self.note_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        event_id_value = str(self.event_id_input.value).strip()
+        if not event_id_value.isdigit():
+            return await interaction.response.send_message("❌ 이벤트 번호는 숫자로 입력해주세요.", ephemeral=True)
+
+        draft = get_event_end_draft(interaction.user.id)
+        draft["event_id"] = event_id_value
+        draft["winner_team"] = str(self.winner_input.value).strip()
+        draft["loser_team"] = str(self.loser_input.value).strip()
+        draft["note"] = str(self.note_input.value).strip()
+
+        await interaction.response.edit_message(
+            embed=build_event_end_preview_embed(interaction),
+            view=EventEndPanelView()
+        )
+
+
+class EventEndPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="종료 내용 입력", emoji="📝", style=discord.ButtonStyle.blurple)
+    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        if await reject_if_not_bot_manager(interaction):
+            return
+        await interaction.response.send_modal(EventEndEditModal(interaction.user.id))
+
+    @discord.ui.button(label="종료 발표하기", emoji="🏁", style=discord.ButtonStyle.green)
+    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 관리자만 이벤트를 종료할 수 있습니다.", ephemeral=True)
+
+        draft = get_event_end_draft(interaction.user.id)
+        event_id_text = str(draft.get("event_id") or "").strip()
+        if not event_id_text.isdigit():
+            return await interaction.response.send_message("❌ 먼저 `종료 내용 입력`에서 이벤트 번호를 입력해주세요.", ephemeral=True)
+
+        row = get_scheduled_event(interaction.guild.id, int(event_id_text))
+        if not row:
+            return await interaction.response.send_message("❌ 해당 이벤트 번호를 찾을 수 없습니다. `/이벤트목록`에서 ID를 확인해주세요.", ephemeral=True)
+
+        event_id, guild_id, channel_id, creator_id, title, description, event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward = row
+        winner_team = str(draft.get("winner_team") or "").strip()
+        loser_team = str(draft.get("loser_team") or "").strip()
+        note = str(draft.get("note") or "").strip()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        c.execute(
+            """
+            INSERT INTO event_results(event_id, guild_id, moderator_id, winner_team, loser_team, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, guild_id, interaction.user.id, winner_team, loser_team, note, now)
+        )
+        c.execute("UPDATE scheduled_events SET is_sent=1 WHERE guild_id=? AND event_id=?", (guild_id, event_id))
+        conn.commit()
+
+        embed = discord.Embed(
+            title="🏁 이벤트 종료",
+            description=f"**{title}** 이벤트가 종료되었습니다.",
+            color=BOT_COLOR
+        )
+        embed.add_field(name="이벤트 번호", value=f"`{event_id}`", inline=True)
+        embed.add_field(name="담당 관리자", value=interaction.user.mention, inline=True)
+        embed.add_field(name="기존 이벤트 채널", value=f"<#{channel_id}>", inline=True)
+        if winner_team:
+            embed.add_field(name="🏆 우승팀", value=winner_team, inline=False)
+        if loser_team:
+            embed.add_field(name="💀 패배팀", value=loser_team, inline=False)
+        if note:
+            embed.add_field(name="📝 결과 설명", value=note[:1024], inline=False)
+
+        reward_lines = []
+        if reward_1:
+            reward_lines.append(f"🥇 1등 보상: {reward_1}")
+        if reward_2:
+            reward_lines.append(f"🥈 2등 보상: {reward_2}")
+        if reward_3:
+            reward_lines.append(f"🥉 3등 보상: {reward_3}")
+        if win_reward:
+            reward_lines.append(f"🏆 승리팀 보상: {win_reward}")
+        if lose_reward:
+            reward_lines.append(f"💀 패배팀 보상: {lose_reward}")
+        embed.add_field(name="🎁 등록된 보상", value="\n".join(reward_lines) if reward_lines else "보상은 관리자가 추후 안내합니다.", inline=False)
+        embed.add_field(name="🎁 다음 단계", value="`/개인보상` 또는 `/팀보상`으로 실제 보상을 지급할 수 있습니다.", inline=False)
+        embed.set_footer(text="이벤트 종료 기록이 저장되었습니다.")
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+        target = get_event_result_channel(interaction.guild, interaction.channel)
+        try:
+            await target.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            target = interaction.channel
+            await target.send(embed=embed)
+
+        EVENT_END_DRAFTS.pop(interaction.user.id, None)
+        await interaction.response.edit_message(
+            content=f"✅ 이벤트 종료 발표를 {target.mention} 에 올렸습니다.",
+            embed=None,
+            view=None
+        )
+        await send_log(interaction.guild, f"🏁 이벤트 종료\n관리자: {interaction.user.mention}\n이벤트: #{event_id} {title}", "general")
+
+    @discord.ui.button(label="초기화", emoji="🗑️", style=discord.ButtonStyle.red)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        EVENT_END_DRAFTS.pop(interaction.user.id, None)
+        get_event_end_draft(interaction.user.id)
+        await interaction.response.edit_message(
+            embed=build_event_end_preview_embed(interaction),
+            view=EventEndPanelView()
+        )
+
+
+@bot.tree.command(name="이벤트종료", description="박스형 패널로 이벤트 종료 임베드를 만들고 발표합니다.")
+async def event_end_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 이벤트를 종료할 수 있습니다.", ephemeral=True)
+
+    get_event_end_draft(interaction.user.id)
+    await interaction.response.send_message(
+        embed=build_event_end_preview_embed(interaction),
+        view=EventEndPanelView(),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="개인보상", description="이벤트 1등~3등 개인 보상을 지급하고 임베드로 발표합니다.")
+@app_commands.describe(
+    이벤트번호="/이벤트목록에서 확인한 이벤트 ID",
+    일등="1등 유저",
+    이등="2등 유저",
+    삼등="3등 유저",
+    일등포인트="1등에게 지급할 포인트",
+    이등포인트="2등에게 지급할 포인트",
+    삼등포인트="3등에게 지급할 포인트",
+    추가아이템="쉼표로 구분해서 모든 수상자에게 지급할 아이템 예: 랜덤박스, 강화보호권",
+    발표채널="발표할 채널. 비우면 당첨자발표 채널로 갑니다."
+)
+async def personal_event_reward_command(
+    interaction: discord.Interaction,
+    이벤트번호: int,
+    일등: discord.Member,
+    이등: discord.Member = None,
+    삼등: discord.Member = None,
+    일등포인트: int = 0,
+    이등포인트: int = 0,
+    삼등포인트: int = 0,
+    추가아이템: str = "",
+    발표채널: discord.TextChannel = None
+):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 보상을 지급할 수 있습니다.", ephemeral=True)
+
+    row = get_scheduled_event(interaction.guild.id, 이벤트번호)
+    if not row:
+        return await interaction.response.send_message("❌ 해당 이벤트 ID를 찾을 수 없습니다. `/이벤트목록`에서 ID를 확인해주세요.", ephemeral=True)
+
+    event_id, guild_id, channel_id, creator_id, title, description, event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward = row
+    winners = [("🥇 1등", 일등, reward_1, 일등포인트), ("🥈 2등", 이등, reward_2, 이등포인트), ("🥉 3등", 삼등, reward_3, 삼등포인트)]
+
+    embed = discord.Embed(title="🏆 개인 순위 보상 지급", description=f"**{title}** 이벤트 개인 보상 결과입니다.", color=BOT_COLOR)
+    for rank_name, member, reward_text, point_amount in winners:
+        if member is None:
+            continue
+        paid = add_event_reward_point(guild_id, member.id, max(point_amount, 0))
+        items = add_inventory_reward(member.id, 추가아이템)
+        lines = [f"대상: {member.mention}", f"설정 보상: {event_reward_text(reward_text)}"]
+        if paid:
+            lines.append(f"지급 포인트: **{paid:,}P**")
+        if items:
+            lines.append("지급 아이템: " + ", ".join(f"`{item}`" for item in items))
+        embed.add_field(name=rank_name, value="\n".join(lines), inline=False)
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT INTO event_results(
+            event_id, guild_id, moderator_id, first_user, second_user, third_user,
+            first_point, second_point, third_point, note, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, guild_id, interaction.user.id, 일등.id if 일등 else 0, 이등.id if 이등 else 0, 삼등.id if 삼등 else 0, max(일등포인트, 0), max(이등포인트, 0), max(삼등포인트, 0), f"개인보상 아이템: {추가아이템}" if 추가아이템 else "개인보상 지급", now)
+    )
+    conn.commit()
+
+    embed.set_footer(text="축하드립니다! 보상 지급 기록이 저장되었습니다.")
+    target = 발표채널 or get_event_result_channel(interaction.guild, interaction.channel)
+    try:
+        await target.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        target = interaction.channel
+        await target.send(embed=embed)
+
+    await interaction.response.send_message(f"✅ 개인 보상 발표와 지급을 완료했습니다. 발표 채널: {target.mention}", ephemeral=True)
+    await send_log(interaction.guild, f"🏆 개인 이벤트 보상 지급\n관리자: {interaction.user.mention}\n이벤트: #{event_id} {title}", "general")
+
+
+@bot.tree.command(name="팀보상", description="승리팀/패배팀 보상을 역할 기준으로 지급하고 임베드로 발표합니다.")
+@app_commands.describe(
+    이벤트번호="/이벤트목록에서 확인한 이벤트 ID",
+    승리팀="승리팀 이름",
+    패배팀="패배팀 이름",
+    승리팀역할="승리팀 멤버들이 가진 역할. 선택하면 해당 역할 멤버에게 포인트가 지급됩니다.",
+    패배팀역할="패배팀 멤버들이 가진 역할. 선택하면 해당 역할 멤버에게 포인트가 지급됩니다.",
+    승리팀포인트="승리팀 역할 멤버 1명당 지급 포인트",
+    패배팀포인트="패배팀 역할 멤버 1명당 지급 포인트",
+    추가아이템="쉼표로 구분해서 보상 대상자에게 지급할 아이템 예: 랜덤박스, 강화보호권",
+    발표채널="발표할 채널. 비우면 당첨자발표 채널로 갑니다."
+)
+async def team_event_reward_command(
+    interaction: discord.Interaction,
+    이벤트번호: int,
+    승리팀: str,
+    패배팀: str = "",
+    승리팀역할: discord.Role = None,
+    패배팀역할: discord.Role = None,
+    승리팀포인트: int = 0,
+    패배팀포인트: int = 0,
+    추가아이템: str = "",
+    발표채널: discord.TextChannel = None
+):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 팀 보상을 지급할 수 있습니다.", ephemeral=True)
+
+    row = get_scheduled_event(interaction.guild.id, 이벤트번호)
+    if not row:
+        return await interaction.response.send_message("❌ 해당 이벤트 ID를 찾을 수 없습니다. `/이벤트목록`에서 ID를 확인해주세요.", ephemeral=True)
+
+    event_id, guild_id, channel_id, creator_id, title, description, event_time, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward = row
+
+    def reward_role_members(role: discord.Role, point_amount: int):
+        if role is None:
+            return []
+        rewarded = []
+        for member in role.members:
+            if member.bot:
+                continue
+            paid = add_event_reward_point(guild_id, member.id, max(point_amount, 0))
+            items = add_inventory_reward(member.id, 추가아이템)
+            rewarded.append((member, paid, items))
+        return rewarded
+
+    win_members = reward_role_members(승리팀역할, 승리팀포인트)
+    lose_members = reward_role_members(패배팀역할, 패배팀포인트)
+
+    embed = discord.Embed(title="⚔️ 팀 보상 지급", description=f"**{title}** 이벤트 팀 보상 결과입니다.", color=BOT_COLOR)
+    win_value = [f"팀명: **{승리팀}**", f"설정 보상: {event_reward_text(win_reward)}"]
+    if 승리팀역할:
+        win_value.append(f"대상 역할: {승리팀역할.mention}")
+        win_value.append(f"지급 인원: **{len(win_members)}명**")
+    if 승리팀포인트 > 0:
+        win_value.append(f"1인 지급 포인트: **{승리팀포인트:,}P**")
+    embed.add_field(name="🏆 승리팀", value="\n".join(win_value), inline=False)
+
+    if 패배팀 or 패배팀역할:
+        lose_value = [f"팀명: **{패배팀 or '미입력'}**", f"설정 보상: {event_reward_text(lose_reward)}"]
+        if 패배팀역할:
+            lose_value.append(f"대상 역할: {패배팀역할.mention}")
+            lose_value.append(f"지급 인원: **{len(lose_members)}명**")
+        if 패배팀포인트 > 0:
+            lose_value.append(f"1인 지급 포인트: **{패배팀포인트:,}P**")
+        embed.add_field(name="💀 패배팀", value="\n".join(lose_value), inline=False)
+
+    if 추가아이템:
+        embed.add_field(name="🎁 추가 아이템", value=f"`{추가아이템}`", inline=False)
+    embed.set_footer(text="팀 보상 지급 기록이 저장되었습니다.")
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT INTO event_results(
+            event_id, guild_id, moderator_id, winner_team, loser_team,
+            win_role_id, lose_role_id, win_point, lose_point, note, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, guild_id, interaction.user.id, 승리팀, 패배팀, 승리팀역할.id if 승리팀역할 else 0, 패배팀역할.id if 패배팀역할 else 0, max(승리팀포인트, 0), max(패배팀포인트, 0), f"팀보상 아이템: {추가아이템}" if 추가아이템 else "팀보상 지급", now)
+    )
+    conn.commit()
+
+    target = 발표채널 or get_event_result_channel(interaction.guild, interaction.channel)
+    try:
+        await target.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        target = interaction.channel
+        await target.send(embed=embed)
+
+    await interaction.response.send_message(f"✅ 팀 보상 발표와 지급을 완료했습니다. 발표 채널: {target.mention}", ephemeral=True)
+    await send_log(interaction.guild, f"⚔️ 팀 이벤트 보상 지급\n관리자: {interaction.user.mention}\n이벤트: #{event_id} {title}", "general")
+
+
+@tasks.loop(seconds=30)
+async def scheduled_event_sender():
+    now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        SELECT event_id, guild_id, channel_id, creator_id, title, description, event_time, reward_point, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward, embed_color, image_url, footer
+        FROM scheduled_events
+        WHERE is_sent=0 AND event_time<=?
+        ORDER BY event_time ASC
+        """,
+        (now_text,)
+    )
+    rows = c.fetchall()
+
+    for event_id, guild_id, channel_id, creator_id, title, description, event_time, reward_point, reward_1, reward_2, reward_3, participant_reward, win_reward, lose_reward, embed_color, image_url, footer in rows:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            c.execute("UPDATE scheduled_events SET is_sent=1 WHERE event_id=?", (event_id,))
+            conn.commit()
+            continue
+
+        embed = discord.Embed(
+            title=f"🎉 {title}",
+            description=description,
+            color=normalize_embed_color(embed_color or "FFD700")
+        )
+        embed.add_field(name="상태", value="진행 중", inline=True)
+        personal_lines = []
+        if reward_1:
+            personal_lines.append(f"🥇 **1등**: {reward_1}")
+        if reward_2:
+            personal_lines.append(f"🥈 **2등**: {reward_2}")
+        if reward_3:
+            personal_lines.append(f"🥉 **3등**: {reward_3}")
+        if participant_reward:
+            personal_lines.append(f"🎁 **참가보상**: {participant_reward}")
+
+        team_lines = []
+        if win_reward:
+            team_lines.append(f"🏆 **승리팀**: {win_reward}")
+        if lose_reward:
+            team_lines.append(f"💀 **패배팀**: {lose_reward}")
+
+        embed.add_field(
+            name="🏆 개인/참가 보상",
+            value="\n".join(personal_lines) if personal_lines else "관리자가 추후 안내합니다.",
+            inline=False
+        )
+        if team_lines:
+            embed.add_field(
+                name="⚔️ 팀 보상",
+                value="\n".join(team_lines),
+                inline=False
+            )
+        embed.add_field(name="등록 관리자", value=f"<@{creator_id}>", inline=False)
+        if image_url:
+            embed.set_image(url=image_url)
+        embed.set_footer(text=(footer or "예약된 이벤트가 시작되었습니다!")[:2048])
+
+        try:
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        c.execute("UPDATE scheduled_events SET is_sent=1 WHERE event_id=?", (event_id,))
+        conn.commit()
+
+# =========================
+# 공지 / 관리자 패널 / 도움말
+# =========================
+
+class AnnouncementModal(discord.ui.Modal):
+    def __init__(self, mode):
+        super().__init__(title="공지 작성")
+        self.mode = mode
+        self.title_input = discord.ui.TextInput(label="제목", required=True, max_length=100)
+        self.content_input = discord.ui.TextInput(label="내용", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+        self.add_item(self.title_input)
+        self.add_item(self.content_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        title = self.title_input.value
+        content = self.content_input.value
+        if self.mode == "normal":
+            await interaction.channel.send(f"📢 **{title}**\n\n{content}")
+        elif self.mode == "embed":
+            await interaction.channel.send(embed=discord.Embed(title=f"🌸 {title}", description=content, color=BOT_COLOR))
+        elif self.mode == "event":
+            embed = discord.Embed(title=f"🎉 {title}", description=content, color=discord.Color.gold())
+            embed.set_footer(text="이벤트 진행 중!")
+            await interaction.channel.send(embed=embed)
+        await interaction.response.send_message("✅ 공지가 전송되었습니다.", ephemeral=True)
+
+
+class DMAnnouncementModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="DM 공지")
+        self.user_id = discord.ui.TextInput(label="유저 ID", required=True)
+        self.message_input = discord.ui.TextInput(label="메시지", style=discord.TextStyle.paragraph, required=True)
+        self.add_item(self.user_id)
+        self.add_item(self.message_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user = await bot.fetch_user(int(self.user_id.value))
+            await user.send(self.message_input.value)
+        except Exception:
+            return await interaction.response.send_message("❌ DM 전송 실패", ephemeral=True)
+        await interaction.response.send_message("✅ DM 전송 완료", ephemeral=True)
+
+
+class AnnouncementView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="📢 일반 공지", style=discord.ButtonStyle.blurple)
+    async def normal_notice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnnouncementModal("normal"))
+
+    @discord.ui.button(label="🌸 임베드 공지", style=discord.ButtonStyle.success)
+    async def embed_notice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnnouncementModal("embed"))
+
+    @discord.ui.button(label="🎉 이벤트 공지", style=discord.ButtonStyle.danger)
+    async def event_notice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnnouncementModal("event"))
+
+    @discord.ui.button(label="📩 DM 공지", style=discord.ButtonStyle.secondary)
+    async def dm_notice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DMAnnouncementModal())
+
+
+
+class CleanModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="채팅 청소")
+        self.amount = discord.ui.TextInput(
+            label="삭제할 메시지 개수",
+            placeholder="1 이상 숫자",
+            required=True,
+            max_length=10
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message("❌ 메시지 관리 권한이 없습니다.", ephemeral=True)
+
+        try:
+            amount = int(self.amount.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자만 입력해주세요.", ephemeral=True)
+
+        if amount < 1:
+            return await interaction.response.send_message("❌ 1개 이상 입력해주세요.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        deleted_count = await purge_messages_unlimited(interaction.channel, amount)
+
+        await interaction.followup.send(f"🧹 메시지 {deleted_count}개를 삭제했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🧹 채팅 청소\n관리자: {interaction.user.mention}\n채널: {interaction.channel.mention}\n삭제 개수: {deleted_count}개", "chat")
+
+
+class KickModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="유저 킥")
+        self.user_id = discord.ui.TextInput(
+            label="유저 ID",
+            placeholder="킥할 유저 ID를 입력하세요",
+            required=True,
+            max_length=30
+        )
+        self.reason = discord.ui.TextInput(
+            label="사유",
+            placeholder="사유를 입력하세요",
+            required=False,
+            max_length=300
+        )
+        self.add_item(self.user_id)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.kick_members:
+            return await interaction.response.send_message("❌ 킥 권한이 없습니다.", ephemeral=True)
+
+        try:
+            user_id = int(self.user_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID는 숫자로 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+
+        if member == interaction.user:
+            return await interaction.response.send_message("❌ 자기 자신은 킥할 수 없습니다.", ephemeral=True)
+
+        reason = self.reason.value or "사유 없음"
+        await member.kick(reason=reason)
+
+        await interaction.response.send_message(f"🔨 {member} 님을 킥했습니다.\n사유: {reason}", ephemeral=True)
+        await send_log(interaction.guild, f"🔨 킥\n대상: {member}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+
+
+class BanModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="유저 밴")
+        self.user_id = discord.ui.TextInput(
+            label="유저 ID",
+            placeholder="밴할 유저 ID를 입력하세요",
+            required=True,
+            max_length=30
+        )
+        self.reason = discord.ui.TextInput(
+            label="사유",
+            placeholder="사유를 입력하세요",
+            required=False,
+            max_length=300
+        )
+        self.add_item(self.user_id)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.ban_members:
+            return await interaction.response.send_message("❌ 밴 권한이 없습니다.", ephemeral=True)
+
+        try:
+            user_id = int(self.user_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID는 숫자로 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+
+        if member == interaction.user:
+            return await interaction.response.send_message("❌ 자기 자신은 밴할 수 없습니다.", ephemeral=True)
+
+        reason = self.reason.value or "사유 없음"
+        await member.ban(reason=reason)
+
+        await interaction.response.send_message(f"⛔ {member} 님을 밴했습니다.\n사유: {reason}", ephemeral=True)
+        await send_log(interaction.guild, f"⛔ 밴\n대상: {member}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+
+
+
+# =========================
+# 통합 랭킹 패널
+# =========================
+
+def build_ranking_embed(guild_id: int):
+    point_text = ""
+    level_text = ""
+    attendance_text = ""
+
+    c.execute("SELECT user_id, point FROM users WHERE guild_id=? ORDER BY point DESC LIMIT 10", (guild_id,))
+    point_rows = c.fetchall()
+    if point_rows:
+        for index, (user_id, point) in enumerate(point_rows, start=1):
+            point_text += f"**{index}위** <@{user_id}> - {point}P\n"
+    else:
+        point_text = "아직 포인트 데이터가 없습니다."
+
+    c.execute("""
+        SELECT user_id, level, exp
+        FROM levels
+        ORDER BY level DESC, exp DESC
+        LIMIT 10
+    """)
+    level_rows = c.fetchall()
+    if level_rows:
+        for index, (user_id, level, exp) in enumerate(level_rows, start=1):
+            level_text += f"**{index}위** <@{user_id}> - Lv.{level} / {exp} EXP\n"
+    else:
+        level_text = "아직 레벨 데이터가 없습니다."
+
+    c.execute("""
+        SELECT user_id, attendance_count, streak
+        FROM users
+        WHERE guild_id=?
+        ORDER BY attendance_count DESC, streak DESC
+        LIMIT 10
+    """, (guild_id,))
+    attendance_rows = c.fetchall()
+    if attendance_rows:
+        for index, (user_id, attendance_count, streak) in enumerate(attendance_rows, start=1):
+            attendance_text += f"**{index}위** <@{user_id}> - 출석 {attendance_count}일 / 연속 {streak}일\n"
+    else:
+        attendance_text = "아직 출석 데이터가 없습니다."
+
+    embed = discord.Embed(
+        title="🏆 만능 봇 통합 랭킹",
+        description="포인트, 레벨, 출석 랭킹 TOP 10입니다.",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="💰 포인트 랭킹", value=point_text[:1024], inline=False)
+    embed.add_field(name="📊 레벨 랭킹", value=level_text[:1024], inline=False)
+    embed.add_field(name="🎀 출석 랭킹", value=attendance_text[:1024], inline=False)
+    embed.set_footer(text="⭐ 만능 봇 | 통합 랭킹")
+    return embed
+
+
+@bot.tree.command(name="랭킹", description="포인트, 레벨, 출석 랭킹을 한 번에 확인합니다.")
+async def all_ranking(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_ranking_embed(interaction.guild.id))
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="📢 공지 패널", style=discord.ButtonStyle.blurple)
+    async def notice_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="📢 만능 봇 공지 패널", description="버튼을 눌러 공지를 작성하세요.", color=BOT_COLOR)
+        await interaction.response.send_message(embed=embed, view=AnnouncementView(), ephemeral=True)
+   
+    @discord.ui.button(label="💰 경제 패널", style=discord.ButtonStyle.green)
+    async def economy_panel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="💰 만능 봇 경제 패널", description="포인트, 일일 보상, 가챠, 백업 기능입니다.", color=discord.Color.gold())
+        await interaction.response.send_message(embed=embed, view=EconomyView(), ephemeral=True)
+
+    @discord.ui.button(label="🎫 티켓 패널", style=discord.ButtonStyle.gray)
+    async def ticket_panel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = create_embed("🎫 만능 봇 통합 티켓 패널", "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n🎫 일반 티켓\n💬 문의 티켓\n🚨 신고 티켓")
+        await interaction.response.send_message(embed=embed, view=UnifiedTicketView(), ephemeral=True)
+
+    @discord.ui.button(label="🏆 통합 랭킹", style=discord.ButtonStyle.blurple)
+    async def ranking_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=build_ranking_embed(), ephemeral=True)
+
+
+# =====================================================
+# 관리자 전용 패널: 경고 / 청소 / 킥 / 밴
+# =====================================================
+
+class CleanModal(discord.ui.Modal, title="메시지 청소"):
+    amount = discord.ui.TextInput(label="삭제할 메시지 개수", placeholder="1 이상", required=True, max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message("❌ 메시지 관리 권한이 필요해요.", ephemeral=True)
+
+        try:
+            amount = int(self.amount.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자만 입력해주세요.", ephemeral=True)
+
+        if amount < 1:
+            return await interaction.response.send_message("❌ 1개 이상 입력해주세요.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        deleted_count = await purge_messages_unlimited(interaction.channel, amount)
+        await interaction.followup.send(f"🧹 메시지 {deleted_count}개를 삭제했어요.", ephemeral=True)
+
+
+class KickModal(discord.ui.Modal, title="유저 킥"):
+    user_id = discord.ui.TextInput(label="유저 ID", placeholder="킥할 유저 ID", required=True)
+    reason = discord.ui.TextInput(label="사유", placeholder="사유를 입력하세요", required=False, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.kick_members:
+            return await interaction.response.send_message("❌ 킥 권한이 필요해요.", ephemeral=True)
+
+        try:
+            target_id = int(self.user_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID는 숫자만 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(target_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없어요.", ephemeral=True)
+
+        if member == interaction.user:
+            return await interaction.response.send_message("❌ 자기 자신은 킥할 수 없어요.", ephemeral=True)
+
+        reason = self.reason.value or "사유 없음"
+        await member.kick(reason=reason)
+        await interaction.response.send_message(f"🔨 {member} 님을 킥했어요.\n사유: {reason}", ephemeral=True)
+
+        if "send_log" in globals():
+            await send_log(interaction.guild, f"🔨 킥\n대상: {member}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+
+
+class BanModal(discord.ui.Modal, title="유저 밴"):
+    user_id = discord.ui.TextInput(label="유저 ID", placeholder="밴할 유저 ID", required=True)
+    reason = discord.ui.TextInput(label="사유", placeholder="사유를 입력하세요", required=False, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.ban_members:
+            return await interaction.response.send_message("❌ 밴 권한이 필요해요.", ephemeral=True)
+
+        try:
+            target_id = int(self.user_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID는 숫자만 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(target_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없어요.", ephemeral=True)
+
+        if member == interaction.user:
+            return await interaction.response.send_message("❌ 자기 자신은 밴할 수 없어요.", ephemeral=True)
+
+        reason = self.reason.value or "사유 없음"
+        await member.ban(reason=reason)
+        await interaction.response.send_message(f"⛔ {member} 님을 밴했어요.\n사유: {reason}", ephemeral=True)
+
+        if "send_log" in globals():
+            await send_log(interaction.guild, f"⛔ 밴\n대상: {member}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+
+
+class StaffToolPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="경고 패널", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def warning_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.moderate_members:
+            return await interaction.response.send_message("❌ 권한이 없어요.", ephemeral=True)
+
+        embed = discord.Embed(title="⚠️ 경고 관리 패널", description="아래 버튼으로 경고를 관리하세요.", color=discord.Color.orange())
+        await interaction.response.send_message(embed=embed, view=WarnManagePanel(), ephemeral=True)
+
+    @discord.ui.button(label="청소", emoji="🧹", style=discord.ButtonStyle.blurple)
+    async def clean_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CleanModal())
+
+    @discord.ui.button(label="킥", emoji="🔨", style=discord.ButtonStyle.gray)
+    async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(KickModal())
+
+    @discord.ui.button(label="밴", emoji="⛔", style=discord.ButtonStyle.red)
+    async def ban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BanModal())
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="관리도구", description="경고, 청소, 킥, 밴 관리자 전용 패널을 엽니다.")
+async def staff_tool_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        if "send_log" in globals():
+            await send_log(interaction.guild, f"🚫 관리도구 권한 부족\n유저: {interaction.user.mention}")
+        return await interaction.response.send_message("❌ 관리자만 사용할 수 있어요.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🔨 만능 봇 관리자 전용 도구",
+        description=(
+            "아래 버튼으로 관리 기능을 사용할 수 있어요.\n\n"
+            "⚠️ **경고 패널**\n"
+            "🧹 **청소**\n"
+            "🔨 **킥**\n"
+            "⛔ **밴**"
+        ),
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=StaffToolPanelView(), ephemeral=True)
+
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="관리자패널", description="만능 봇 관리자 패널을 엽니다.")
+async def admin_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await send_log(interaction.guild, f"🚫 관리자패널 권한 부족\n유저: {interaction.user.mention}")
+        return await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+    embed = discord.Embed(title="🎛️ 만능 봇 관리자 패널", description="아래 버튼으로 서버를 관리하세요.\n\n📢 공지 패널\n⚠️ 경고 패널\n💰 경제 패널\n🎫 티켓 패널\n🏆 통합 랭킹\n🧹 청소\n🔨 킥\n⛔ 밴", color=BOT_COLOR)
+    await interaction.response.send_message(embed=embed, view=AdminPanelView(), ephemeral=True)
+
+"""
+@discord.ui.button(label="🔨 관리도구", style=discord.ButtonStyle.danger)
+async def staff_tool_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 사용할 수 있어요.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🔨 만능 봇 관리자 전용 도구",
+        description="경고, 청소, 킥, 밴 기능을 사용할 수 있어요.",
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=StaffToolPanelView(), ephemeral=True)
+"""
+
+
+HELP_CATEGORIES = {
+    "main": {
+        "label": "처음 보기",
+        "emoji": "🌸",
+        "title": "🌸 만능 봇 도움말",
+        "description": (
+            "필요한 메뉴를 아래 선택창에서 골라보세요.\n"
+            "관리자 전용 세팅 명령어는 숨겨두고, 일반 유저가 사용할 기능만 정리했어요."
+        ),
+        "fields": [
+            ("빠른 시작", "`/프로필` 내 정보 확인\n`/잔액` 포인트 확인\n`/송금` 포인트 보내기\n`/출석` 하루 보상 받기\n`/업적` 업적 진행도 확인\n`/칭호` 칭호 구매\n`/랭크` 채팅/음성 레벨 확인\n`/top` 채팅/음성 랭킹 보기", False),
+            ("채널 이용", "티켓은 `📩-티켓생성` 채널의 버튼을 눌러 열 수 있어요.\n음악은 `🎵-뮤직명령어` 채널의 뮤직 패널을 사용하면 편해요.", False),
+        ],
+    },
+    "profile": {
+        "label": "프로필/랭킹",
+        "emoji": "🏆",
+        "title": "🏆 프로필 · 레벨 · 랭킹",
+        "description": "내 활동 정보와 서버 랭킹을 확인하는 명령어예요.",
+        "fields": [
+            ("내 정보", "`/프로필` - 내 프로필 보기\n`/칭호` - 내 칭호 확인\n`/칭호` - 대표 칭호 설정\n`/업적` - 업적 진행도 확인\n`/업적보상` - 완료 업적 보상 받기\n`/유저정보` - 유저 정보 확인\n`/레벨` - 채팅 레벨 확인\n`/랭크` - 채팅 레벨과 음성 레벨 확인", False),
+            ("랭킹", "`/top` - 채팅/음성 랭킹 TOP 확인\n`/랭킹` - 통합 랭킹 확인\n`/포인트랭킹` `/레벨랭킹` `/출석랭킹` - 개별 랭킹 확인", False),
+        ],
+    },
+    "economy": {
+        "label": "경제/상점",
+        "emoji": "💰",
+        "title": "💰 경제 · 상점",
+        "description": "포인트를 모으고 상점/인벤토리/주식 기능을 사용할 수 있어요.",
+        "fields": [
+            ("경제", "`/출석` - 하루 한 번 출석 보상\n`/잔액` - 내 포인트 확인\n`/송금` - 다른 유저에게 포인트 보내기\n`/경제패널` - 경제 기능 패널 열기\n`/미션` - 오늘의 일일미션 확인\n`/미션보상` - 미션 완료 보상 받기\n`/업적` `/업적보상` - 성장 보상 받기\n`/칭호` `/칭호` - 칭호 구매\n`/쿠폰사용` - 이벤트 쿠폰 사용\n`/프로필` - 내 포인트 확인", False),
+            ("상점", "`/통합상점` - 상점 패널 열기\n`/구매` - 원하는 상품과 개수 구매\n`/인벤토리` - 구매한 아이템 확인\n`/닉네임색변경권` `/칭호권` `/VIP권` - 아이템 사용", False),
+            (
+                "📈 주식 시스템",
+                "╭─────────────╮\n"
+                "💹 서버 전용 가상 주식\n"
+                "╰─────────────╯\n\n"
+                "📊 `/주식목록` - 상장된 주식 확인\n"
+                "🛒 `/주식구매` - 주식 매수\n"
+                "💰 `/주식판매` - 주식 매도\n"
+                "📦 `/주식보유` - 내 보유 주식 확인\n"
+                "📈 `/주식시세` - 현재 가격 확인\n\n"
+                "✨ 포인트를 이용해 주식을 사고 팔 수 있습니다.\n"
+                "📉 가격은 자동으로 변동됩니다.\n"
+                "🏆 시세 차익으로 더 많은 포인트를 획득해보세요!",
+                False
+            ),
+            ("랭킹", "`/포인트랭킹` - 포인트 TOP 10\n`/출석랭킹` - 출석 TOP 10", False),
+        ],
+    },
+    "stock": {
+        "label": "주식",
+        "emoji": "📈",
+        "title": "📈 주식 시스템",
+        "description": "포인트로 사고파는 서버 전용 가상 주식 시스템이에요.",
+        "fields": [
+            (
+                "📈 주식 시스템",
+                "╭─────────────╮\n"
+                "💹 서버 전용 가상 주식\n"
+                "╰─────────────╯\n\n"
+                "📊 `/주식목록` - 상장된 주식 확인\n"
+                "🛒 `/주식구매` - 주식 매수\n"
+                "💰 `/주식판매` - 주식 매도\n"
+                "📦 `/주식보유` - 내 보유 주식 확인\n"
+                "📈 `/주식시세` - 현재 가격 확인\n\n"
+                "✨ 포인트를 이용해 주식을 사고 팔 수 있습니다.\n"
+                "📉 가격은 자동으로 변동됩니다.\n"
+                "🏆 시세 차익으로 더 많은 포인트를 획득해보세요!",
+                False
+            ),
+        ],
+    },
+    "enhance": {
+        "label": "강화",
+        "emoji": "⚒️",
+        "title": "⚒️ 강화 시스템",
+        "description": "아이템을 강화하고 랭킹을 겨루는 성장형 미니게임이에요.",
+        "fields": [
+            ("강화 시작", "`/강화 아이템 이름:<이름>` - 아이템 강화\n`!강화 <이름>` - 채팅 명령어로 강화\n쿨타임은 1분입니다.", False),
+            ("강화 아이템", "`강화보호권` - 파괴 시 자동 보호\n`강화확률업권` - 성공 확률 증가\n`/강화보호권`, `/강화확률업권` - 보유 개수 확인", False),
+            ("내 기록", "`/강화 보유` - 보유 아이템 목록\n`/강화 내기록` - 내 강화 통계\n`/강화 내순위` - 내 순위 확인\n`/강화 삭제` - 내 강화 아이템 삭제", False),
+            ("랭킹/채널", "`/강화 순위` - 현재 강화 순위\n`/강화 기네스` - 최고 기록 순위\n`/강화채널생성` - 강화방과 박스형 안내 생성", False),
+        ],
+    },
+    "music": {
+        "label": "음악/TTS",
+        "emoji": "🎵",
+        "title": "🎵 음악 · TTS",
+        "description": "음악 재생과 TTS 기능을 사용할 수 있어요.",
+        "fields": [
+            ("음악", "`/뮤직` - 뮤직 패널 열기\n패널 버튼: 재생 / 일시정지 / 다시재생 / 스킵 / 대기열 / 반복 / 셔플 / 볼륨 / 종료", False),
+            ("TTS", "`/tts text:내용` - 음성 채널에서 문장 읽기\n`/입장` - 봇을 음성 채널로 부르기\n`/퇴장` - 봇 음성 채널 퇴장\n`/목소리변경` - 만능 봇 느낌 목소리 선택\n`/목소리목록` - TTS 목소리 목록 확인\n`🔊-tts` 채널에 글을 쓰면 자동으로 읽어줘요.", False),
+        ],
+    },
+    "community": {
+        "label": "커뮤니티",
+        "emoji": "🎮",
+        "title": "🎮 커뮤니티 기능",
+        "description": "서버에서 같이 즐길 수 있는 편의 기능이에요.",
+        "fields": [
+            ("참여 기능", "`/투표` - 찬반 투표 만들기\n`/추첨` - 온라인 멤버 중 랜덤 추첨\n`/내전모집` - 내전 모집 패널 생성", False),
+            ("정보", "`/서버상세정보` - 서버 정보 보기\n`/유저정보` - 유저 정보 보기", False),
+            ("게임 역할", "게임 역할은 `🎮-게임역할선택` 채널의 버튼으로 받을 수 있어요.", False),
+        ],
+    },
+    "ticket": {
+        "label": "티켓",
+        "emoji": "🎫",
+        "title": "🎫 티켓 이용법",
+        "description": "문의, 신고, 일반 상담이 필요할 때 티켓을 열 수 있어요.",
+        "fields": [
+            ("티켓 열기", "`📩-티켓생성` 채널에서 원하는 버튼을 눌러주세요.\n일반 티켓 / 문의 티켓 / 신고 티켓을 선택할 수 있어요.", False),
+            ("티켓 이용", "열린 티켓 채널에서 내용을 자세히 적으면 관리자가 확인해요.\n해결 후에는 티켓 닫기 버튼으로 종료할 수 있어요.", False),
+        ],
+    },
+    "security": {
+        "label": "보안",
+        "emoji": "🛡️",
+        "title": "🛡️ 보안 / 서버시작",
+        "description": "만능봇 스타일 보안 설정과 서버 초기 세팅 명령어입니다.",
+        "fields": [
+            ("서버 시작", "`/서버시작` - 친목섭 전체세팅 / 기본채널만 생성 / 보안설정만 켜기를 선택합니다.\n`/개발로그` - 업데이트/패치노트/봇상태/개발일지 채널과 알림 패널을 자동 생성합니다.", False),
+            ("보안 설정", "`/보안패널` - 버튼으로 보안 기능 켜기/끄기\n`/설정 상태` - 현재 보안 상태 확인\n`/설정 악성유저감지` - 새 계정/대량 입장 감지\n`/설정 자동검열` - 초대링크/IP/금지어 자동 삭제\n`/설정 테러감지` - 채널/역할 삭제 같은 위험 작업 감지\n`/설정 도배보호` - 짧은 시간 반복 채팅 감지\n`/설정 멘션테러감지` - 대량 멘션/@everyone 감지\n`/설정 새계정보호` - 생성 초기 계정 입장 알림", False),
+            ("관리 목록", "`/설정 악성유저등록` / `/설정 악성유저삭제` / `/설정 악성유저목록`\n`/설정 차단단어추가` / `/설정 차단단어삭제` / `/설정 차단단어목록`\n`/설정 보안로그` / `/설정 보안로그저장`", False),
+        ],
+    },
+    "event": {
+        "label": "이벤트",
+        "emoji": "🎉",
+        "title": "🎉 이벤트",
+        "description": "관리자가 서버 이벤트를 즉시 공지하거나 원하는 시간에 예약할 수 있어요.",
+        "fields": [
+            ("이벤트 확인", "이벤트 공지가 올라오면 제목, 설명, 보상 포인트를 확인하면 돼요.", False),
+            ("관리자 전용", "`/이벤트` - 박스형 패널로 이벤트 생성/예약, 참가보상/승리팀/패배팀 보상 설정\n`/이벤트목록` - 예약/등록된 이벤트 목록 확인\n`/이벤트종료` - 이벤트 종료 및 결과 발표\n`/개인보상` - 1등~3등 개인 보상 지급\n`/팀보상` - 승리팀/패배팀 역할 보상 지급\n`/이벤트자동생성` - 이벤트 카테고리와 채널 자동 생성\n시간 예시: `2026-06-12 20:30`\n시간을 비워두면 즉시 공지됩니다.", False),
+        ],
+    },
+}
+
+
+def build_public_help_embed(category_key: str = "main"):
+    data = HELP_CATEGORIES.get(category_key, HELP_CATEGORIES["main"])
+    embed = discord.Embed(
+        title=data["title"],
+        description=data["description"],
+        color=BOT_COLOR
+    )
+    for name, value, inline in data["fields"]:
+        embed.add_field(name=name, value=value, inline=inline)
+    embed.set_footer(text="관리자 전용 명령어는 도움말에서 숨겨져 있어요.")
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    return embed
+
+
+class PublicHelpSelect(discord.ui.Select):
+    def __init__(self):
+        options = []
+        for key, data in HELP_CATEGORIES.items():
+            options.append(discord.SelectOption(
+                label=data["label"],
+                value=key,
+                emoji=data["emoji"],
+                description=data["title"][:100]
+            ))
+        super().__init__(placeholder="보고 싶은 도움말 메뉴를 선택하세요.", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=build_public_help_embed(self.values[0]),
+            view=PublicHelpView()
+        )
+
+
+class PublicHelpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(PublicHelpSelect())
+
+
+@bot.tree.command(name="도움말", description="일반 유저용 도움말을 보여줍니다.")
+async def help_panel(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=build_public_help_embed("main"),
+        view=PublicHelpView(),
+        ephemeral=True
+    )
+
+
+# =========================
+# 로그 시스템
+# =========================
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if before.nick != after.nick:
+        await send_log(after.guild, f"👤 닉네임 변경\n유저: {after.mention}\n변경 전: {before.nick or before.name}\n변경 후: {after.nick or after.name}", "nickname")
+    before_roles = set(before.roles)
+    after_roles = set(after.roles)
+    settings = get_security_settings(after.guild.id)
+    for role in after_roles - before_roles:
+        await send_log(after.guild, f"➕ 역할 추가\n유저: {after.mention}\n역할: {role.mention}", "general")
+        if settings.get("permission_guard"):
+            risky = dangerous_permissions_from(role.permissions)
+            if risky:
+                actor = await get_audit_log_user(after.guild, discord.AuditLogAction.member_role_update, after.id)
+                actor_text = actor.mention if actor else "확인 불가"
+                reason = f"위험 권한 역할 지급: {role.name} / {', '.join(risky)} / 지급자: {actor_text}"
+                add_security_log(after.guild.id, after.id, "권한보호", reason, 0)
+                await send_log(
+                    after.guild,
+                    f"🧬 권한보호 경고\n대상: {after.mention}\n역할: {role.mention}\n위험 권한: `{', '.join(risky)}`\n지급자: {actor_text}",
+                    "punishment"
+                )
+    for role in before_roles - after_roles:
+        await send_log(after.guild, f"➖ 역할 제거\n유저: {after.mention}\n역할: {role.name}", "general")
+
+
+@bot.event
+async def on_member_ban(guild, user):
+    await send_log(guild, f"⛔ 밴 로그\n유저: {user}", "punishment")
+
+
+@bot.event
+async def on_member_unban(guild, user):
+    await send_log(guild, f"🔓 밴 해제 로그\n유저: {user}", "punishment")
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    await send_log(channel.guild, f"📁 채널 생성\n채널: {channel.mention}\n이름: {channel.name}", "general")
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    await send_log(channel.guild, f"🗑 채널 삭제\n채널명: {channel.name}", "general")
+    actor = await get_audit_log_user(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
+    if actor:
+        await track_raid_action(channel.guild, actor, f"채널 삭제: {channel.name}")
+
+
+@bot.event
+async def on_guild_role_create(role):
+    await send_log(role.guild, f"🎭 역할 생성\n역할: {role.mention}", "general")
+
+
+@bot.event
+async def on_guild_role_delete(role):
+    await send_log(role.guild, f"🗑 역할 삭제\n역할명: {role.name}", "general")
+    actor = await get_audit_log_user(role.guild, discord.AuditLogAction.role_delete, role.id)
+    if actor:
+        await track_raid_action(role.guild, actor, f"역할 삭제: {role.name}")
+
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    await send_log(after.guild, f"🎭 역할 수정\n역할: {after.mention}\n이름: {before.name} → {after.name}", "general")
+    settings = get_security_settings(after.guild.id)
+    if not settings.get("permission_guard"):
+        return
+    added = dangerous_permissions_added(before.permissions, after.permissions)
+    if not added:
+        return
+    actor = await get_audit_log_user(after.guild, discord.AuditLogAction.role_update, after.id)
+    actor_text = actor.mention if actor else "확인 불가"
+    reason = f"역할 위험 권한 추가: {after.name} / {', '.join(added)} / 수정자: {actor_text}"
+    add_security_log(after.guild.id, after.id, "권한보호", reason, 0)
+    await send_log(
+        after.guild,
+        f"🧬 권한보호 경고\n역할: {after.mention}\n추가된 위험 권한: `{', '.join(added)}`\n수정자: {actor_text}\n필요하면 역할 권한을 바로 확인해주세요.",
+        "punishment"
+    )
+    if actor:
+        await track_raid_action(after.guild, actor, f"역할 위험 권한 추가: {after.name} / {', '.join(added)}")
+
+
+@bot.event
+async def on_webhooks_update(channel):
+    settings = get_security_settings(channel.guild.id)
+    if not settings.get("permission_guard"):
+        return
+    add_security_log(channel.guild.id, 0, "웹후크변경", f"채널: {channel.name}", channel.id)
+    await send_log(
+        channel.guild,
+        f"🪝 웹후크 변경 감지\n채널: {channel.mention}\n권한보호가 켜져 있으니 웹후크 목록을 확인해주세요.",
+        "warning"
+    )
+
+# =========================
+# 게임 역할 선택 패널
+# =========================
+
+GAME_ROLE_NAMES = [
+    "롤",
+    "발로란트",
+    "배틀그라운드",
+    "이터널리턴",
+    "마인크래프트",
+    "로블록스",
+    "오버워치",
+    "서든어택",
+    "피파",
+    "스타크래프트",
+    "종합게임",
+]
+
+
+class GameRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def toggle_role(self, interaction: discord.Interaction, role_name: str):
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+
+        if role is None:
+            return await interaction.response.send_message(
+                f"❌ `{role_name}` 역할이 없습니다. 먼저 `/친목섭` 또는 `/역할자동생성`을 실행해주세요.",
+                ephemeral=True
+            )
+
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(
+                f"✅ `{role.name}` 역할을 제거했어요.",
+                ephemeral=True
+            )
+        else:
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(
+                f"✅ `{role.name}` 역할을 지급했어요.",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="롤", emoji="⚔️", style=discord.ButtonStyle.green, custom_id="game_role_lol", row=0)
+    async def lol_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "롤")
+
+    @discord.ui.button(label="발로란트", emoji="🎯", style=discord.ButtonStyle.red, custom_id="game_role_valorant", row=0)
+    async def valorant_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "발로란트")
+
+    @discord.ui.button(label="배틀그라운드", emoji="🔫", style=discord.ButtonStyle.blurple, custom_id="game_role_battlegrounds", row=0)
+    async def battlegrounds_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "배틀그라운드")
+
+    @discord.ui.button(label="이터널리턴", emoji="🧪", style=discord.ButtonStyle.gray, custom_id="game_role_er", row=0)
+    async def eternal_return_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "이터널리턴")
+
+    @discord.ui.button(label="마인크래프트", emoji="⛏️", style=discord.ButtonStyle.green, custom_id="game_role_minecraft", row=1)
+    async def minecraft_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "마인크래프트")
+
+    @discord.ui.button(label="로블록스", emoji="🧱", style=discord.ButtonStyle.blurple, custom_id="game_role_roblox", row=1)
+    async def roblox_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "로블록스")
+
+    @discord.ui.button(label="오버워치", emoji="🎯", style=discord.ButtonStyle.red, custom_id="game_role_overwatch", row=1)
+    async def overwatch_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "오버워치")
+
+    @discord.ui.button(label="서든어택", emoji="🔫", style=discord.ButtonStyle.gray, custom_id="game_role_sudden_attack", row=1)
+    async def sudden_attack_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "서든어택")
+
+    @discord.ui.button(label="피파", emoji="⚽", style=discord.ButtonStyle.green, custom_id="game_role_fifa", row=2)
+    async def fifa_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "피파")
+
+    @discord.ui.button(label="스타크래프트", emoji="🚀", style=discord.ButtonStyle.blurple, custom_id="game_role_starcraft", row=2)
+    async def starcraft_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "스타크래프트")
+
+    @discord.ui.button(label="종합게임", emoji="🎮", style=discord.ButtonStyle.gray, custom_id="game_role_all_games", row=2)
+    async def all_games_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_role(interaction, "종합게임")
+
+
+def build_game_role_embed():
+    return create_embed(
+        "🎮 게임 역할 선택",
+        "아래 버튼을 눌러 원하는 게임 역할을 받아가세요.\n\n"
+        "다시 누르면 역할이 제거됩니다.\n"
+        "지원 역할: 롤 / 발로란트 / 배틀그라운드 / 이터널리턴 / 마인크래프트 / 로블록스 / 오버워치 / 서든어택 / 피파 / 스타크래프트 / 종합게임"
+    )
+
+
+async def send_game_role_panel_to_channel(channel: discord.TextChannel):
+    """게임 역할 선택 채널에 게임역할 패널을 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "게임 역할" in title and msg.components:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    await channel.send(embed=build_game_role_embed(), view=GameRoleView())
+    return True
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="게임역할패널", description="게임 역할 선택 패널을 보냅니다.")
+async def game_role_panel(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있어요.",
+            ephemeral=True
+        )
+
+    await interaction.response.send_message(embed=build_game_role_embed(), view=GameRoleView())
+
+# =====================================================
+# 티켓 로그 저장 강화
+# 기존 CloseTicketView 또는 TicketCloseConfirm 대신 사용 가능
+# =====================================================
+
+TICKET_LOG_CHANNEL_ID = globals().get("TICKET_LOG_CHANNEL_ID", 0)
+
+async def save_ticket_transcript(channel: discord.TextChannel, closed_by: discord.Member):
+    log_channel = get_channel_by_id_or_name(channel.guild, TICKET_LOG_CHANNEL_ID, ["📋-일반로그", "🎫-티켓로그", "티켓로그"], "text")
+    if log_channel is None:
+        return
+
+    messages = []
+    async for msg in channel.history(limit=200, oldest_first=True):
+        content = msg.content or ""
+        if msg.embeds:
+            content += " [임베드 메시지]"
+        if msg.attachments:
+            files = ", ".join(a.url for a in msg.attachments)
+            content += f" [첨부파일: {files}]"
+        messages.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author}: {content}")
+
+    transcript = "\n".join(messages) if messages else "저장된 메시지가 없습니다."
+
+    if len(transcript) > 3500:
+        transcript = transcript[:3500] + "\n... 로그가 길어 일부만 표시됩니다."
+
+    embed = discord.Embed(
+        title="📁 티켓 로그 저장",
+        description=(
+            f"채널명: `{channel.name}`\n"
+            f"닫은 사람: {closed_by.mention}\n\n"
+            f"```{transcript}```"
+        ),
+        color=BOT_COLOR
+    )
+    await log_channel.send(embed=embed)
+
+
+class TicketCloseConfirm(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=30)
+
+    @discord.ui.button(label="닫기 확정", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_channels:
+            return await interaction.response.send_message("❌ 관리자만 티켓을 닫을 수 있어요.", ephemeral=True)
+
+        await interaction.response.send_message("🔒 티켓 로그를 저장하고 닫는 중이에요...", ephemeral=True)
+        await save_ticket_transcript(interaction.channel, interaction.user)
+        await interaction.channel.delete(reason=f"{interaction.user} 티켓 닫기")
+
+
+class TicketControlViewV10(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="티켓 닫기", emoji="🔒", style=discord.ButtonStyle.red, custom_id="rize_ticket_close_v10")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "정말 이 티켓을 닫을까요? 닫기 전에 로그가 저장됩니다.",
+            view=TicketCloseConfirmV10(),
+            ephemeral=True
+        )
+
+
+# 사용 방법:
+# 티켓 생성할 때 view=CloseTicketView() 또는 view=TicketControlView() 부분을
+# view=TicketControlViewV10() 으로 바꾸면 됩니다.
+
+
+# =====================================================
+# 내전 모집 시스템
+# =====================================================
+
+class ScrimRecruitView(discord.ui.View):
+    def __init__(self, game_name: str, max_members: int):
+        super().__init__(timeout=None)
+        self.game_name = game_name
+        self.max_members = max_members
+        self.members = []
+
+    def make_embed(self):
+        member_text = "\n".join([f"{i}. {member.mention}" for i, member in enumerate(self.members, start=1)])
+        if not member_text:
+            member_text = "아직 참가자가 없습니다."
+
+        status = "🎉 모집 완료!" if len(self.members) >= self.max_members else "모집 중"
+
+        embed = discord.Embed(
+            title=f"🎮 {self.game_name} 내전 모집",
+            description=(
+                f"상태: **{status}**\n"
+                f"현재 인원: **{len(self.members)} / {self.max_members}명**\n\n"
+                f"참가자 목록\n{member_text}"
+            ),
+            color=BOT_COLOR
+        )
+        embed.set_footer(text="참가 / 취소 버튼으로 신청할 수 있어요.")
+        return embed
+
+    @discord.ui.button(label="참가", emoji="✅", style=discord.ButtonStyle.green, custom_id="rize_scrim_join")
+    async def join_scrim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user in self.members:
+            return await interaction.response.send_message("❌ 이미 참가했어요.", ephemeral=True)
+
+        if len(self.members) >= self.max_members:
+            return await interaction.response.send_message("❌ 이미 모집이 완료되었어요.", ephemeral=True)
+
+        self.members.append(interaction.user)
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    @discord.ui.button(label="취소", emoji="❌", style=discord.ButtonStyle.red, custom_id="rize_scrim_leave")
+    async def leave_scrim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user not in self.members:
+            return await interaction.response.send_message("❌ 아직 참가하지 않았어요.", ephemeral=True)
+
+        self.members.remove(interaction.user)
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+
+@bot.tree.command(name="내전모집", description="내전 모집 패널을 생성합니다.")
+async def scrim_recruit(interaction: discord.Interaction, 게임이름: str, 인원수: int = 10):
+    if 인원수 < 2:
+        return await interaction.response.send_message("❌ 인원수는 2명 이상이어야 해요.", ephemeral=True)
+
+    if 인원수 > 30:
+        return await interaction.response.send_message("❌ 인원수는 최대 30명까지 가능해요.", ephemeral=True)
+
+    view = ScrimRecruitView(게임이름, 인원수)
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+
+
+# =====================================================
+# 관리자 전용 패널: 경고 / 청소 / 킥 / 밴
+# =====================================================
+
+class CleanModal(discord.ui.Modal, title="메시지 청소"):
+    amount = discord.ui.TextInput(label="삭제할 메시지 개수", placeholder="1 이상", required=True, max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message("❌ 메시지 관리 권한이 필요해요.", ephemeral=True)
+
+        try:
+            amount = int(self.amount.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자만 입력해주세요.", ephemeral=True)
+
+        if amount < 1:
+            return await interaction.response.send_message("❌ 1개 이상 입력해주세요.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        deleted_count = await purge_messages_unlimited(interaction.channel, amount)
+        await interaction.followup.send(f"🧹 메시지 {deleted_count}개를 삭제했어요.", ephemeral=True)
+
+
+class KickModal(discord.ui.Modal, title="유저 킥"):
+    user_id = discord.ui.TextInput(label="유저 ID", placeholder="킥할 유저 ID", required=True)
+    reason = discord.ui.TextInput(label="사유", placeholder="사유를 입력하세요", required=False, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.kick_members:
+            return await interaction.response.send_message("❌ 킥 권한이 필요해요.", ephemeral=True)
+
+        try:
+            target_id = int(self.user_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID는 숫자만 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(target_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없어요.", ephemeral=True)
+
+        if member == interaction.user:
+            return await interaction.response.send_message("❌ 자기 자신은 킥할 수 없어요.", ephemeral=True)
+
+        reason = self.reason.value or "사유 없음"
+        await member.kick(reason=reason)
+        await interaction.response.send_message(f"🔨 {member} 님을 킥했어요.\n사유: {reason}", ephemeral=True)
+
+        if "send_log" in globals():
+            await send_log(interaction.guild, f"🔨 킥\n대상: {member}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+
+
+class BanModal(discord.ui.Modal, title="유저 밴"):
+    user_id = discord.ui.TextInput(label="유저 ID", placeholder="밴할 유저 ID", required=True)
+    reason = discord.ui.TextInput(label="사유", placeholder="사유를 입력하세요", required=False, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.ban_members:
+            return await interaction.response.send_message("❌ 밴 권한이 필요해요.", ephemeral=True)
+
+        try:
+            target_id = int(self.user_id.value)
+        except ValueError:
+            return await interaction.response.send_message("❌ 유저 ID는 숫자만 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(target_id)
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없어요.", ephemeral=True)
+
+        if member == interaction.user:
+            return await interaction.response.send_message("❌ 자기 자신은 밴할 수 없어요.", ephemeral=True)
+
+        reason = self.reason.value or "사유 없음"
+        await member.ban(reason=reason)
+        await interaction.response.send_message(f"⛔ {member} 님을 밴했어요.\n사유: {reason}", ephemeral=True)
+
+        if "send_log" in globals():
+            await send_log(interaction.guild, f"⛔ 밴\n대상: {member}\n관리자: {interaction.user}\n사유: {reason}", "punishment")
+
+
+class StaffToolPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="경고 패널", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def warning_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.moderate_members:
+            return await interaction.response.send_message("❌ 권한이 없어요.", ephemeral=True)
+
+        embed = discord.Embed(title="⚠️ 경고 관리 패널", description="아래 버튼으로 경고를 관리하세요.", color=discord.Color.orange())
+        await interaction.response.send_message(embed=embed, view=WarnManagePanel(), ephemeral=True)
+
+    @discord.ui.button(label="청소", emoji="🧹", style=discord.ButtonStyle.blurple)
+    async def clean_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CleanModal())
+
+    @discord.ui.button(label="킥", emoji="🔨", style=discord.ButtonStyle.gray)
+    async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(KickModal())
+
+    @discord.ui.button(label="밴", emoji="⛔", style=discord.ButtonStyle.red)
+    async def ban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BanModal())
+
+# =====================================================
+# 기존 관리자패널에 관리도구 버튼을 넣고 싶을 때
+# AdminPanelView 클래스 안에 아래 버튼을 추가하세요.
+# =====================================================
+
+"""
+@discord.ui.button(label="🔨 관리도구", style=discord.ButtonStyle.danger)
+async def staff_tool_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 관리자만 사용할 수 있어요.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🔨 만능 봇 관리자 전용 도구",
+        description="경고, 청소, 킥, 밴 기능을 사용할 수 있어요.",
+        color=BOT_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=StaffToolPanelView(), ephemeral=True)
+"""
+
+# =========================
+# 인증 패널
+# =========================
+
+UNVERIFIED_ROLE_ID = 1510944132854710364  # 미인증 역할 ID
+NEWFACE_ROLE_ID = 764487916902285332     # 뉴페이스 역할 ID
+
+# 인증 완료 후 버튼을 누른 사람에게만 보여줄 메시지 설정입니다.
+# /인증완료문구설정 으로 서버마다 직접 수정할 수 있습니다.
+DEFAULT_VERIFY_SUCCESS_MESSAGE = (
+    "✅ 인증이 완료되었습니다!\n\n"
+    "{mention}님, 만능 봇 공식 지원 서버 이용 권한이 활성화되었습니다.\n"
+    "이제 공지사항, 봇 도움말, 문의 티켓, 업데이트 채널을 이용할 수 있어요.\n\n"
+    "먼저 `#공지사항` 과 `#자주묻는질문` 을 확인해주세요!"
+)
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS verify_success_messages (
+    guild_id INTEGER PRIMARY KEY,
+    message TEXT,
+    updated_by INTEGER DEFAULT 0,
+    updated_at TEXT
+)
+""")
+conn.commit()
+
+
+def get_verify_success_message_template(guild_id: int):
+    c.execute("SELECT message FROM verify_success_messages WHERE guild_id=?", (guild_id,))
+    row = c.fetchone()
+    if row and row[0]:
+        return row[0]
+    return DEFAULT_VERIFY_SUCCESS_MESSAGE
+
+
+def save_verify_success_message(guild_id: int, message: str, updated_by: int):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT INTO verify_success_messages(guild_id, message, updated_by, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            message=excluded.message,
+            updated_by=excluded.updated_by,
+            updated_at=excluded.updated_at
+        """,
+        (guild_id, message, updated_by, now)
+    )
+    conn.commit()
+
+
+def reset_verify_success_message(guild_id: int):
+    c.execute("DELETE FROM verify_success_messages WHERE guild_id=?", (guild_id,))
+    conn.commit()
+
+
+def render_verify_success_message(template: str, member: discord.Member):
+    guild = member.guild
+    replacements = {
+        "{mention}": member.mention,
+        "{user}": str(member),
+        "{username}": member.display_name,
+        "{server}": guild.name if guild else "서버",
+        "{member_count}": str(guild.member_count if guild and guild.member_count else 0),
+        "[@username]": member.mention,
+    }
+    message = template or DEFAULT_VERIFY_SUCCESS_MESSAGE
+    for key, value in replacements.items():
+        message = message.replace(key, value)
+    return message[:1900]
+
+
+class VerifySuccessMessageModal(discord.ui.Modal, title="인증 완료 문구 설정"):
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        current_message = get_verify_success_message_template(guild_id)
+        self.message_input = discord.ui.TextInput(
+            label="인증 완료 후 표시할 문구",
+            style=discord.TextStyle.paragraph,
+            default=current_message[:1500],
+            placeholder="예: ✅ 인증이 완료되었습니다!\n{mention}님 환영합니다!",
+            required=True,
+            max_length=1500
+        )
+        self.add_item(self.message_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        message = str(self.message_input.value).strip()
+        if not message:
+            return await interaction.response.send_message("❌ 문구를 입력해주세요.", ephemeral=True)
+
+        save_verify_success_message(self.guild_id, message, interaction.user.id)
+        preview = render_verify_success_message(message, interaction.user)
+        await interaction.response.send_message(
+            "✅ 인증 완료 문구를 저장했습니다.\n\n"
+            "**미리보기**\n"
+            f"{preview}\n\n"
+            "사용 가능한 변수: `{mention}`, `{username}`, `{server}`, `{member_count}`",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="인증완료문구설정", description="인증 버튼을 눌렀을 때 뜨는 완료 메시지를 수정합니다.")
+async def verify_success_message_setting(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await interaction.response.send_modal(VerifySuccessMessageModal(interaction.guild.id))
+
+
+@bot.tree.command(name="인증완료문구보기", description="현재 인증 완료 메시지를 확인합니다.")
+async def verify_success_message_view(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    template = get_verify_success_message_template(interaction.guild.id)
+    preview = render_verify_success_message(template, interaction.user)
+    await interaction.response.send_message(
+        "**현재 인증 완료 문구 미리보기**\n"
+        f"{preview}\n\n"
+        "사용 가능한 변수: `{mention}`, `{username}`, `{server}`, `{member_count}`",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="인증완료문구초기화", description="인증 완료 메시지를 기본값으로 되돌립니다.")
+async def verify_success_message_reset(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    reset_verify_success_message(interaction.guild.id)
+    preview = render_verify_success_message(DEFAULT_VERIFY_SUCCESS_MESSAGE, interaction.user)
+    await interaction.response.send_message(
+        "✅ 인증 완료 문구를 기본값으로 초기화했습니다.\n\n"
+        "**미리보기**\n"
+        f"{preview}",
+        ephemeral=True
+    )
+
+
+class VerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="인증하기",
+        emoji="✅",
+        style=discord.ButtonStyle.green,
+        custom_id="verify_button"
+    )
+    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        guild = interaction.guild
+
+        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID) or discord.utils.get(guild.roles, name="미인증")
+        newface_role = guild.get_role(NEWFACE_ROLE_ID) or discord.utils.get(guild.roles, name="뉴페이스")
+
+        if unverified_role and unverified_role in member.roles:
+            await member.remove_roles(unverified_role, reason="인증 완료")
+
+        if newface_role and newface_role not in member.roles:
+            await member.add_roles(newface_role, reason="인증 완료")
+
+        success_message = render_verify_success_message(
+            get_verify_success_message_template(guild.id),
+            member
+        )
+        await interaction.response.send_message(success_message, ephemeral=True)
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="인증패널", description="인증 패널을 보냅니다.")
+async def verify_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있어요.",
+            ephemeral=True
+        )
+
+    panel_sent = await send_verify_panel_to_channel(interaction.channel)
+    await interaction.response.send_message(
+        "✅ 인증 패널을 전송했습니다." if panel_sent else "✅ 이미 인증 패널이 있습니다.",
+        ephemeral=True
+    )
+
+
+
+# =========================
+# 채팅/음성 랭크 명령어
+# =========================
+
+@bot.tree.command(name="랭크", description="채팅 레벨과 음성 레벨을 확인합니다.")
+async def rank_command(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    chat_exp, chat_level = get_or_create_level_user(target.id)
+    voice_exp, voice_level, total_seconds = get_or_create_voice_level_user(target.id)
+
+    total_minutes = total_seconds // 60
+    total_hours = total_minutes // 60
+    remain_minutes = total_minutes % 60
+
+    embed = discord.Embed(title="📊 랭크 정보", color=BOT_COLOR)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="유저", value=target.mention, inline=False)
+    embed.add_field(name="💬 채팅 레벨", value=f"Lv.{chat_level}\nEXP: {chat_exp} / {chat_level * 100}", inline=True)
+    embed.add_field(name="🔊 음성 레벨", value=f"Lv.{voice_level}\nEXP: {voice_exp} / {voice_level * 100}", inline=True)
+    embed.add_field(name="⏱️ 누적 음성 시간", value=f"{total_hours}시간 {remain_minutes}분", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="top", description="채팅 랭킹과 음성 랭킹 TOP 10을 확인합니다.")
+async def top_command(interaction: discord.Interaction):
+    c.execute("SELECT user_id, level, exp FROM levels ORDER BY level DESC, exp DESC LIMIT 10")
+    chat_rows = c.fetchall()
+    c.execute("SELECT user_id, level, exp, total_seconds FROM voice_levels ORDER BY level DESC, exp DESC, total_seconds DESC LIMIT 10")
+    voice_rows = c.fetchall()
+
+    chat_text = ""
+    if chat_rows:
+        for index, (user_id, level, exp) in enumerate(chat_rows, start=1):
+            chat_text += f"**{index}위** <@{user_id}> - Lv.{level} / {exp} EXP\n"
+    else:
+        chat_text = "아직 채팅 레벨 데이터가 없습니다."
+
+    voice_text = ""
+    if voice_rows:
+        for index, (user_id, level, exp, total_seconds) in enumerate(voice_rows, start=1):
+            total_minutes = int(total_seconds or 0) // 60
+            voice_text += f"**{index}위** <@{user_id}> - Lv.{level} / {exp} EXP / {total_minutes}분\n"
+    else:
+        voice_text = "아직 음성 레벨 데이터가 없습니다."
+
+    embed = discord.Embed(title="🏆 채팅/음성 랭킹 TOP 10", color=discord.Color.gold())
+    embed.add_field(name="💬 채팅 랭킹", value=chat_text[:1024], inline=False)
+    embed.add_field(name="🔊 음성 랭킹", value=voice_text[:1024], inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+
+# =========================
+# 만능 봇 공식 지원 서버 템플릿
+# =========================
+
+SUPPORT_TEMPLATE_ROLE_DEFINITIONS = [
+    # 만능 봇 공식 지원 서버용 최소 역할만 생성합니다.
+    # 요청 반영: 게임역할, 담당팀, 특수역할은 생성하지 않고 서버부스터만 유지합니다.
+    # name, color, hoist, permission profile
+    ("대표", 0xFF4F9A, True, "owner"),
+    ("부대표", 0xFF73B3, True, "owner"),
+    ("총관리자", 0xB388FF, True, "admin"),
+    ("부관리자", 0x9575CD, True, "manager"),
+    ("운영진", 0x7E57C2, True, "manager"),
+    ("관리자", 0x5C6BC0, True, "manager"),
+    ("뉴페이스", 0xA5D6A7, True, "member"),
+    ("서버부스터", 0xF06292, True, "member"),
+]
+
+SUPPORT_TEMPLATE_ROLE_NAMES = [item[0] for item in SUPPORT_TEMPLATE_ROLE_DEFINITIONS]
+SUPPORT_TEMPLATE_MEMBER_ROLE_NAMES = ["뉴페이스", "서버부스터"]
+SUPPORT_TEMPLATE_STAFF_ROLE_NAMES = ["대표", "부대표", "총관리자", "부관리자", "운영진", "관리자"]
+SUPPORT_TEMPLATE_REMOVED_ROLE_NAMES = [
+    # 예전 지원서버템플릿에서 만들었던 역할 중 이번 공식 지원 서버 템플릿에서는 삭제할 역할입니다.
+    # 서버부스터는 일부러 제외했습니다.
+    "적응팀", "보안팀", "뉴관팀", "이벤트팀", "홍보팀", "팀장", "부팀장",
+    "VIP", "VVIP", "귀빈", "우수회원", "단골", "후원자",
+    "스트리머", "유튜버", "디자이너", "개발자",
+    "롤", "발로란트", "배틀그라운드", "이터널리턴", "마인크래프트", "로블록스",
+    "오버워치", "서든어택", "피파", "스타크래프트", "종합게임",
+]
+SUPPORT_TEMPLATE_REMOVED_CHANNEL_NAMES = [
+    # 예전 지원 서버 템플릿에서 자동 생성했던 게임/역할 전용 채널 정리용입니다.
+    "🎭︱역할선택", "🎮︱게임채팅", "🎬︱크리에이터", "🎮︱게임통화",
+]
+
+
+def support_template_permissions(profile: str):
+    if profile in ("owner", "admin"):
+        return discord.Permissions(administrator=True)
+    if profile == "manager":
+        perms = discord.Permissions.none()
+        perms.view_channel = True
+        perms.send_messages = True
+        perms.manage_channels = True
+        perms.manage_roles = True
+        perms.manage_messages = True
+        perms.kick_members = True
+        perms.ban_members = True
+        perms.moderate_members = True
+        perms.read_message_history = True
+        perms.use_application_commands = True
+        return perms
+    if profile == "security":
+        perms = discord.Permissions.none()
+        perms.view_channel = True
+        perms.send_messages = True
+        perms.manage_messages = True
+        perms.moderate_members = True
+        perms.read_message_history = True
+        perms.use_application_commands = True
+        return perms
+    if profile in ("staff", "event"):
+        perms = discord.Permissions.none()
+        perms.view_channel = True
+        perms.send_messages = True
+        perms.manage_messages = True
+        perms.read_message_history = True
+        perms.use_application_commands = True
+        return perms
+    perms = discord.Permissions.none()
+    perms.view_channel = True
+    perms.send_messages = True
+    perms.read_message_history = True
+    perms.connect = True
+    perms.speak = True
+    perms.use_application_commands = True
+    return perms
+
+
+def build_support_user_only_overwrites(guild: discord.Guild):
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    if bot_member:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            connect=True,
+            speak=True,
+        )
+    for role_name in SUPPORT_TEMPLATE_MEMBER_ROLE_NAMES + SUPPORT_TEMPLATE_STAFF_ROLE_NAMES:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                connect=True,
+                speak=True,
+                use_application_commands=True,
+            )
+    return overwrites
+
+SUPPORT_TEMPLATE_TEXT_CHANNELS = {
+    "📌 필독": [
+        ("📢︱공지사항", "봇 업데이트 및 중요한 공지사항을 확인하는 공간입니다."),
+        ("📜︱이용규칙", "지원 서버 이용 규칙을 확인해주세요."),
+        ("📖︱봇사용법", "만능 봇의 기능과 명령어를 확인할 수 있습니다."),
+        ("📌︱자주묻는질문", "자주 묻는 질문과 기본 해결 방법을 확인하는 공간입니다."),
+    ],
+    "💬 커뮤니티": [
+        ("💭︱자유채팅", "자유롭게 대화하는 공간입니다."),
+        ("🙋︱질문답변", "간단한 질문과 답변을 주고받는 공간입니다."),
+        ("👋︱가입인사", "새로 오신 분들은 인사를 남겨주세요."),
+        ("📸︱사진자랑", "사진과 스크린샷을 공유하는 공간입니다."),
+    ],
+    "🛠️ 고객지원": [
+        ("🎫︱티켓문의", "문의, 버그제보, 기능건의, 신고를 티켓으로 접수하는 공간입니다."),
+    ],
+    "🤖 봇 테스트": [
+        ("🤖︱봇명령어", "만능 봇 명령어를 테스트할 수 있습니다."),
+        ("🎵︱뮤직테스트", "음악 기능을 테스트할 수 있습니다."),
+        ("🔊︱TTS테스트", "TTS 기능을 테스트할 수 있습니다."),
+        ("⚒️︱강화테스트", "강화 시스템을 테스트할 수 있습니다."),
+        ("💰︱경제테스트", "경제 시스템을 테스트할 수 있습니다."),
+        ("🎉︱이벤트테스트", "이벤트 기능을 테스트할 수 있습니다."),
+    ],
+    "📈 개발로그": [
+        ("🚀︱업데이트", "새로운 기능 추가 내역을 확인하는 공간입니다."),
+        ("📝︱패치노트", "버그 수정 및 변경 사항을 확인하는 공간입니다."),
+        ("📊︱봇상태", "봇 상태 및 점검 안내를 확인하는 공간입니다."),
+        ("📅︱개발일지", "개발 진행 내용을 기록하는 공간입니다."),
+    ],
+}
+
+SUPPORT_TEMPLATE_VOICE_CHANNELS = {
+    "🔊 음성채널": [
+        "🎙️︱대기실",
+        "🎵︱음악감상",
+        "🔊︱TTS체험",
+        "🌸︱자유통화",
+    ]
+}
+
+
+def build_support_template_embed(title: str, description: str):
+    embed = discord.Embed(title=title, description=description, color=BOT_COLOR)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="🌸 만능 봇 공식 지원 서버")
+    return embed
+
+
+
+async def send_support_ticket_panel(guild: discord.Guild):
+    """고객지원 채널에 박스형 티켓 패널을 자동 전송합니다. 이미 있으면 False, 새로 보내면 True를 반환합니다."""
+    channel = discord.utils.get(guild.text_channels, name="🎫︱티켓문의")
+    if not channel:
+        return False
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds and (msg.embeds[0].title or "") == "🎫 만능 봇 고객지원 센터":
+                return False
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+    embed = discord.Embed(
+        title="🎫 만능 봇 고객지원 센터",
+        description=(
+            "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n"
+            "╭──────────────╮\n"
+            "   🌸 고객지원 메뉴\n"
+            "╰──────────────╯\n\n"
+            "🎫 **일반 티켓** · 간단 문의 / 도움 요청\n"
+            "💬 **문의 티켓** · 사용법 / 기능 질문\n"
+            "🚨 **신고 티켓** · 오류 / 문제 상황 신고\n\n"
+            "티켓을 열면 관리자에게만 보이는 개인 채널이 생성됩니다."
+        ),
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="🌸 만능 봇 공식 지원 서버 | 티켓으로 안전하게 문의하세요")
+    try:
+        await channel.send(embed=embed, view=UnifiedTicketView())
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def ensure_support_ticket_panel(guild: discord.Guild):
+    """삭제된 공식 지원 서버 티켓문의 채널과 티켓 패널을 복구합니다."""
+    support_overwrites = build_support_user_only_overwrites(guild)
+    category = discord.utils.get(guild.categories, name="🛠️ 고객지원")
+    if category is None:
+        category = await guild.create_category(
+            "🛠️ 고객지원",
+            overwrites=support_overwrites,
+            reason="만능 봇 공식 지원 서버 티켓문의 복구"
+        )
+    else:
+        try:
+            await category.edit(overwrites=support_overwrites, reason="만능 봇 공식 지원 서버 고객지원 권한 정리")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    channel = discord.utils.get(guild.text_channels, name="🎫︱티켓문의")
+    if channel is None:
+        channel = await guild.create_text_channel(
+            "🎫︱티켓문의",
+            category=category,
+            overwrites=support_overwrites,
+            topic="문의, 버그제보, 기능건의, 신고를 티켓으로 접수하는 공간입니다.",
+            reason="만능 봇 공식 지원 서버 티켓문의 복구"
+        )
+    else:
+        try:
+            await channel.edit(
+                category=category,
+                overwrites=support_overwrites,
+                topic="문의, 버그제보, 기능건의, 신고를 티켓으로 접수하는 공간입니다.",
+                reason="만능 봇 공식 지원 서버 티켓문의 정리"
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    panel_sent = await send_support_ticket_panel(guild)
+    return category, channel, panel_sent
+
+
+async def send_support_development_auto_messages(guild: discord.Guild):
+    """개발로그 채널에 자동 안내 메시지를 전송합니다."""
+    items = {
+        "🚀︱업데이트": discord.Embed(
+            title="🚀 만능 봇 업데이트 알림",
+            description=(
+                "만능 봇이 새 기능을 만들거나 템플릿을 적용하면 이곳에 업데이트 소식이 올라옵니다.\n\n"
+                "✅ 지원 서버 템플릿 자동 생성\n"
+                "✅ 공식 지원 서버 채널 자동 세팅\n"
+                "✅ 고객지원 티켓 패널 자동 생성\n\n"
+                "앞으로 새 기능을 추가할 때도 이 채널에 자동으로 기록됩니다."
+            ),
+            color=discord.Color.green()
+        ),
+        "📝︱패치노트": discord.Embed(
+            title="📝 자동 패치노트",
+            description=(
+                "이번 패치 내용입니다.\n\n"
+                "• 공식 지원 서버용 최소 역할만 유지\n"
+                "• 게임역할/담당팀/특수역할 자동 생성 제거\n"
+                "• 서버부스터 역할은 유지\n"
+                "• 고객지원 채널을 티켓 박스형 패널로 복구/생성\n"
+                "• 개발로그 자동 메시지 추가"
+            ),
+            color=discord.Color.blurple()
+        ),
+        "📊︱봇상태": discord.Embed(
+            title="📊 만능 봇 상태",
+            description=(
+                "현재 상태: **정상 작동 중 ✅**\n\n"
+                "🎵 음악 시스템: 준비됨\n"
+                "🔊 TTS 시스템: 준비됨\n"
+                "🎫 티켓 시스템: 준비됨\n"
+                "🛡️ 관리 시스템: 준비됨\n"
+                "📈 개발로그 자동화: 준비됨"
+            ),
+            color=discord.Color.teal()
+        ),
+        "📅︱개발일지": discord.Embed(
+            title="📅 개발일지",
+            description=(
+                "오늘의 개발 기록입니다.\n\n"
+                "만능 봇 공식 지원 서버 템플릿을 적용했고, "
+                "운영진 역할, 색상, 권한, 티켓 고객지원, 자동 개발로그 메시지를 추가했습니다.\n\n"
+                "새로운 기능을 만들 때마다 이곳에 기록을 남길 수 있습니다."
+            ),
+            color=BOT_COLOR
+        ),
+    }
+    for channel_name, embed in items.items():
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if not channel:
+            continue
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed.set_footer(text="🌸 만능 봇 자동 개발로그")
+        try:
+            already_sent = False
+            async for msg in channel.history(limit=30):
+                if msg.author == bot.user and msg.embeds and (msg.embeds[0].title or "") == (embed.title or ""):
+                    already_sent = True
+                    break
+            if not already_sent:
+                await channel.send(embed=embed)
+                await asyncio.sleep(0.2)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+async def send_support_template_default_embeds(guild: discord.Guild):
+    """지원 서버 기본 안내 임베드를 중복 없이 전송합니다."""
+    default_embeds = {
+        "📢︱공지사항": build_support_template_embed(
+            "🌸 만능 봇 공식 지원 서버",
+            (
+                "만능 봇의 업데이트 소식, 문의 접수, 버그 제보, 기능 건의 및 커뮤니티 활동을 위한 공식 지원 서버입니다.\n\n"
+                "🎵 음악\n"
+                "🔊 TTS\n"
+                "💰 경제\n"
+                "⚒️ 강화\n"
+                "🎉 이벤트\n"
+                "🛡️ 관리\n"
+                "📈 레벨\n\n"
+                "모든 기능을 하나의 봇으로 만나보세요!"
+            )
+        ),
+        "📜︱이용규칙": build_auto_embed(guild, "rules"),
+        "📖︱봇사용법": build_support_template_embed(
+            "📖 만능 봇 사용법",
+            (
+                "만능 봇은 서버 운영과 친목에 필요한 기능을 한 번에 지원합니다.\n\n"
+                "🎵 음악: 재생, 스킵, 대기열, 현재재생 패널\n"
+                "🔊 TTS: 자동 읽기, 목소리 변경, TTS 통방\n"
+                "💰 경제: 포인트, 출석, 송금, 가챠, 상점\n"
+                "⚒️ 강화: 아이템 강화, 보호권, 확률업권\n"
+                "🎉 이벤트: 이벤트 패널, 등수 보상, 참가 보상\n"
+                "🛡️ 관리: 로그, 경고, 인증, 티켓\n\n"
+                "자세한 명령어는 `/도움말`을 사용해주세요."
+            )
+        ),
+        "🤖︱봇명령어": build_support_template_embed(
+            "🤖 봇 테스트 안내",
+            "이 채널에서 만능 봇 명령어를 자유롭게 테스트할 수 있습니다.\n\n`/도움말`을 입력해서 기능을 확인해보세요."
+        ),
+    }
+
+    for channel_name, embed in default_embeds.items():
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if not channel:
+            continue
+        try:
+            already_sent = False
+            async for msg in channel.history(limit=30):
+                if msg.author == bot.user and msg.embeds and (msg.embeds[0].title or "") == (embed.title or ""):
+                    already_sent = True
+                    break
+            if not already_sent:
+                await channel.send(embed=embed)
+                await asyncio.sleep(0.2)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+@bot.tree.command(name="지원서버템플릿", description="만능 봇 공식 지원 서버 템플릿을 자동 생성합니다.")
+async def create_support_server_template(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+
+    created = []
+    updated = []
+    deleted = []
+    skipped_delete = []
+
+    # 서버 이름도 지원 서버 느낌으로 자동 변경합니다.
+    try:
+        if guild.name != "🌸 만능 봇 공식 지원 서버":
+            await guild.edit(name="🌸 만능 봇 공식 지원 서버", reason="만능 봇 지원 서버 템플릿 적용")
+            updated.append("서버 이름")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    # 예전 /지원서버템플릿에서 만들었던 게임역할/담당팀/특수역할을 정리합니다.
+    # 단, 서버부스터 역할은 유지합니다.
+    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    for role_name in SUPPORT_TEMPLATE_REMOVED_ROLE_NAMES:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            continue
+        if role.managed or role == guild.default_role or (bot_member and role >= bot_member.top_role):
+            skipped_delete.append(f"역할: {role_name}")
+            continue
+        try:
+            await role.delete(reason="만능 봇 지원 서버 템플릿 역할 정리")
+            c.execute("DELETE FROM default_roles WHERE guild_id=? AND role_id=?", (guild.id, role.id))
+            conn.commit()
+            deleted.append(f"역할: {role_name}")
+            await asyncio.sleep(0.15)
+        except (discord.Forbidden, discord.HTTPException):
+            skipped_delete.append(f"역할: {role_name}")
+
+    # 예전 지원 템플릿의 게임/역할 전용 채널도 정확히 같은 이름일 때만 정리합니다.
+    for channel_name in SUPPORT_TEMPLATE_REMOVED_CHANNEL_NAMES:
+        channel = discord.utils.get(guild.text_channels, name=channel_name) or discord.utils.get(guild.voice_channels, name=channel_name)
+        if not channel:
+            continue
+        try:
+            await channel.delete(reason="만능 봇 지원 서버 템플릿 채널 정리")
+            deleted.append(f"채널: {channel_name}")
+            await asyncio.sleep(0.15)
+        except (discord.Forbidden, discord.HTTPException):
+            skipped_delete.append(f"채널: {channel_name}")
+
+    # 역할 생성/수정: 색상, 권한, 멤버와 분리 표시까지 적용합니다.
+    created_roles = {}
+    for role_name, color_value, hoist, profile in SUPPORT_TEMPLATE_ROLE_DEFINITIONS:
+        role = discord.utils.get(guild.roles, name=role_name)
+        permissions = support_template_permissions(profile)
+        if role is None:
+            try:
+                role = await guild.create_role(
+                    name=role_name,
+                    color=discord.Color(color_value),
+                    hoist=hoist,
+                    permissions=permissions,
+                    mentionable=False,
+                    reason="만능 봇 지원 서버 템플릿 역할 생성"
+                )
+                created.append(f"역할: {role_name}")
+                await asyncio.sleep(0.15)
+            except (discord.Forbidden, discord.HTTPException):
+                role = None
+        else:
+            try:
+                await role.edit(
+                    color=discord.Color(color_value),
+                    hoist=hoist,
+                    permissions=permissions,
+                    mentionable=False,
+                    reason="만능 봇 지원 서버 템플릿 역할 정리"
+                )
+                updated.append(f"역할 설정: {role_name}")
+                await asyncio.sleep(0.1)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        if role:
+            created_roles[role_name] = role
+
+    # 티켓 전용 카테고리도 미리 만들어둡니다.
+    support_overwrites = build_support_user_only_overwrites(guild)
+    ticket_category = discord.utils.get(guild.categories, name="🎫 티켓")
+    if ticket_category is None:
+        try:
+            ticket_category = await guild.create_category(
+                "🎫 티켓",
+                overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)},
+                reason="만능 봇 지원 서버 티켓 카테고리"
+            )
+            created.append("카테고리: 🎫 티켓")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    else:
+        try:
+            await ticket_category.edit(
+                overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)},
+                reason="만능 봇 지원 서버 티켓 카테고리 정리"
+            )
+            updated.append("카테고리 정리: 🎫 티켓")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    # 텍스트 카테고리/채널 생성: 모든 카테고리는 유저 역할 이상에게만 보이도록 설정합니다.
+    for category_name, channels in SUPPORT_TEMPLATE_TEXT_CHANNELS.items():
+        support_overwrites = build_support_user_only_overwrites(guild)
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category is None:
+            try:
+                category = await guild.create_category(
+                    category_name,
+                    overwrites=support_overwrites,
+                    reason="만능 봇 지원 서버 템플릿"
+                )
+                created.append(f"카테고리: {category_name}")
+                await asyncio.sleep(0.2)
+            except (discord.Forbidden, discord.HTTPException):
+                category = None
+        else:
+            try:
+                await category.edit(overwrites=support_overwrites, reason="만능 봇 지원 서버 카테고리 권한 정리")
+                updated.append(f"카테고리 권한: {category_name}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        for channel_name, topic in channels:
+            channel = discord.utils.get(guild.text_channels, name=channel_name)
+            if channel is None:
+                try:
+                    await guild.create_text_channel(
+                        channel_name,
+                        category=category,
+                        overwrites=support_overwrites,
+                        topic=topic,
+                        reason="만능 봇 지원 서버 템플릿"
+                    )
+                    created.append(f"채팅방: {channel_name}")
+                    await asyncio.sleep(0.2)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            else:
+                try:
+                    await channel.edit(
+                        category=category,
+                        overwrites=support_overwrites,
+                        topic=topic,
+                        reason="만능 봇 지원 서버 템플릿 정리"
+                    )
+                    updated.append(f"채팅방 정리: {channel_name}")
+                    await asyncio.sleep(0.1)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+    # 음성 카테고리/채널 생성: 음성도 유저 역할 이상에게만 보이도록 설정합니다.
+    for category_name, voice_names in SUPPORT_TEMPLATE_VOICE_CHANNELS.items():
+        support_overwrites = build_support_user_only_overwrites(guild)
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category is None:
+            try:
+                category = await guild.create_category(
+                    category_name,
+                    overwrites=support_overwrites,
+                    reason="만능 봇 지원 서버 템플릿"
+                )
+                created.append(f"카테고리: {category_name}")
+                await asyncio.sleep(0.2)
+            except (discord.Forbidden, discord.HTTPException):
+                category = None
+        else:
+            try:
+                await category.edit(overwrites=support_overwrites, reason="만능 봇 지원 서버 음성 카테고리 권한 정리")
+                updated.append(f"카테고리 권한: {category_name}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        for voice_name in voice_names:
+            voice = discord.utils.get(guild.voice_channels, name=voice_name)
+            if voice is None:
+                try:
+                    await guild.create_voice_channel(
+                        voice_name,
+                        category=category,
+                        overwrites=support_overwrites,
+                        reason="만능 봇 지원 서버 템플릿"
+                    )
+                    created.append(f"음성방: {voice_name}")
+                    await asyncio.sleep(0.2)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            else:
+                try:
+                    await voice.edit(
+                        category=category,
+                        overwrites=support_overwrites,
+                        reason="만능 봇 지원 서버 템플릿 정리"
+                    )
+                    updated.append(f"음성방 정리: {voice_name}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+    await send_support_template_default_embeds(guild)
+    support_ticket_category, support_ticket_channel, support_ticket_panel_sent = await ensure_support_ticket_panel(guild)
+    if support_ticket_channel:
+        updated.append(f"티켓지원: {support_ticket_channel.name}")
+    await send_support_development_auto_messages(guild)
+    await send_development_log_intro_embeds(guild)
+
+    created_text = "\n".join(f"• {item}" for item in created[:25]) if created else "새로 생성된 항목 없음"
+    if len(created) > 25:
+        created_text += f"\n외 {len(created) - 25}개"
+
+    deleted_text = "\n".join(f"• {item}" for item in deleted[:25]) if deleted else "정리된 항목 없음"
+    if len(deleted) > 25:
+        deleted_text += f"\n외 {len(deleted) - 25}개"
+
+    skipped_text = "\n".join(f"• {item}" for item in skipped_delete[:10]) if skipped_delete else "없음"
+    if len(skipped_delete) > 10:
+        skipped_text += f"\n외 {len(skipped_delete) - 10}개"
+
+    await interaction.followup.send(
+        "✅ 만능 봇 공식 지원 서버 템플릿 적용 완료!\n\n"
+        f"**새로 생성됨**\n{created_text}\n\n"
+        f"**정리됨**\n{deleted_text}\n\n"
+        f"**수정됨** `{len(updated)}`개\n"
+        f"**삭제 건너뜀** {skipped_text}\n\n"
+        f"🎫 티켓지원 채널: {support_ticket_channel.mention if support_ticket_channel else '미설정'} / "
+        f"패널: {'새로 전송됨' if support_ticket_panel_sent else '이미 있음'}",
+        ephemeral=True
+    )
+    await send_log(guild, f"🌸 지원 서버 템플릿 적용\n관리자: {interaction.user.mention}\n생성: {len(created)}개\n정리: {len(deleted)}개\n수정: {len(updated)}개", "general")
+
+
+
+@bot.tree.command(name="지원티켓복구", description="삭제된 만능 봇 공식 지원 서버 티켓문의 채널과 패널을 복구합니다.")
+async def restore_support_ticket_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    category, channel, panel_sent = await ensure_support_ticket_panel(interaction.guild)
+    await interaction.followup.send(
+        "✅ 공식 지원 서버 티켓문의를 복구했습니다.\n"
+        f"카테고리: `{category.name if category else '미설정'}`\n"
+        f"채널: {channel.mention if channel else '미설정'}\n"
+        f"티켓 패널: {'새로 전송됨' if panel_sent else '이미 있음'}",
+        ephemeral=True
+    )
+    await send_log(interaction.guild, f"🎫 지원 티켓 복구\n채널: {channel.mention if channel else '미설정'}\n관리자: {interaction.user.mention}", "general")
+
+
+async def auto_create_selected_panel(guild: discord.Guild, panel_value: str):
+    """슬래시 명령어로 자주 쓰는 패널/채널을 자동 생성합니다."""
+    results = []
+
+    if panel_value in ("support_ticket", "all"):
+        category, channel, sent = await ensure_support_ticket_panel(guild)
+        results.append(f"🎫 지원 티켓: {channel.mention if channel else '미설정'} / {'새로 전송됨' if sent else '이미 있음'}")
+
+    if panel_value in ("ticket", "all"):
+        category, channel, log_channel, sent = await create_ticket_category_channels(guild, send_panel=True)
+        try:
+            await apply_member_category_permissions(guild, category)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        results.append(f"📩 일반 티켓: {channel.mention if channel else '미설정'} / {'새로 전송됨' if sent else '이미 있음'}")
+
+    if panel_value in ("verify", "all"):
+        rule_category = await get_or_create_category(guild, "📌 필독")
+        verify_channel, sent = await create_verify_channel(guild, rule_category)
+        results.append(f"✅ 인증 패널: {verify_channel.mention if verify_channel else '미설정'} / {'새로 전송됨' if sent else '이미 있음'}")
+
+    if panel_value in ("music", "all"):
+        layout = await create_music_category_channels(guild, send_panel=True)
+        channel = layout.get("music_command_channel")
+        results.append(f"🎵 뮤직 패널: {channel.mention if channel else '미설정'} / {'새로 전송됨' if layout.get('music_panel_sent') else '이미 있음'}")
+
+    if panel_value in ("shop", "all"):
+        layout = await create_shop_category_channels(guild, send_shop_panel=True)
+        channel = layout.get("shop_channel")
+        results.append(f"🛒 상점 패널: {channel.mention if channel else '미설정'} / {'새로 전송됨' if layout.get('shop_panel_sent') else '이미 있음'}")
+
+    if panel_value in ("bot_guides", "all"):
+        layout = await create_bot_command_category_channels(guild, send_guides=True)
+        results.append(
+            f"📅 출석/레벨/강화 안내: "
+            f"{layout.get('attendance_channel').mention if layout.get('attendance_channel') else '미설정'} / "
+            f"{layout.get('level_channel').mention if layout.get('level_channel') else '미설정'} / "
+            f"{layout.get('enhance_channel').mention if layout.get('enhance_channel') else '미설정'}"
+        )
+
+    if panel_value in ("tts", "all"):
+        category, text_channel, voice_channel, sent = await create_tts_category_channels(guild)
+        results.append(f"🔊 TTS 안내: {text_channel.mention if text_channel else '미설정'} / {'새로 전송됨' if sent else '이미 있음'}")
+
+    if panel_value == "game_role":
+        category = await get_or_create_category(guild, "🎮 게임방")
+        try:
+            await apply_member_category_permissions(guild, category)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        channel = await get_or_create_text_channel(guild, "🎮-게임역할선택", category)
+        sent = await send_game_role_panel_to_channel(channel)
+        results.append(f"🎮 게임역할 패널: {channel.mention if channel else '미설정'} / {'새로 전송됨' if sent else '이미 있음'}")
+
+    if panel_value == "security":
+        channel = guild.system_channel or (guild.text_channels[0] if guild.text_channels else None)
+        if channel:
+            await channel.send(embed=build_security_panel_embed(guild), view=SecurityPanelView())
+            results.append(f"🛡️ 보안 패널: {channel.mention} / 새로 전송됨")
+        else:
+            results.append("🛡️ 보안 패널: 보낼 채널을 찾지 못함")
+
+    return results
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="패널자동생성", description="티켓/인증/뮤직/상점/TTS 등 주요 패널을 채널까지 자동 생성합니다.")
+@app_commands.describe(종류="자동 생성할 패널 종류를 선택하세요.")
+@app_commands.choices(종류=[
+    app_commands.Choice(name="전체 기본 패널", value="all"),
+    app_commands.Choice(name="공식지원 티켓문의", value="support_ticket"),
+    app_commands.Choice(name="일반 티켓패널", value="ticket"),
+    app_commands.Choice(name="인증패널", value="verify"),
+    app_commands.Choice(name="뮤직패널", value="music"),
+    app_commands.Choice(name="상점/포인트/주식패널", value="shop"),
+    app_commands.Choice(name="출석/레벨/강화 안내", value="bot_guides"),
+    app_commands.Choice(name="TTS 안내", value="tts"),
+    app_commands.Choice(name="게임역할패널", value="game_role"),
+    app_commands.Choice(name="보안패널", value="security"),
+])
+async def auto_create_panel_command(interaction: discord.Interaction, 종류: app_commands.Choice[str]):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.manage_channels:
+        return await interaction.response.send_message("❌ 채널 관리 권한이 필요합니다.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    results = await auto_create_selected_panel(interaction.guild, 종류.value)
+    text = "\n".join(f"• {line}" for line in results) if results else "처리된 패널이 없습니다."
+    await interaction.followup.send(
+        f"✅ `{종류.name}` 자동 생성/복구가 완료됐습니다.\n\n{text}",
+        ephemeral=True
+    )
+    await send_log(interaction.guild, f"🧩 패널 자동 생성\n종류: {종류.name}\n관리자: {interaction.user.mention}", "general")
+
+
+
+
+# =========================
+# 통합 패널 메뉴 (/패널)
+# =========================
+# 여러 개로 흩어져 있던 패널 명령어를 한 곳에서 단계별로 선택할 수 있게 만든 메뉴입니다.
+
+UNIFIED_PANEL_AUTO_CHOICES = [
+    {"label": "전체 기본 패널", "value": "all", "emoji": "🧩", "desc": "자주 쓰는 기본 패널을 한 번에 생성/복구"},
+    {"label": "공식지원 티켓문의", "value": "support_ticket", "emoji": "🎫", "desc": "공식 지원 서버 티켓문의 채널과 패널 복구"},
+    {"label": "일반 티켓패널", "value": "ticket", "emoji": "📩", "desc": "일반 티켓 카테고리/채널/패널 생성"},
+    {"label": "인증패널", "value": "verify", "emoji": "✅", "desc": "인증 채널과 인증 버튼 패널 생성"},
+    {"label": "뮤직패널", "value": "music", "emoji": "🎵", "desc": "뮤직 채널/음성채널/조작 패널 생성"},
+    {"label": "상점/포인트/주식패널", "value": "shop", "emoji": "🛒", "desc": "상점 카테고리와 경제 안내 패널 생성"},
+    {"label": "출석/레벨/강화 안내", "value": "bot_guides", "emoji": "📅", "desc": "출석, 레벨, 강화 안내 채널 생성"},
+    {"label": "TTS 안내", "value": "tts", "emoji": "🔊", "desc": "TTS 채팅방/통방/안내 생성"},
+    {"label": "게임역할패널", "value": "game_role", "emoji": "🎮", "desc": "게임 역할 선택 패널 생성"},
+    {"label": "보안패널", "value": "security", "emoji": "🛡️", "desc": "보안 설정 패널 전송"},
+]
+
+UNIFIED_PANEL_OPEN_CHOICES = [
+    {"label": "도움말 패널", "value": "help", "emoji": "🌸", "desc": "일반 유저용 도움말"},
+    {"label": "경제 패널", "value": "economy", "emoji": "💰", "desc": "포인트/가챠/쿠폰/백업"},
+    {"label": "통합 상점", "value": "shop", "emoji": "🛒", "desc": "구매/인벤토리 버튼"},
+    {"label": "티켓 패널", "value": "ticket", "emoji": "🎫", "desc": "일반/문의/신고 티켓"},
+    {"label": "뮤직 패널", "value": "music", "emoji": "🎵", "desc": "음악 재생/스킵/정지 조작"},
+    {"label": "인증 패널", "value": "verify", "emoji": "✅", "desc": "인증 버튼 패널"},
+    {"label": "게임역할 패널", "value": "game_role", "emoji": "🎮", "desc": "게임 역할 선택"},
+    {"label": "보안 패널", "value": "security", "emoji": "🛡️", "desc": "서버 보안 설정"},
+    {"label": "경고 패널", "value": "warning", "emoji": "⚠️", "desc": "경고 지급/조회/삭제"},
+    {"label": "관리도구 패널", "value": "staff_tools", "emoji": "🔨", "desc": "청소/킥/밴/경고"},
+    {"label": "관리자 패널", "value": "admin", "emoji": "🎛️", "desc": "관리자 통합 메뉴"},
+    {"label": "이벤트 생성 패널", "value": "event", "emoji": "🎉", "desc": "박스형 이벤트 공지/예약"},
+    {"label": "이벤트 종료 패널", "value": "event_end", "emoji": "🏁", "desc": "승리팀/패배팀/보상 발표"},
+    {"label": "칭호 패널", "value": "title", "emoji": "🏷️", "desc": "칭호/업적/보상"},
+    {"label": "개발로그 패널", "value": "devlog", "emoji": "📈", "desc": "업데이트/패치노트 알림"},
+]
+
+UNIFIED_PANEL_EMBED_CHOICES = [
+    {"label": "전체 임베드 설정", "value": "unified_embed", "emoji": "🧩", "desc": "환영/규칙/자기소개/인증 버튼식 설정"},
+    {"label": "환영 임베드", "value": "welcome_embed", "emoji": "🌸", "desc": "입장 환영 메시지 임베드 설정"},
+    {"label": "규칙 임베드", "value": "rule_embed", "emoji": "📜", "desc": "이용규칙 임베드 설정"},
+    {"label": "자기소개 임베드", "value": "intro_embed", "emoji": "📝", "desc": "자기소개 안내 임베드 설정"},
+    {"label": "인증 임베드", "value": "verify_embed", "emoji": "✅", "desc": "인증패널 임베드 설정"},
+    {"label": "인증 완료 문구", "value": "verify_success", "emoji": "💬", "desc": "인증 버튼 클릭 후 뜨는 문구 설정"},
+] + PANEL_CUSTOM_SETTING_CHOICES
+
+
+def build_unified_panel_home_embed():
+    embed = discord.Embed(
+        title="🧩 만능 봇 통합 패널",
+        description=(
+            "여기서 원하는 패널 종류를 고르면 다음 단계로 이동합니다.\n\n"
+            "**1단계** 패널 분류 선택\n"
+            "**2단계** 세부 패널 선택\n"
+            "**3단계** 실행 또는 전송\n\n"
+            "아래 버튼 중 하나를 눌러주세요."
+        ),
+        color=BOT_COLOR
+    )
+    embed.add_field(
+        name="📦 채널까지 자동 생성/복구",
+        value="티켓, 인증, 뮤직, 상점, TTS 등 필요한 채널과 패널을 자동으로 만듭니다.",
+        inline=False
+    )
+    embed.add_field(
+        name="🎛️ 패널 바로 열기",
+        value="경제, 상점, 티켓, 보안, 이벤트, 관리자 패널 등을 바로 엽니다.",
+        inline=False
+    )
+    embed.add_field(
+        name="✏️ 임베드/문구 설정",
+        value="규칙, 인증, 자기소개, 인증 완료 문구와 주요 패널 디자인을 수정합니다.",
+        inline=False
+    )
+    embed.set_footer(text="만능 봇 | 단계별 통합 패널 메뉴")
+    return embed
+
+
+def build_unified_panel_step_embed(title: str, description: str, choices: list = None):
+    embed = discord.Embed(title=title, description=description, color=BOT_COLOR)
+    if choices:
+        text = "\n".join(
+            f"{item.get('emoji', '•')} **{item['label']}** - {item.get('desc', '')}"
+            for item in choices[:20]
+        )
+        embed.add_field(name="선택 가능 항목", value=text[:1024], inline=False)
+    embed.set_footer(text="뒤로 가려면 아래 버튼을 눌러주세요.")
+    return embed
+
+
+def unified_panel_choice_name(choices: list, value: str):
+    for item in choices:
+        if item["value"] == value:
+            return item["label"]
+    return value
+
+
+def unified_panel_choice_desc(choices: list, value: str):
+    for item in choices:
+        if item["value"] == value:
+            return item.get("desc", "")
+    return ""
+
+
+async def send_unified_panel_open(interaction: discord.Interaction, panel_value: str, *, send_to_channel: bool = False):
+    """선택한 패널을 열거나 현재 채널에 전송합니다."""
+    guild = interaction.guild
+    channel = interaction.channel
+
+    if guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    # 공개 전송은 서버 세팅에 영향을 줄 수 있으므로 관리자만 허용합니다.
+    if send_to_channel and not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ 현재 채널에 패널을 전송하려면 관리자 권한이 필요합니다.", ephemeral=True)
+
+    if panel_value == "help":
+        embed = build_public_help_embed("main")
+        embed = apply_custom_panel_embed(guild, "help", embed)
+        view = PublicHelpView()
+        if send_to_channel:
+            await channel.send(embed=embed, view=view)
+            return await interaction.response.send_message("✅ 도움말 패널을 현재 채널에 전송했습니다.", ephemeral=True)
+        return await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    if panel_value == "economy":
+        embed = discord.Embed(
+            title="💰 만능 봇 경제 패널",
+            description=(
+                "아래 버튼으로 경제 기능을 사용할 수 있습니다.\n\n"
+                "💰 포인트 지급 - 관리자 전용\n"
+                "💸 포인트 차감 - 관리자 전용\n"
+                "🎁 일일 보상 - 하루 1회\n"
+                "🎰 가챠 - `/가챠 금액 횟수`\n"
+                "🎯 일일미션 - 채팅/출석 미션 확인\n"
+                "🏷️ 칭호/업적 - 성장 보상과 대표 칭호\n"
+                "🎟️ 쿠폰 - 쿠폰 사용 안내\n"
+                "💾 DB 백업 - 관리자 전용"
+            ),
+            color=discord.Color.gold()
+        )
+        embed = apply_custom_panel_embed(guild, "economy", embed)
+        return await interaction.response.send_message(embed=embed, view=EconomyView(), ephemeral=True)
+
+    if panel_value == "shop":
+        embed = apply_custom_panel_embed(guild, "shop", build_shop_embed())
+        if send_to_channel:
+            await channel.send(embed=embed, view=ShopView())
+            return await interaction.response.send_message("✅ 통합 상점 패널을 현재 채널에 전송했습니다.", ephemeral=True)
+        return await interaction.response.send_message(embed=embed, view=ShopView(), ephemeral=True)
+
+    if panel_value == "ticket":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 티켓 패널은 관리자만 열거나 전송할 수 있습니다.", ephemeral=True)
+        embed = create_embed(
+            "🎫 만능 봇 통합 티켓 패널",
+            "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n🎫 **일반 티켓**\n💬 **문의 티켓**\n🚨 **신고 티켓**\n\n관리자에게만 보이는 개인 채널이 생성됩니다."
+        )
+        embed = apply_custom_panel_embed(guild, "ticket", embed)
+        if send_to_channel:
+            await channel.send(embed=embed, view=UnifiedTicketView())
+            return await interaction.response.send_message("✅ 티켓 패널을 현재 채널에 전송했습니다.", ephemeral=True)
+        return await interaction.response.send_message(embed=embed, view=UnifiedTicketView(), ephemeral=True)
+
+    if panel_value == "music":
+        embed = await build_music_panel_embed()
+        embed = apply_custom_panel_embed(guild, "music", embed)
+        if send_to_channel:
+            await channel.send(embed=embed, view=MusicPanelView())
+            return await interaction.response.send_message("✅ 뮤직 패널을 현재 채널에 전송했습니다.", ephemeral=True)
+        return await interaction.response.send_message(embed=embed, view=MusicPanelView(), ephemeral=True)
+
+    if panel_value == "verify":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 인증 패널은 관리자만 전송할 수 있습니다.", ephemeral=True)
+        if send_to_channel:
+            sent = await send_verify_panel_to_channel(channel)
+            return await interaction.response.send_message(
+                "✅ 인증 패널을 현재 채널에 전송했습니다." if sent else "✅ 이미 이 채널에 인증 패널이 있습니다.",
+                ephemeral=True
+            )
+        return await interaction.response.send_message(embed=build_auto_embed(guild, "verify"), view=VerifyView(), ephemeral=True)
+
+    if panel_value == "game_role":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 게임역할 패널은 관리자만 전송할 수 있습니다.", ephemeral=True)
+        embed = apply_custom_panel_embed(guild, "game_role", build_game_role_embed())
+        if send_to_channel:
+            await channel.send(embed=embed, view=GameRoleView())
+            return await interaction.response.send_message("✅ 게임역할 패널을 현재 채널에 전송했습니다.", ephemeral=True)
+        return await interaction.response.send_message(embed=embed, view=GameRoleView(), ephemeral=True)
+
+    if panel_value == "security":
+        if not await require_admin_interaction(interaction):
+            return
+        embed = apply_custom_panel_embed(guild, "security", build_security_panel_embed(guild))
+        if send_to_channel:
+            await channel.send(embed=embed, view=SecurityPanelView())
+            return await interaction.response.send_message("✅ 보안 패널을 현재 채널에 전송했습니다.", ephemeral=True)
+        return await interaction.response.send_message(embed=embed, view=SecurityPanelView(), ephemeral=True)
+
+    if panel_value == "warning":
+        if not interaction.user.guild_permissions.moderate_members:
+            return await interaction.response.send_message("❌ 경고 패널은 멤버 관리 권한이 필요합니다.", ephemeral=True)
+        embed = discord.Embed(title="⚠️ 경고 관리 패널", description="아래 버튼으로 경고를 관리하세요.", color=discord.Color.orange())
+        embed = apply_custom_panel_embed(guild, "warning", embed)
+        return await interaction.response.send_message(embed=embed, view=WarnManagePanel(), ephemeral=True)
+
+    if panel_value == "staff_tools":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        embed = discord.Embed(
+            title="🔨 만능 봇 관리자 전용 도구",
+            description="아래 버튼으로 관리 기능을 사용할 수 있어요.\n\n⚠️ **경고 패널**\n🧹 **청소**\n🔨 **킥**\n⛔ **밴**",
+            color=BOT_COLOR
+        )
+        embed = apply_custom_panel_embed(guild, "staff_tools", embed)
+        return await interaction.response.send_message(embed=embed, view=StaffToolPanelView(), ephemeral=True)
+
+    if panel_value == "admin":
+        if not interaction.user.guild_permissions.administrator:
+            await send_log(guild, f"🚫 통합 패널 관리자패널 권한 부족\n유저: {interaction.user.mention}")
+            return await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        embed = discord.Embed(
+            title="🎛️ 만능 봇 관리자 패널",
+            description="아래 버튼으로 서버를 관리하세요.\n\n📢 공지 패널\n⚠️ 경고 패널\n💰 경제 패널\n🎫 티켓 패널\n🏆 통합 랭킹\n🧹 청소\n🔨 킥\n⛔ 밴",
+            color=BOT_COLOR
+        )
+        embed = apply_custom_panel_embed(guild, "admin", embed)
+        return await interaction.response.send_message(embed=embed, view=AdminPanelView(), ephemeral=True)
+
+    if panel_value == "event":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 관리자만 이벤트를 등록할 수 있습니다.", ephemeral=True)
+        get_event_draft(interaction.user.id)
+        embed = apply_custom_panel_embed(guild, "event", build_event_preview_embed(interaction))
+        return await interaction.response.send_message(embed=embed, view=EventCreatePanelView(), ephemeral=True)
+
+    if panel_value == "event_end":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 관리자만 이벤트 종료 패널을 사용할 수 있습니다.", ephemeral=True)
+        get_event_end_draft(interaction.user.id)
+        embed = apply_custom_panel_embed(guild, "event_end", build_event_end_preview_embed(interaction))
+        return await interaction.response.send_message(embed=embed, view=EventEndPanelView(), ephemeral=True)
+
+    if panel_value == "title":
+        equipped = get_equipped_title(guild.id, interaction.user.id)
+        owned_count = count_user_titles(guild.id, interaction.user.id)
+        point = get_user_point(guild.id, interaction.user.id)
+        embed = discord.Embed(
+            title="🏷️ 만능 봇 칭호 패널",
+            description=(
+                "아래 버튼으로 칭호 기능을 사용할 수 있어요.\n\n"
+                "🏷️ **상점 보기** - 구매 가능한 칭호 확인\n"
+                "🛒 **구매** - 포인트로 칭호 구매\n"
+                "📦 **내 칭호** - 보유 칭호 목록 확인\n"
+                "🌟 **대표 칭호** - 프로필에 표시할 칭호 설정\n"
+                "🏆 **업적 보기** - 업적 진행도 확인\n"
+                "🎁 **업적 보상** - 완료한 업적 보상 수령"
+            ),
+            color=discord.Color.purple()
+        )
+        embed.add_field(name="현재 대표 칭호", value=equipped or "없음", inline=True)
+        embed.add_field(name="보유 칭호", value=f"{owned_count}개", inline=True)
+        embed.add_field(name="보유 포인트", value=f"{point:,}P", inline=True)
+        embed = apply_custom_panel_embed(guild, "title", embed)
+        return await interaction.response.send_message(embed=embed, view=TitlePanelView(), ephemeral=True)
+
+    if panel_value == "devlog":
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 개발로그 패널은 관리자만 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        result = await ensure_development_log_channels(guild)
+        channel_lines = []
+        try:
+            for config in DEVELOPMENT_LOG_CHANNELS:
+                dev_channel = discord.utils.get(guild.text_channels, name=config["name"])
+                channel_lines.append(f"{config['name'].split('︱')[0]} {dev_channel.mention if dev_channel else '`생성 실패`'}")
+        except Exception:
+            channel_lines = []
+        embed = discord.Embed(
+            title="📈 개발로그 자동 생성 완료",
+            description=(
+                "개발로그 채널 구성을 자동으로 생성/정리했습니다.\n\n"
+                + ("\n".join(channel_lines) if channel_lines else "업데이트/패치노트/봇상태/개발일지 채널을 확인해주세요.")
+                + "\n\n아래 버튼으로 업데이트 알림, 패치노트, 봇상태, 개발일지를 바로 보낼 수 있습니다."
+            ),
+            color=BOT_COLOR
+        )
+        if isinstance(result, dict):
+            embed.add_field(name="새로 생성", value=f"`{len(result.get('created', []))}`개", inline=True)
+            embed.add_field(name="정리 완료", value=f"`{len(result.get('updated', []))}`개", inline=True)
+            if result.get("alert_role"):
+                embed.add_field(name="알림 역할", value=result["alert_role"].mention, inline=True)
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed = apply_custom_panel_embed(guild, "devlog", embed)
+        return await interaction.followup.send(embed=embed, view=DevelopmentLogPanelView(), ephemeral=True)
+
+    return await interaction.response.send_message("❌ 아직 연결되지 않은 패널입니다.", ephemeral=True)
+
+
+async def send_unified_embed_setting(interaction: discord.Interaction, embed_value: str):
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+
+    if embed_value == "unified_embed":
+        embed = discord.Embed(
+            title="🧩 통합 임베드 설정",
+            description="수정할 임베드 종류를 버튼으로 선택해주세요.",
+            color=BOT_COLOR
+        )
+        return await interaction.response.send_message(embed=embed, view=UnifiedEmbedSettingView(), ephemeral=True)
+
+    if embed_value == "welcome_embed":
+        embed = discord.Embed(
+            title="🌸 환영 임베드 설정",
+            description=(
+                "입장 환영 메시지 임베드를 만들고 수정합니다.\n\n"
+                "📝 만들기/수정: 제목, 내용, 색상, 이미지/GIF, 하단 문구 설정\n"
+                "👀 미리보기: 현재 저장된 환영 임베드 확인\n"
+                "🗑️ 초기화: 기본 환영 임베드로 되돌리기"
+            ),
+            color=BOT_COLOR
+        )
+        return await interaction.response.send_message(embed=embed, view=WelcomeEmbedSettingView(), ephemeral=True)
+
+    if embed_value == "rule_embed":
+        embed = discord.Embed(
+            title="📜 규칙 임베드 설정",
+            description="자동 생성되는 규칙 임베드를 만들고 수정합니다.",
+            color=BOT_COLOR
+        )
+        return await interaction.response.send_message(embed=embed, view=AutoEmbedSettingView("rules", "규칙 임베드"), ephemeral=True)
+
+    if embed_value == "intro_embed":
+        embed = discord.Embed(
+            title="📝 자기소개 임베드 설정",
+            description="자동 생성되는 자기소개 임베드를 만들고 수정합니다.",
+            color=BOT_COLOR
+        )
+        return await interaction.response.send_message(embed=embed, view=AutoEmbedSettingView("intro", "자기소개 임베드"), ephemeral=True)
+
+    if embed_value == "verify_embed":
+        embed = discord.Embed(
+            title="✅ 인증 패널 임베드 설정",
+            description="자동 생성되는 인증 패널 임베드를 만들고 수정합니다.",
+            color=BOT_COLOR
+        )
+        return await interaction.response.send_message(embed=embed, view=AutoEmbedSettingView("verify", "인증패널"), ephemeral=True)
+
+    if embed_value == "verify_success":
+        return await interaction.response.send_modal(VerifySuccessMessageModal(guild.id))
+
+    if embed_value.startswith("panel_custom_"):
+        panel_value = embed_value.replace("panel_custom_", "", 1)
+        embed_type = PANEL_CUSTOM_EMBED_TYPES.get(panel_value)
+        display_name = PANEL_CUSTOM_EMBED_DISPLAY_NAMES.get(panel_value, "패널")
+        if not embed_type:
+            return await interaction.response.send_message("❌ 아직 연결되지 않은 패널 꾸미기입니다.", ephemeral=True)
+        embed = discord.Embed(
+            title=f"🎨 {display_name} 꾸미기",
+            description=(
+                f"`{display_name}`의 제목, 내용, 색상, 이미지/GIF, 하단 문구를 수정합니다.\n\n"
+                "📝 **만들기/수정** 버튼을 눌러 박스에 원하는 내용을 입력하세요.\n"
+                "👀 **미리보기**로 저장된 디자인을 확인할 수 있어요.\n"
+                "🗑️ **초기화**를 누르면 기본 디자인으로 돌아갑니다."
+            ),
+            color=BOT_COLOR
+        )
+        return await interaction.response.send_message(
+            embed=embed,
+            view=AutoEmbedSettingView(embed_type, display_name),
+            ephemeral=True
+        )
+
+    return await interaction.response.send_message("❌ 아직 연결되지 않은 설정입니다.", ephemeral=True)
+
+
+class UnifiedPanelHomeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if await can_manage_bot_in_guild(interaction):
+            return True
+        await interaction.response.send_message(
+            "❌ 이 통합 패널은 관리자만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="자동 생성/복구", emoji="📦", style=discord.ButtonStyle.green)
+    async def auto_panels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        step_embed = build_unified_panel_step_embed(
+            "📦 1단계: 자동 생성할 패널 선택",
+            "아래 선택창에서 자동으로 만들거나 복구할 패널을 골라주세요.",
+            UNIFIED_PANEL_AUTO_CHOICES
+        )
+        step_embed = apply_custom_panel_embed(interaction.guild, "auto_create", step_embed)
+        await interaction.response.edit_message(
+            embed=step_embed,
+            view=UnifiedPanelAutoSelectView()
+        )
+
+    @discord.ui.button(label="패널 바로 열기", emoji="🎛️", style=discord.ButtonStyle.blurple)
+    async def open_panels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_unified_panel_step_embed(
+                "🎛️ 1단계: 열어볼 패널 선택",
+                "아래 선택창에서 열고 싶은 패널을 골라주세요. 선택 후 다음 단계에서 실행합니다.",
+                UNIFIED_PANEL_OPEN_CHOICES
+            ),
+            view=UnifiedPanelOpenSelectView()
+        )
+
+    @discord.ui.button(label="임베드/문구 설정", emoji="✏️", style=discord.ButtonStyle.gray)
+    async def embed_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_unified_panel_step_embed(
+                "✏️ 1단계: 수정할 임베드/문구 선택",
+                "수정할 임베드나 인증 완료 문구를 선택해주세요.",
+                UNIFIED_PANEL_EMBED_CHOICES
+            ),
+            view=UnifiedPanelEmbedSelectView()
+        )
+
+    @discord.ui.button(label="닫기", emoji="✖️", style=discord.ButtonStyle.red)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ 통합 패널 메뉴를 닫았습니다.", embed=None, view=None)
+
+
+class UnifiedPanelBackView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if await can_manage_bot_in_guild(interaction):
+            return True
+        await interaction.response.send_message(
+            "❌ 이 통합 패널은 관리자만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="처음으로", emoji="🏠", style=discord.ButtonStyle.gray)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=build_unified_panel_home_embed(), view=UnifiedPanelHomeView())
+
+    @discord.ui.button(label="닫기", emoji="✖️", style=discord.ButtonStyle.red)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ 통합 패널 메뉴를 닫았습니다.", embed=None, view=None)
+
+
+class UnifiedPanelAutoSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=item["label"],
+                value=item["value"],
+                description=item.get("desc", "")[:100],
+                emoji=item.get("emoji")
+            )
+            for item in UNIFIED_PANEL_AUTO_CHOICES
+        ]
+        super().__init__(placeholder="자동 생성/복구할 패널을 선택해주세요", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        label = unified_panel_choice_name(UNIFIED_PANEL_AUTO_CHOICES, value)
+        desc = unified_panel_choice_desc(UNIFIED_PANEL_AUTO_CHOICES, value)
+        embed = discord.Embed(
+            title=f"📦 2단계: {label}",
+            description=(
+                f"**선택한 항목**\n{desc}\n\n"
+                "아래 `실행하기` 버튼을 누르면 채널과 패널을 자동으로 생성하거나 복구합니다."
+            ),
+            color=BOT_COLOR
+        )
+        embed = apply_custom_panel_embed(interaction.guild, value, embed)
+        await interaction.response.edit_message(embed=embed, view=UnifiedPanelAutoConfirmView(value, label))
+
+
+class UnifiedPanelAutoSelectView(UnifiedPanelBackView):
+    def __init__(self):
+        super().__init__()
+        self.add_item(UnifiedPanelAutoSelect())
+
+
+class UnifiedPanelAutoConfirmView(UnifiedPanelBackView):
+    def __init__(self, panel_value: str, panel_label: str):
+        super().__init__()
+        self.panel_value = panel_value
+        self.panel_label = panel_label
+
+    @discord.ui.button(label="실행하기", emoji="✅", style=discord.ButtonStyle.green)
+    async def run_auto_create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        if await reject_if_not_bot_manager(interaction):
+            return
+        if not interaction.user.guild_permissions.manage_channels:
+            return await interaction.response.send_message("❌ 채널 관리 권한이 필요합니다.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        results = await auto_create_selected_panel(interaction.guild, self.panel_value)
+        text = "\n".join(f"• {line}" for line in results) if results else "처리된 패널이 없습니다."
+        await interaction.followup.send(
+            f"✅ `{self.panel_label}` 자동 생성/복구가 완료됐습니다.\n\n{text}",
+            ephemeral=True
+        )
+        try:
+            await interaction.message.edit(
+                embed=build_unified_panel_step_embed(
+                    "📦 자동 생성/복구 완료",
+                    "다른 패널도 생성하려면 아래에서 다시 선택해주세요.",
+                    UNIFIED_PANEL_AUTO_CHOICES
+                ),
+                view=UnifiedPanelAutoSelectView()
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await send_log(interaction.guild, f"🧩 통합 패널 자동 생성\n종류: {self.panel_label}\n관리자: {interaction.user.mention}", "general")
+
+
+class UnifiedPanelOpenSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=item["label"],
+                value=item["value"],
+                description=item.get("desc", "")[:100],
+                emoji=item.get("emoji")
+            )
+            for item in UNIFIED_PANEL_OPEN_CHOICES
+        ]
+        super().__init__(placeholder="열고 싶은 패널을 선택해주세요", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        label = unified_panel_choice_name(UNIFIED_PANEL_OPEN_CHOICES, value)
+        desc = unified_panel_choice_desc(UNIFIED_PANEL_OPEN_CHOICES, value)
+        embed = discord.Embed(
+            title=f"🎛️ 2단계: {label}",
+            description=(
+                f"**선택한 항목**\n{desc}\n\n"
+                "`나만 보기로 열기`는 버튼을 누른 사람에게만 보입니다.\n"
+                "`현재 채널에 전송`은 관리자만 사용할 수 있고, 공개 패널로 전송됩니다."
+            ),
+            color=BOT_COLOR
+        )
+        await interaction.response.edit_message(embed=embed, view=UnifiedPanelOpenConfirmView(value, label))
+
+
+class UnifiedPanelOpenSelectView(UnifiedPanelBackView):
+    def __init__(self):
+        super().__init__()
+        self.add_item(UnifiedPanelOpenSelect())
+
+
+class UnifiedPanelOpenConfirmView(UnifiedPanelBackView):
+    def __init__(self, panel_value: str, panel_label: str):
+        super().__init__()
+        self.panel_value = panel_value
+        self.panel_label = panel_label
+
+    @discord.ui.button(label="나만 보기로 열기", emoji="👁️", style=discord.ButtonStyle.blurple)
+    async def open_private(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_unified_panel_open(interaction, self.panel_value, send_to_channel=False)
+
+    @discord.ui.button(label="현재 채널에 전송", emoji="📨", style=discord.ButtonStyle.green)
+    async def send_public(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_unified_panel_open(interaction, self.panel_value, send_to_channel=True)
+
+
+class UnifiedPanelEmbedSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=item["label"],
+                value=item["value"],
+                description=item.get("desc", "")[:100],
+                emoji=item.get("emoji")
+            )
+            for item in UNIFIED_PANEL_EMBED_CHOICES
+        ]
+        super().__init__(placeholder="수정할 임베드/문구를 선택해주세요", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        label = unified_panel_choice_name(UNIFIED_PANEL_EMBED_CHOICES, value)
+        desc = unified_panel_choice_desc(UNIFIED_PANEL_EMBED_CHOICES, value)
+        embed = discord.Embed(
+            title=f"✏️ 2단계: {label}",
+            description=(
+                f"**선택한 항목**\n{desc}\n\n"
+                "아래 `설정 열기` 버튼을 누르면 수정 화면으로 이동합니다."
+            ),
+            color=BOT_COLOR
+        )
+        await interaction.response.edit_message(embed=embed, view=UnifiedPanelEmbedConfirmView(value, label))
+
+
+class UnifiedPanelEmbedSelectView(UnifiedPanelBackView):
+    def __init__(self):
+        super().__init__()
+        self.add_item(UnifiedPanelEmbedSelect())
+
+
+class UnifiedPanelEmbedConfirmView(UnifiedPanelBackView):
+    def __init__(self, embed_value: str, embed_label: str):
+        super().__init__()
+        self.embed_value = embed_value
+        self.embed_label = embed_label
+
+    @discord.ui.button(label="설정 열기", emoji="✏️", style=discord.ButtonStyle.green)
+    async def open_embed_setting(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_unified_embed_setting(interaction, self.embed_value)
+
+
+@bot.tree.command(name="패널", description="모든 패널을 단계별 통합 메뉴로 엽니다.")
+async def unified_panel_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    await interaction.response.send_message(embed=build_unified_panel_home_embed(), view=UnifiedPanelHomeView(), ephemeral=True)
+
+# =========================
+# 경제 업그레이드: 일일미션 / 쿠폰 시스템
+# =========================
+DAILY_MISSION_CHAT_TARGET = 20
+DAILY_MISSION_REWARD_POINT = 500
+DAILY_MISSION_REWARD_BOX = 1
+
+
+def get_daily_mission_settings(guild_id: int):
+    ensure_dashboard_sync_for_guild(guild_id)
+    c.execute("SELECT chat_target, reward_point, reward_box FROM daily_mission_settings WHERE guild_id=?", (guild_id,))
+    row = c.fetchone()
+    if row:
+        chat_target = max(1, int(row[0] or DAILY_MISSION_CHAT_TARGET))
+        reward_point = max(0, int(row[1] or DAILY_MISSION_REWARD_POINT))
+        reward_box = max(0, int(row[2] or DAILY_MISSION_REWARD_BOX))
+        return chat_target, reward_point, reward_box
+    return DAILY_MISSION_CHAT_TARGET, DAILY_MISSION_REWARD_POINT, DAILY_MISSION_REWARD_BOX
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS daily_mission_progress (
+    guild_id INTEGER,
+    user_id INTEGER,
+    mission_date TEXT,
+    message_count INTEGER DEFAULT 0,
+    attendance_done INTEGER DEFAULT 0,
+    claimed INTEGER DEFAULT 0,
+    claimed_at TEXT,
+    PRIMARY KEY (guild_id, user_id, mission_date)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS coupon_codes (
+    guild_id INTEGER,
+    code TEXT,
+    reward_point INTEGER DEFAULT 0,
+    item_name TEXT,
+    item_amount INTEGER DEFAULT 0,
+    max_uses INTEGER DEFAULT 1,
+    used_count INTEGER DEFAULT 0,
+    expires_at TEXT,
+    is_active INTEGER DEFAULT 1,
+    created_by INTEGER,
+    created_at TEXT,
+    PRIMARY KEY (guild_id, code)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS coupon_claims (
+    guild_id INTEGER,
+    code TEXT,
+    user_id INTEGER,
+    claimed_at TEXT,
+    PRIMARY KEY (guild_id, code, user_id)
+)
+""")
+conn.commit()
+
+
+def today_key():
+    return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def normalize_coupon_code(code: str):
+    code = (code or "").strip().upper()
+    code = re.sub(r"\s+", "", code)
+    return code
+
+
+def parse_coupon_expire(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(value, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    return "INVALID"
+
+
+def ensure_daily_mission_progress(guild_id: int, user_id: int):
+    mission_date = today_key()
+    c.execute(
+        """
+        SELECT message_count, attendance_done, claimed
+        FROM daily_mission_progress
+        WHERE guild_id=? AND user_id=? AND mission_date=?
+        """,
+        (guild_id, user_id, mission_date)
+    )
+    row = c.fetchone()
+
+    # 이미 오늘 출석을 완료한 유저라면, 미션 테이블이 늦게 만들어졌어도 자동으로 반영합니다.
+    c.execute("SELECT last_attendance FROM users WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+    attendance_row = c.fetchone()
+    attendance_done_now = 1 if attendance_row and attendance_row[0] == mission_date else 0
+
+    if row is None:
+        c.execute(
+            """
+            INSERT OR IGNORE INTO daily_mission_progress(
+                guild_id, user_id, mission_date, message_count, attendance_done, claimed
+            ) VALUES (?, ?, ?, 0, ?, 0)
+            """,
+            (guild_id, user_id, mission_date, attendance_done_now)
+        )
+        conn.commit()
+        return 0, attendance_done_now, 0
+
+    message_count, attendance_done, claimed = row
+    if attendance_done_now and not attendance_done:
+        attendance_done = 1
+        c.execute(
+            "UPDATE daily_mission_progress SET attendance_done=1 WHERE guild_id=? AND user_id=? AND mission_date=?",
+            (guild_id, user_id, mission_date)
+        )
+        conn.commit()
+    return int(message_count or 0), int(attendance_done or 0), int(claimed or 0)
+
+
+def add_daily_mission_message_progress(guild_id: int, user_id: int):
+    mission_date = today_key()
+    message_count, attendance_done, claimed = ensure_daily_mission_progress(guild_id, user_id)
+    if claimed or message_count >= DAILY_MISSION_CHAT_TARGET:
+        return message_count, attendance_done, claimed
+    message_count += 1
+    c.execute(
+        """
+        UPDATE daily_mission_progress
+        SET message_count=?
+        WHERE guild_id=? AND user_id=? AND mission_date=?
+        """,
+        (message_count, guild_id, user_id, mission_date)
+    )
+    conn.commit()
+    return message_count, attendance_done, claimed
+
+
+def mark_daily_mission_attendance(guild_id: int, user_id: int):
+    mission_date = today_key()
+    ensure_daily_mission_progress(guild_id, user_id)
+    c.execute(
+        """
+        UPDATE daily_mission_progress
+        SET attendance_done=1
+        WHERE guild_id=? AND user_id=? AND mission_date=?
+        """,
+        (guild_id, user_id, mission_date)
+    )
+    conn.commit()
+
+
+def build_daily_mission_embed(guild_id: int, user: discord.User):
+    message_count, attendance_done, claimed = ensure_daily_mission_progress(guild_id, user.id)
+    chat_done = message_count >= DAILY_MISSION_CHAT_TARGET
+    progress_bar_count = min(10, int((min(message_count, DAILY_MISSION_CHAT_TARGET) / DAILY_MISSION_CHAT_TARGET) * 10))
+    progress_bar = "▰" * progress_bar_count + "▱" * (10 - progress_bar_count)
+
+    embed = discord.Embed(
+        title="🎯 오늘의 일일미션",
+        description=(
+            f"{user.mention}님의 오늘 미션 진행도입니다.\n\n"
+            f"💬 채팅 미션: **{min(message_count, DAILY_MISSION_CHAT_TARGET)}/{DAILY_MISSION_CHAT_TARGET}회**\n"
+            f"{progress_bar}\n"
+            f"📅 출석 미션: {'완료 ✅' if attendance_done else '미완료 ❌'}\n\n"
+            f"🎁 완료 보상: **{DAILY_MISSION_REWARD_POINT:,}P + 랜덤박스 {DAILY_MISSION_REWARD_BOX}개**"
+        ),
+        color=discord.Color.green() if chat_done and attendance_done and not claimed else BOT_COLOR
+    )
+    if claimed:
+        embed.add_field(name="보상 상태", value="오늘 미션 보상을 이미 받았습니다. ✅", inline=False)
+    elif chat_done and attendance_done:
+        embed.add_field(name="보상 상태", value="`/미션보상`으로 보상을 받을 수 있어요!", inline=False)
+    else:
+        embed.add_field(name="남은 할 일", value="채팅 20회와 출석을 모두 완료하면 보상을 받을 수 있어요.", inline=False)
+    embed.set_footer(text="일일미션은 매일 날짜가 바뀌면 다시 진행할 수 있습니다.")
+    return embed
+
+
+async def send_daily_mission_status(interaction: discord.Interaction, user: discord.User = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    user = user or interaction.user
+    embed = build_daily_mission_embed(interaction.guild.id, user)
+    await interaction.response.send_message(embed=embed, view=DailyMissionView(), ephemeral=True)
+
+
+class DailyMissionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="🎯 진행도 확인", style=discord.ButtonStyle.blurple)
+    async def show_progress(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_daily_mission_status(interaction, interaction.user)
+
+    @discord.ui.button(label="🎁 보상 받기", style=discord.ButtonStyle.green)
+    async def claim_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await claim_daily_mission_reward_interaction(interaction)
+
+
+async def claim_daily_mission_reward_interaction(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+    mission_date = today_key()
+    message_count, attendance_done, claimed = ensure_daily_mission_progress(guild_id, user_id)
+    chat_target, reward_point, reward_box = get_daily_mission_settings(guild_id)
+
+    if claimed:
+        return await interaction.response.send_message("❌ 오늘 미션 보상은 이미 받았습니다.", ephemeral=True)
+    if message_count < DAILY_MISSION_CHAT_TARGET or not attendance_done:
+        return await interaction.response.send_message(
+            f"❌ 아직 미션이 완료되지 않았습니다.\n채팅: **{message_count}/{DAILY_MISSION_CHAT_TARGET}회**\n출석: {'완료' if attendance_done else '미완료'}",
+            ephemeral=True
+        )
+
+    now_point = get_user_point(guild_id, user_id)
+    set_user_point(guild_id, user_id, now_point + DAILY_MISSION_REWARD_POINT)
+    c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, "랜덤박스", DAILY_MISSION_REWARD_BOX))
+    c.execute(
+        """
+        UPDATE daily_mission_progress
+        SET claimed=1, claimed_at=?
+        WHERE guild_id=? AND user_id=? AND mission_date=?
+        """,
+        (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), guild_id, user_id, mission_date)
+    )
+    conn.commit()
+
+    embed = discord.Embed(
+        title="🎁 일일미션 보상 지급 완료!",
+        description=(
+            f"{interaction.user.mention}님 오늘 미션을 완료했어요!\n\n"
+            f"💰 포인트: **+{DAILY_MISSION_REWARD_POINT:,}P**\n"
+            f"🎁 랜덤박스: **+{DAILY_MISSION_REWARD_BOX}개**\n"
+            f"💎 현재 포인트: **{get_user_point(guild_id, user_id):,}P**"
+        ),
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed)
+    await send_log(interaction.guild, f"🎯 일일미션 보상 지급\n대상: {interaction.user.mention}\n보상: {DAILY_MISSION_REWARD_POINT}P + 랜덤박스 {DAILY_MISSION_REWARD_BOX}개", "general")
+
+
+@bot.tree.command(name="미션", description="오늘의 일일미션 진행도를 확인합니다.")
+async def daily_mission_command(interaction: discord.Interaction):
+    await send_daily_mission_status(interaction, interaction.user)
+
+
+@bot.tree.command(name="미션보상", description="일일미션을 완료하고 보상을 받습니다.")
+async def daily_mission_reward_command(interaction: discord.Interaction):
+    await claim_daily_mission_reward_interaction(interaction)
+
+
+@bot.tree.command(name="쿠폰생성", description="관리자가 포인트/아이템 쿠폰을 생성합니다.")
+@app_commands.describe(
+    코드="유저가 사용할 쿠폰 코드입니다. 예: WELCOME1000",
+    포인트="지급할 포인트입니다. 없으면 0",
+    아이템명="같이 지급할 아이템명입니다. 예: 랜덤박스",
+    아이템개수="아이템 지급 개수입니다. 아이템이 없으면 0",
+    사용횟수="전체 사용 가능 횟수입니다.",
+    만료일="선택: 2026-06-30 또는 2026-06-30 23:59"
+)
+async def create_coupon_command(
+    interaction: discord.Interaction,
+    코드: str,
+    포인트: int = 0,
+    아이템명: str = "",
+    아이템개수: int = 0,
+    사용횟수: int = 1,
+    만료일: str = ""
+):
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    code = normalize_coupon_code(코드)
+    if not re.fullmatch(r"[A-Z0-9_-]{3,30}", code):
+        return await interaction.response.send_message("❌ 쿠폰 코드는 영문/숫자/_/- 조합 3~30자로 입력해주세요.", ephemeral=True)
+    if 포인트 < 0 or 아이템개수 < 0 or 사용횟수 <= 0:
+        return await interaction.response.send_message("❌ 포인트/아이템개수는 0 이상, 사용횟수는 1 이상이어야 합니다.", ephemeral=True)
+
+    item_name = normalize_shop_item(아이템명.strip()) if 아이템명 else ""
+    if 포인트 <= 0 and (not item_name or 아이템개수 <= 0):
+        return await interaction.response.send_message("❌ 포인트 또는 아이템 보상 중 하나는 꼭 있어야 합니다.", ephemeral=True)
+
+    expires_at = parse_coupon_expire(만료일)
+    if expires_at == "INVALID":
+        return await interaction.response.send_message("❌ 만료일 형식이 올바르지 않습니다. 예: `2026-06-30 23:59`", ephemeral=True)
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO coupon_codes(
+            guild_id, code, reward_point, item_name, item_amount,
+            max_uses, used_count, expires_at, is_active, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT used_count FROM coupon_codes WHERE guild_id=? AND code=?), 0), ?, 1, ?, ?)
+        """,
+        (interaction.guild.id, code, 포인트, item_name, 아이템개수, 사용횟수, interaction.guild.id, code, expires_at, interaction.user.id, now)
+    )
+    conn.commit()
+
+    reward_lines = []
+    if 포인트 > 0:
+        reward_lines.append(f"💰 {포인트:,}P")
+    if item_name and 아이템개수 > 0:
+        reward_lines.append(f"🎁 {item_name} {아이템개수}개")
+
+    embed = discord.Embed(
+        title="🎟️ 쿠폰 생성 완료",
+        description=(
+            f"코드: `{code}`\n"
+            f"보상: {' / '.join(reward_lines)}\n"
+            f"사용 가능 횟수: **{사용횟수}회**\n"
+            f"만료일: **{expires_at or '없음'}**"
+        ),
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🎟️ 쿠폰 생성\n관리자: {interaction.user.mention}\n코드: `{code}`\n보상: {' / '.join(reward_lines)}", "general")
+
+
+@bot.tree.command(name="쿠폰사용", description="쿠폰 코드를 사용해서 보상을 받습니다.")
+@app_commands.describe(코드="관리자가 배포한 쿠폰 코드입니다.")
+async def use_coupon_command(interaction: discord.Interaction, 코드: str):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    code = normalize_coupon_code(코드)
+    c.execute(
+        """
+        SELECT reward_point, item_name, item_amount, max_uses, used_count, expires_at, is_active
+        FROM coupon_codes
+        WHERE guild_id=? AND code=?
+        """,
+        (interaction.guild.id, code)
+    )
+    row = c.fetchone()
+    if not row:
+        return await interaction.response.send_message("❌ 존재하지 않는 쿠폰입니다.", ephemeral=True)
+
+    reward_point, item_name, item_amount, max_uses, used_count, expires_at, is_active = row
+    if not is_active:
+        return await interaction.response.send_message("❌ 비활성화된 쿠폰입니다.", ephemeral=True)
+    if expires_at:
+        try:
+            expire_dt = datetime.datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+            if datetime.datetime.now() > expire_dt:
+                return await interaction.response.send_message("❌ 만료된 쿠폰입니다.", ephemeral=True)
+        except ValueError:
+            pass
+    if used_count >= max_uses:
+        return await interaction.response.send_message("❌ 사용 가능 횟수가 모두 소진된 쿠폰입니다.", ephemeral=True)
+
+    c.execute(
+        "SELECT 1 FROM coupon_claims WHERE guild_id=? AND code=? AND user_id=?",
+        (interaction.guild.id, code, interaction.user.id)
+    )
+    if c.fetchone():
+        return await interaction.response.send_message("❌ 이미 사용한 쿠폰입니다.", ephemeral=True)
+
+    reward_lines = []
+    if reward_point and reward_point > 0:
+        current = get_user_point(interaction.guild.id, interaction.user.id)
+        set_user_point(interaction.guild.id, interaction.user.id, current + int(reward_point))
+        reward_lines.append(f"💰 {int(reward_point):,}P")
+    if item_name and item_amount and int(item_amount) > 0:
+        c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (interaction.user.id, normalize_shop_item(item_name), int(item_amount)))
+        reward_lines.append(f"🎁 {normalize_shop_item(item_name)} {int(item_amount)}개")
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO coupon_claims(guild_id, code, user_id, claimed_at) VALUES (?, ?, ?, ?)", (interaction.guild.id, code, interaction.user.id, now))
+    c.execute("UPDATE coupon_codes SET used_count=used_count+1 WHERE guild_id=? AND code=?", (interaction.guild.id, code))
+    conn.commit()
+
+    embed = discord.Embed(
+        title="🎟️ 쿠폰 사용 완료!",
+        description=(
+            f"쿠폰 `{code}` 사용 완료!\n\n"
+            f"받은 보상\n" + "\n".join(reward_lines)
+        ),
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed)
+    await send_log(interaction.guild, f"🎟️ 쿠폰 사용\n유저: {interaction.user.mention}\n코드: `{code}`\n보상: {' / '.join(reward_lines)}", "general")
+
+
+@bot.tree.command(name="쿠폰목록", description="관리자가 현재 서버의 쿠폰 목록을 확인합니다.")
+async def coupon_list_command(interaction: discord.Interaction):
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    c.execute(
+        """
+        SELECT code, reward_point, item_name, item_amount, max_uses, used_count, expires_at, is_active
+        FROM coupon_codes
+        WHERE guild_id=?
+        ORDER BY created_at DESC
+        LIMIT 15
+        """,
+        (interaction.guild.id,)
+    )
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("현재 생성된 쿠폰이 없습니다.", ephemeral=True)
+
+    lines = []
+    for code, reward_point, item_name, item_amount, max_uses, used_count, expires_at, is_active in rows:
+        rewards = []
+        if reward_point:
+            rewards.append(f"{int(reward_point):,}P")
+        if item_name and item_amount:
+            rewards.append(f"{item_name} {item_amount}개")
+        state = "켜짐" if is_active else "꺼짐"
+        lines.append(f"`{code}` | {' + '.join(rewards) if rewards else '보상 없음'} | {used_count}/{max_uses}회 | {state} | 만료: {expires_at or '없음'}")
+
+    embed = discord.Embed(
+        title="🎟️ 쿠폰 목록",
+        description="\n".join(lines)[:4096],
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="쿠폰삭제", description="관리자가 쿠폰을 비활성화합니다.")
+@app_commands.describe(코드="비활성화할 쿠폰 코드입니다.")
+async def coupon_delete_command(interaction: discord.Interaction, 코드: str):
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    code = normalize_coupon_code(코드)
+    c.execute("UPDATE coupon_codes SET is_active=0 WHERE guild_id=? AND code=?", (interaction.guild.id, code))
+    changed = c.rowcount
+    conn.commit()
+    if not changed:
+        return await interaction.response.send_message("❌ 해당 쿠폰을 찾을 수 없습니다.", ephemeral=True)
+    await interaction.response.send_message(f"✅ 쿠폰 `{code}`를 비활성화했습니다.", ephemeral=True)
+    await send_log(interaction.guild, f"🎟️ 쿠폰 비활성화\n관리자: {interaction.user.mention}\n코드: `{code}`", "general")
+
+
+# =========================
+# 칭호 / 업적 시스템 업그레이드
+# =========================
+# 보안패널 이후 유저들이 오래 즐길 수 있는 성장형 보상 시스템입니다.
+# 기존 포인트/출석/레벨/인벤토리와 연결됩니다.
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_titles (
+    guild_id INTEGER,
+    user_id INTEGER,
+    title_name TEXT,
+    acquired_at TEXT,
+    PRIMARY KEY (guild_id, user_id, title_name)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_equipped_titles (
+    guild_id INTEGER,
+    user_id INTEGER,
+    title_name TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS achievement_claims (
+    guild_id INTEGER,
+    user_id INTEGER,
+    achievement_key TEXT,
+    claimed_at TEXT,
+    PRIMARY KEY (guild_id, user_id, achievement_key)
+)
+""")
+conn.commit()
+
+
+TITLE_SHOP_ITEMS = [
+    {"name": "새싹", "emoji": "🌱", "price": 500, "desc": "처음 시작하는 멤버에게 어울리는 기본 칭호"},
+    {"name": "단골손님", "emoji": "🌸", "price": 2500, "desc": "꾸준히 활동하는 멤버용 칭호"},
+    {"name": "만능러", "emoji": "⭐", "price": 5000, "desc": "여러 기능을 즐기는 멤버용 칭호"},
+    {"name": "포인트부자", "emoji": "💰", "price": 10000, "desc": "경제 시스템 고수 느낌 칭호"},
+    {"name": "서버수호자", "emoji": "🛡️", "price": 15000, "desc": "서버를 지켜주는 멤버용 칭호"},
+    {"name": "레전드", "emoji": "👑", "price": 30000, "desc": "최상위 활동 멤버용 프리미엄 칭호"},
+]
+
+
+ACHIEVEMENT_DEFINITIONS = [
+    {
+        "key": "first_attendance",
+        "name": "첫 출석",
+        "emoji": "📅",
+        "condition": "출석 1일 이상",
+        "reward_point": 300,
+        "reward_item": "",
+        "reward_item_amount": 0,
+        "reward_title": "새싹",
+    },
+    {
+        "key": "streak_7",
+        "name": "일주일 개근",
+        "emoji": "🔥",
+        "condition": "연속 출석 7일 이상",
+        "reward_point": 1500,
+        "reward_item": "랜덤박스",
+        "reward_item_amount": 1,
+        "reward_title": "성실왕",
+    },
+    {
+        "key": "level_5",
+        "name": "성장 시작",
+        "emoji": "📈",
+        "condition": "채팅 레벨 5 이상",
+        "reward_point": 2000,
+        "reward_item": "",
+        "reward_item_amount": 0,
+        "reward_title": "성장중",
+    },
+    {
+        "key": "level_10",
+        "name": "서버 활동가",
+        "emoji": "🏆",
+        "condition": "채팅 레벨 10 이상",
+        "reward_point": 5000,
+        "reward_item": "랜덤박스",
+        "reward_item_amount": 2,
+        "reward_title": "활동왕",
+    },
+    {
+        "key": "rich_10000",
+        "name": "포인트 모으기",
+        "emoji": "💰",
+        "condition": "보유 포인트 10,000P 이상",
+        "reward_point": 1000,
+        "reward_item": "",
+        "reward_item_amount": 0,
+        "reward_title": "포인트부자",
+    },
+    {
+        "key": "attendance_30",
+        "name": "한 달 출석러",
+        "emoji": "💎",
+        "condition": "누적 출석 30일 이상",
+        "reward_point": 7000,
+        "reward_item": "VIP권",
+        "reward_item_amount": 1,
+        "reward_title": "단골손님",
+    },
+]
+
+
+def get_achievement_definitions(guild_id: int = 0):
+    definitions = [dict(item) for item in ACHIEVEMENT_DEFINITIONS]
+    if guild_id:
+        ensure_dashboard_sync_for_guild(guild_id)
+        try:
+            c.execute("""
+                SELECT achievement_key, name, emoji, condition_text, reward_point, reward_item, reward_item_amount, reward_title
+                FROM custom_achievements
+                WHERE guild_id=? AND COALESCE(is_active, 1)=1
+                ORDER BY achievement_key ASC
+            """, (guild_id,))
+            for key, name, emoji, condition_text, reward_point, reward_item, reward_item_amount, reward_title in c.fetchall():
+                definitions.append({
+                    "key": key,
+                    "name": name,
+                    "emoji": emoji or "🏆",
+                    "condition": condition_text or "웹 대시보드에서 등록한 커스텀 업적",
+                    "reward_point": int(reward_point or 0),
+                    "reward_item": reward_item or "",
+                    "reward_item_amount": int(reward_item_amount or 0),
+                    "reward_title": reward_title or "",
+                    "custom": True,
+                })
+        except sqlite3.Error:
+            pass
+    return definitions
+
+
+def normalize_title_name(title_name: str):
+    title_name = (title_name or "").strip()
+    if not title_name:
+        return ""
+    title_name = title_name.replace("`", "").replace("@", "")
+    return title_name[:30]
+
+
+def get_title_shop_item(title_name: str, guild_id: int = 0):
+    normalized = normalize_title_name(title_name)
+    if not normalized:
+        return None
+    if guild_id:
+        ensure_dashboard_sync_for_guild(guild_id)
+        try:
+            c.execute("SELECT title_name, emoji, price, description FROM title_shop WHERE guild_id=? AND title_name=? AND COALESCE(is_active, 1)=1", (guild_id, normalized))
+            row = c.fetchone()
+            if row:
+                return {"name": row[0], "emoji": row[1] or "🏷️", "price": int(row[2] or 0), "desc": row[3] or "웹 대시보드에서 등록한 칭호"}
+        except sqlite3.Error:
+            pass
+    for item in TITLE_SHOP_ITEMS:
+        if item["name"] == normalized:
+            return item
+    return None
+
+
+def get_title_shop_items(guild_id: int = 0):
+    items = []
+    if guild_id:
+        ensure_dashboard_sync_for_guild(guild_id)
+        try:
+            c.execute("SELECT title_name, emoji, price, description FROM title_shop WHERE guild_id=? AND COALESCE(is_active, 1)=1 ORDER BY price ASC, title_name ASC", (guild_id,))
+            for title_name, emoji, price, description in c.fetchall():
+                items.append({"name": title_name, "emoji": emoji or "🏷️", "price": int(price or 0), "desc": description or "웹 대시보드에서 등록한 칭호"})
+        except sqlite3.Error:
+            pass
+    merged = {item["name"]: item for item in TITLE_SHOP_ITEMS}
+    for item in items:
+        merged[item["name"]] = item
+    return list(merged.values())
+
+
+def add_user_title(guild_id: int, user_id: int, title_name: str):
+    title_name = normalize_title_name(title_name)
+    if not title_name:
+        return False
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR IGNORE INTO user_titles(guild_id, user_id, title_name, acquired_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (guild_id, user_id, title_name, now)
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    return changed
+
+
+def remove_user_title(guild_id: int, user_id: int, title_name: str):
+    title_name = normalize_title_name(title_name)
+    c.execute(
+        "DELETE FROM user_titles WHERE guild_id=? AND user_id=? AND title_name=?",
+        (guild_id, user_id, title_name)
+    )
+    changed = c.rowcount > 0
+    c.execute(
+        "DELETE FROM user_equipped_titles WHERE guild_id=? AND user_id=? AND title_name=?",
+        (guild_id, user_id, title_name)
+    )
+    conn.commit()
+    return changed
+
+
+def user_has_title(guild_id: int, user_id: int, title_name: str):
+    title_name = normalize_title_name(title_name)
+    c.execute(
+        "SELECT 1 FROM user_titles WHERE guild_id=? AND user_id=? AND title_name=?",
+        (guild_id, user_id, title_name)
+    )
+    return c.fetchone() is not None
+
+
+def list_user_titles(guild_id: int, user_id: int):
+    c.execute(
+        """
+        SELECT title_name, acquired_at
+        FROM user_titles
+        WHERE guild_id=? AND user_id=?
+        ORDER BY acquired_at DESC, title_name ASC
+        """,
+        (guild_id, user_id)
+    )
+    return c.fetchall()
+
+
+def count_user_titles(guild_id: int, user_id: int):
+    c.execute(
+        "SELECT COUNT(*) FROM user_titles WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id)
+    )
+    row = c.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def equip_user_title(guild_id: int, user_id: int, title_name: str):
+    title_name = normalize_title_name(title_name)
+    if not user_has_title(guild_id, user_id, title_name):
+        return False
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR REPLACE INTO user_equipped_titles(guild_id, user_id, title_name, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (guild_id, user_id, title_name, now)
+    )
+    conn.commit()
+    return True
+
+
+def unequip_user_title(guild_id: int, user_id: int):
+    c.execute(
+        "DELETE FROM user_equipped_titles WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id)
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    return changed
+
+
+def get_equipped_title(guild_id: int, user_id: int):
+    c.execute(
+        "SELECT title_name FROM user_equipped_titles WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id)
+    )
+    row = c.fetchone()
+    return row[0] if row else ""
+
+
+def add_inventory_item_simple(user_id: int, item_name: str, amount: int):
+    item_name = normalize_shop_item(item_name)
+    if not item_name or amount <= 0:
+        return
+    c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, item_name, amount))
+    conn.commit()
+
+
+def is_achievement_claimed(guild_id: int, user_id: int, achievement_key: str):
+    c.execute(
+        "SELECT 1 FROM achievement_claims WHERE guild_id=? AND user_id=? AND achievement_key=?",
+        (guild_id, user_id, achievement_key)
+    )
+    return c.fetchone() is not None
+
+
+def mark_achievement_claimed(guild_id: int, user_id: int, achievement_key: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        """
+        INSERT OR IGNORE INTO achievement_claims(guild_id, user_id, achievement_key, claimed_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (guild_id, user_id, achievement_key, now)
+    )
+    conn.commit()
+
+
+def get_user_achievement_stats(guild_id: int, user_id: int):
+    point, attendance_count, streak, _ = get_or_create_user(guild_id, user_id)
+    exp, level = get_or_create_level_user(user_id)
+    return {
+        "point": int(point or 0),
+        "attendance_count": int(attendance_count or 0),
+        "streak": int(streak or 0),
+        "exp": int(exp or 0),
+        "level": int(level or 1),
+    }
+
+
+def check_achievement_completed(achievement_key: str, stats: dict):
+    if achievement_key == "first_attendance":
+        return stats["attendance_count"] >= 1
+    if achievement_key == "streak_7":
+        return stats["streak"] >= 7
+    if achievement_key == "level_5":
+        return stats["level"] >= 5
+    if achievement_key == "level_10":
+        return stats["level"] >= 10
+    if achievement_key == "rich_10000":
+        return stats["point"] >= 10000
+    if achievement_key == "attendance_30":
+        return stats["attendance_count"] >= 30
+    return False
+
+
+def format_achievement_reward(achievement: dict):
+    rewards = []
+    if achievement.get("reward_point"):
+        rewards.append(f"{achievement['reward_point']:,}P")
+    if achievement.get("reward_item") and achievement.get("reward_item_amount"):
+        rewards.append(f"{achievement['reward_item']} {achievement['reward_item_amount']}개")
+    if achievement.get("reward_title"):
+        rewards.append(f"칭호 `{achievement['reward_title']}`")
+    return " + ".join(rewards) if rewards else "보상 없음"
+
+
+def build_title_shop_embed(interaction: discord.Interaction):
+    lines = []
+    for item in get_title_shop_items(interaction.guild.id):
+        owned = "✅ 보유" if user_has_title(interaction.guild.id, interaction.user.id, item["name"]) else f"{item['price']:,}P"
+        lines.append(
+            f"{item['emoji']} **{item['name']}** - `{owned}`\n"
+            f"└ {item['desc']}"
+        )
+
+    embed = discord.Embed(
+        title="🏷️ 칭호 상점",
+        description="\n\n".join(lines)[:4096],
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text="/칭호 → 구매 버튼으로 칭호를 구매하고, 장착 버튼으로 대표 칭호를 설정하세요.")
+    return embed
+
+
+async def send_title_shop_box(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    await interaction.response.send_message(embed=build_title_shop_embed(interaction), ephemeral=True)
+
+
+async def send_title_list_box(interaction: discord.Interaction, target: discord.Member = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    target = target or interaction.user
+    rows = list_user_titles(interaction.guild.id, target.id)
+    equipped = get_equipped_title(interaction.guild.id, target.id)
+
+    if not rows:
+        return await interaction.response.send_message(
+            f"{target.mention}님은 아직 보유한 칭호가 없습니다.\n`/칭호`의 상점/구매 버튼 또는 `/업적보상`으로 칭호를 얻을 수 있어요.",
+            ephemeral=True
+        )
+
+    lines = []
+    for title_name, acquired_at in rows:
+        mark = "🌟 장착중" if title_name == equipped else "•"
+        lines.append(f"{mark} `{title_name}` - {acquired_at}")
+
+    embed = discord.Embed(
+        title=f"🏷️ {target.display_name}님의 칭호 목록",
+        description="\n".join(lines)[:4096],
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text="/칭호 → 장착 버튼으로 대표 칭호를 설정할 수 있어요.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def parse_discord_user_id(raw: str):
+    raw = (raw or "").strip()
+    match = re.search(r"\d{15,25}", raw)
+    return int(match.group(0)) if match else 0
+
+
+class TitleBuyModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="🏷️ 칭호 구매")
+        self.title_input = discord.ui.TextInput(
+            label="구매할 칭호 이름",
+            placeholder="예: 새싹, 단골손님, 만능러, 포인트부자, 서버수호자, 레전드",
+            required=True,
+            max_length=30
+        )
+        self.add_item(self.title_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        item = get_title_shop_item(str(self.title_input.value), interaction.guild.id)
+        if not item:
+            return await interaction.response.send_message("❌ 상점에 없는 칭호입니다. `/칭호`의 상점 버튼에서 목록을 확인해주세요.", ephemeral=True)
+
+        guild_id = interaction.guild.id
+        user_id = interaction.user.id
+
+        if user_has_title(guild_id, user_id, item["name"]):
+            return await interaction.response.send_message("이미 보유 중인 칭호입니다. `/칭호`의 장착 버튼으로 사용할 수 있어요.", ephemeral=True)
+
+        point = get_user_point(guild_id, user_id)
+        if point < item["price"]:
+            return await interaction.response.send_message(
+                f"❌ 포인트가 부족합니다.\n필요: **{item['price']:,}P**\n보유: **{point:,}P**",
+                ephemeral=True
+            )
+
+        set_user_point(guild_id, user_id, point - item["price"])
+        add_user_title(guild_id, user_id, item["name"])
+
+        embed = discord.Embed(
+            title="✅ 칭호 구매 완료",
+            description=(
+                f"{interaction.user.mention}님이 {item['emoji']} **{item['name']}** 칭호를 구매했습니다.\n\n"
+                f"남은 포인트: **{point - item['price']:,}P**\n"
+                f"`/칭호`의 장착 버튼으로 대표 칭호를 설정할 수 있어요."
+            ),
+            color=discord.Color.purple()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await send_log(interaction.guild, f"🏷️ 칭호 구매\n유저: {interaction.user.mention}\n칭호: `{item['name']}`\n가격: {item['price']:,}P", "general")
+
+
+class TitleEquipModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="🌟 대표 칭호 장착")
+        self.title_input = discord.ui.TextInput(
+            label="장착할 칭호 이름",
+            placeholder="내가 보유한 칭호 이름을 입력하세요.",
+            required=True,
+            max_length=30
+        )
+        self.add_item(self.title_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        title_name = normalize_title_name(str(self.title_input.value))
+        if not equip_user_title(interaction.guild.id, interaction.user.id, title_name):
+            return await interaction.response.send_message("❌ 보유하지 않은 칭호입니다. `/칭호`의 내 칭호 버튼을 확인해주세요.", ephemeral=True)
+
+        await interaction.response.send_message(f"✅ 대표 칭호를 `{title_name}` 으로 장착했습니다.", ephemeral=True)
+
+
+class TitleAdminModal(discord.ui.Modal):
+    def __init__(self, mode: str):
+        self.mode = mode
+        modal_title = "👑 관리자 칭호 지급" if mode == "grant" else "🗑️ 관리자 칭호 회수"
+        super().__init__(title=modal_title)
+        self.user_input = discord.ui.TextInput(
+            label="유저 멘션 또는 유저 ID",
+            placeholder="예: @냥이 또는 123456789012345678",
+            required=True,
+            max_length=80
+        )
+        self.title_input = discord.ui.TextInput(
+            label="칭호 이름",
+            placeholder="예: 서버수호자, 이벤트왕, 레전드",
+            required=True,
+            max_length=30
+        )
+        self.add_item(self.user_input)
+        self.add_item(self.title_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        user_id = parse_discord_user_id(str(self.user_input.value))
+        if not user_id:
+            return await interaction.response.send_message("❌ 유저 멘션 또는 유저 ID를 정확히 입력해주세요.", ephemeral=True)
+
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user_id)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+
+        if member is None:
+            return await interaction.response.send_message("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+
+        title_name = normalize_title_name(str(self.title_input.value))
+        if not title_name:
+            return await interaction.response.send_message("❌ 칭호 이름을 입력해주세요.", ephemeral=True)
+
+        if self.mode == "grant":
+            changed = add_user_title(interaction.guild.id, member.id, title_name)
+            result = "지급했습니다" if changed else "이미 보유 중입니다"
+            await interaction.response.send_message(f"✅ {member.mention}님에게 `{title_name}` 칭호를 {result}.", ephemeral=True)
+            await send_log(interaction.guild, f"🏷️ 칭호 지급\n관리자: {interaction.user.mention}\n대상: {member.mention}\n칭호: `{title_name}`", "general")
+        else:
+            changed = remove_user_title(interaction.guild.id, member.id, title_name)
+            if not changed:
+                return await interaction.response.send_message("❌ 해당 유저가 그 칭호를 보유하고 있지 않습니다.", ephemeral=True)
+            await interaction.response.send_message(f"✅ {member.mention}님의 `{title_name}` 칭호를 회수했습니다.", ephemeral=True)
+            await send_log(interaction.guild, f"🏷️ 칭호 회수\n관리자: {interaction.user.mention}\n대상: {member.mention}\n칭호: `{title_name}`", "general")
+
+
+class TitlePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="상점 보기", emoji="🏷️", style=discord.ButtonStyle.blurple, row=0)
+    async def title_shop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_title_shop_box(interaction)
+
+    @discord.ui.button(label="구매", emoji="🛒", style=discord.ButtonStyle.green, row=0)
+    async def title_buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TitleBuyModal())
+
+    @discord.ui.button(label="내 칭호", emoji="📦", style=discord.ButtonStyle.blurple, row=0)
+    async def title_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_title_list_box(interaction, interaction.user)
+
+    @discord.ui.button(label="장착", emoji="🌟", style=discord.ButtonStyle.green, row=1)
+    async def title_equip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TitleEquipModal())
+
+    @discord.ui.button(label="해제", emoji="🧹", style=discord.ButtonStyle.gray, row=1)
+    async def title_unequip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        changed = unequip_user_title(interaction.guild.id, interaction.user.id)
+        if changed:
+            await interaction.response.send_message("✅ 대표 칭호를 해제했습니다.", ephemeral=True)
+        else:
+            await interaction.response.send_message("현재 장착 중인 칭호가 없습니다.", ephemeral=True)
+
+    @discord.ui.button(label="관리자 지급", emoji="👑", style=discord.ButtonStyle.red, row=2)
+    async def title_grant_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        await interaction.response.send_modal(TitleAdminModal("grant"))
+
+    @discord.ui.button(label="업적 보기", emoji="🏆", style=discord.ButtonStyle.blurple, row=3)
+    async def achievement_status_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_achievement_status_box(interaction, interaction.user)
+
+    @discord.ui.button(label="업적 보상", emoji="🎁", style=discord.ButtonStyle.green, row=3)
+    async def achievement_claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await claim_achievement_rewards_box(interaction)
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="칭호", description="칭호/업적/상점/구매/목록/장착/관리 기능을 박스형 패널로 엽니다.")
+async def title_panel_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    equipped = get_equipped_title(interaction.guild.id, interaction.user.id)
+    owned_count = count_user_titles(interaction.guild.id, interaction.user.id)
+    point = get_user_point(interaction.guild.id, interaction.user.id)
+
+    embed = discord.Embed(
+        title="🏷️ 만능 봇 칭호 패널",
+        description=(
+            "아래 버튼으로 칭호 기능을 사용할 수 있어요.\n\n"
+            "🏷️ **상점 보기** - 구매 가능한 칭호 확인\n"
+            "🛒 **구매** - 포인트로 칭호 구매\n"
+            "📦 **내 칭호** - 보유 칭호 목록 확인\n"
+            "🌟 **장착** - 프로필 대표 칭호 설정\n"
+            "🧹 **해제** - 대표 칭호 해제\n"
+            "👑 **관리자 지급/회수** - 관리자 전용\n"
+            "🏆 **업적 보기** - 내 업적 진행도 확인\n"
+            "🎁 **업적 보상** - 완료한 업적 보상 수령"
+        ),
+        color=discord.Color.purple()
+    )
+    embed.add_field(name="내 포인트", value=f"**{point:,}P**", inline=True)
+    embed.add_field(name="대표 칭호", value=f"`{equipped}`" if equipped else "미장착", inline=True)
+    embed.add_field(name="보유 칭호", value=f"**{owned_count}개**", inline=True)
+    embed.set_footer(text="칭호/업적 기능을 /칭호 하나로 합쳐서 슬래시 명령어 제한을 줄였습니다.")
+
+    await interaction.response.send_message(embed=embed, view=TitlePanelView(), ephemeral=True)
+
+
+
+async def send_achievement_status_box(interaction: discord.Interaction, target: discord.Member = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    target = target or interaction.user
+    stats = get_user_achievement_stats(interaction.guild.id, target.id)
+
+    lines = []
+    completed_count = 0
+    claimed_count = 0
+
+    for achievement in get_achievement_definitions(interaction.guild.id):
+        completed = check_achievement_completed(achievement["key"], stats)
+        claimed = is_achievement_claimed(interaction.guild.id, target.id, achievement["key"])
+        if completed:
+            completed_count += 1
+        if claimed:
+            claimed_count += 1
+
+        state = "✅ 수령완료" if claimed else ("🎁 보상가능" if completed else "🔒 진행중")
+        lines.append(
+            f"{achievement['emoji']} **{achievement['name']}** - {state}\n"
+            f"조건: {achievement['condition']}\n"
+            f"보상: {format_achievement_reward(achievement)}"
+        )
+
+    embed = discord.Embed(
+        title=f"🏆 {target.display_name}님의 업적",
+        description="\n\n".join(lines)[:4096],
+        color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="진행 요약",
+        value=f"완료: **{completed_count}/{len(get_achievement_definitions(interaction.guild.id))}**\n수령: **{claimed_count}/{len(get_achievement_definitions(interaction.guild.id))}**",
+        inline=True
+    )
+    embed.add_field(
+        name="현재 기록",
+        value=f"레벨: **Lv.{stats['level']}**\n포인트: **{stats['point']:,}P**\n출석: **{stats['attendance_count']}일**\n연속: **{stats['streak']}일**",
+        inline=True
+    )
+    embed.set_footer(text="/칭호 패널의 업적 보상 버튼으로 완료된 업적 보상을 받을 수 있어요.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def claim_achievement_rewards_box(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+    stats = get_user_achievement_stats(guild_id, user_id)
+    point = get_user_point(guild_id, user_id)
+
+    claimed_lines = []
+    total_point = 0
+
+    for achievement in get_achievement_definitions(interaction.guild.id):
+        key = achievement["key"]
+        if is_achievement_claimed(guild_id, user_id, key):
+            continue
+        if not check_achievement_completed(key, stats):
+            continue
+
+        reward_point = int(achievement.get("reward_point") or 0)
+        reward_item = achievement.get("reward_item") or ""
+        reward_item_amount = int(achievement.get("reward_item_amount") or 0)
+        reward_title = achievement.get("reward_title") or ""
+
+        if reward_point:
+            total_point += reward_point
+        if reward_item and reward_item_amount:
+            add_inventory_item_simple(user_id, reward_item, reward_item_amount)
+        if reward_title:
+            add_user_title(guild_id, user_id, reward_title)
+
+        mark_achievement_claimed(guild_id, user_id, key)
+        claimed_lines.append(f"{achievement['emoji']} **{achievement['name']}** → {format_achievement_reward(achievement)}")
+
+    if not claimed_lines:
+        return await interaction.response.send_message("아직 받을 수 있는 업적 보상이 없습니다. `/칭호`의 업적 보기 버튼으로 진행도를 확인해주세요.", ephemeral=True)
+
+    if total_point:
+        set_user_point(guild_id, user_id, point + total_point)
+
+    embed = discord.Embed(
+        title="🎁 업적 보상 수령 완료",
+        description="\n".join(claimed_lines)[:4096],
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="추가 포인트", value=f"+{total_point:,}P", inline=True)
+    embed.add_field(name="현재 포인트", value=f"{get_user_point(guild_id, user_id):,}P", inline=True)
+    embed.set_footer(text="새로 얻은 칭호는 /칭호 패널에서 확인하고 장착하세요.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await send_log(interaction.guild, f"🏆 업적 보상 수령\n유저: {interaction.user.mention}\n보상 수: {len(claimed_lines)}개\n포인트: +{total_point:,}P", "general")
+
+
+
+
+# =========================
+# 개발로그 채널 업그레이드 / 자동 알림
+# =========================
+DEVELOPMENT_LOG_CATEGORY_NAME = "📈 개발로그"
+DEVELOPMENT_ALERT_ROLE_NAME = "개발알림"
+DEVELOPMENT_LOG_CHANNELS = [
+    {
+        "key": "update",
+        "name": "🚀︱업데이트",
+        "topic": "🚀 만능 봇의 새 기능, 업그레이드, 업데이트 알림이 올라오는 채널입니다.",
+        "title": "🚀 업데이트 알림 센터",
+        "desc": (
+            "만능 봇에 새 기능이 추가되면 이곳에 자동 알림이 올라옵니다.\n\n"
+            "• 신규 기능 추가\n"
+            "• 큰 업데이트 안내\n"
+            "• 서버 운영자가 꼭 확인해야 하는 변경사항\n\n"
+            "아래 알림 버튼을 누르면 `개발알림` 역할을 받고, 업데이트 공지를 더 쉽게 확인할 수 있어요."
+        ),
+        "color": 0x57F287,
+    },
+    {
+        "key": "patch",
+        "name": "📝︱패치노트",
+        "topic": "📝 버그 수정, 오류 해결, 세부 변경사항을 기록하는 채널입니다.",
+        "title": "📝 패치노트 안내",
+        "desc": (
+            "오류 수정과 세부 변경사항은 이곳에 기록됩니다.\n\n"
+            "• 오류 해결 내역\n"
+            "• 명령어 변경사항\n"
+            "• 안정화 패치\n"
+            "• 권한/채널 구조 변경 기록"
+        ),
+        "color": 0x5865F2,
+    },
+    {
+        "key": "status",
+        "name": "📊︱봇상태",
+        "topic": "📊 봇 정상 작동 여부, 점검, 재시작 상태를 확인하는 채널입니다.",
+        "title": "📊 봇 상태 센터",
+        "desc": "현재 봇의 작동 상태와 기본 시스템 준비 상태를 확인할 수 있습니다.",
+        "color": 0x2DD4BF,
+    },
+    {
+        "key": "diary",
+        "name": "📅︱개발일지",
+        "topic": "📅 개발 진행 상황, 다음 업데이트 계획, 작업 기록을 남기는 채널입니다.",
+        "title": "📅 개발일지 안내",
+        "desc": (
+            "개발 진행 기록을 남기는 공간입니다.\n\n"
+            "• 오늘 만든 기능\n"
+            "• 다음 업데이트 예정\n"
+            "• 테스트 결과\n"
+            "• 서버 운영 메모"
+        ),
+        "color": BOT_COLOR,
+    },
+]
+
+
+def get_development_log_channel_config(key: str):
+    for item in DEVELOPMENT_LOG_CHANNELS:
+        if item["key"] == key:
+            return item
+    return DEVELOPMENT_LOG_CHANNELS[0]
+
+
+def get_development_log_channel(guild: discord.Guild, key: str):
+    config = get_development_log_channel_config(key)
+    return discord.utils.get(guild.text_channels, name=config["name"])
+
+
+async def get_or_create_development_alert_role(guild: discord.Guild):
+    role = discord.utils.get(guild.roles, name=DEVELOPMENT_ALERT_ROLE_NAME)
+    if role:
+        try:
+            if not role.mentionable:
+                await role.edit(mentionable=True, reason="개발로그 알림 역할 정리")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return role
+    try:
+        return await guild.create_role(
+            name=DEVELOPMENT_ALERT_ROLE_NAME,
+            color=discord.Color(0x57F287),
+            hoist=False,
+            mentionable=True,
+            reason="개발로그 알림 역할 자동 생성"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+
+def build_development_log_overwrites(guild: discord.Guild, alert_role: discord.Role = None):
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            read_message_history=True,
+            add_reactions=True,
+            use_application_commands=True,
+        )
+    }
+
+    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    if bot_member:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_messages=True,
+            read_message_history=True,
+            embed_links=True,
+            attach_files=True,
+            add_reactions=True,
+            use_application_commands=True,
+        )
+
+    if alert_role:
+        overwrites[alert_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            read_message_history=True,
+            add_reactions=True,
+        )
+
+    manager_names = list(dict.fromkeys(BOT_MANAGER_ROLE_NAMES + ["개발자", "보안팀", "이벤트팀", "총관리자", "부관리자"]))
+    for role_name in manager_names:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_messages=True,
+                read_message_history=True,
+                embed_links=True,
+                attach_files=True,
+                add_reactions=True,
+                use_application_commands=True,
+            )
+    return overwrites
+
+
+def build_development_intro_embed(config: dict):
+    embed = discord.Embed(
+        title=config["title"],
+        description=config["desc"],
+        color=config.get("color", BOT_COLOR)
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="📈 만능 봇 개발로그 | 자동 생성 알림 채널")
+    return embed
+
+
+def build_development_status_embed(guild: discord.Guild):
+    latency_ms = int((bot.latency or 0) * 1000)
+    member_count = guild.member_count or len(guild.members)
+    embed = discord.Embed(
+        title="📊 만능 봇 실시간 상태",
+        description="현재 봇 상태를 자동으로 정리했습니다.",
+        color=discord.Color.teal()
+    )
+    embed.add_field(name="작동 상태", value="정상 작동 중 ✅", inline=True)
+    embed.add_field(name="응답 속도", value=f"약 `{latency_ms}ms`", inline=True)
+    embed.add_field(name="보호 중인 서버 인원", value=f"`{member_count:,}`명", inline=True)
+    embed.add_field(
+        name="시스템 준비 상태",
+        value=(
+            "🎵 음악 시스템: 준비됨\n"
+            "🔊 TTS 시스템: 준비됨\n"
+            "💰 경제 시스템: 준비됨\n"
+            "🛡️ 보안 시스템: 준비됨\n"
+            "📈 개발로그 알림: 준비됨"
+        ),
+        inline=False
+    )
+    embed.set_footer(text=datetime.datetime.now().strftime("마지막 갱신: %Y-%m-%d %H:%M:%S"))
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    return embed
+
+
+async def channel_has_bot_embed_title(channel: discord.TextChannel, title: str, limit: int = 40):
+    try:
+        async for msg in channel.history(limit=limit):
+            if msg.author == bot.user and msg.embeds and (msg.embeds[0].title or "") == title:
+                return True
+    except (discord.Forbidden, discord.HTTPException):
+        return True
+    return False
+
+
+class DevAlertRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="개발알림 받기/끄기", emoji="🔔", style=discord.ButtonStyle.blurple, custom_id="devlog_alert_role_toggle_v1")
+    async def toggle_dev_alert_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        role = await get_or_create_development_alert_role(interaction.guild)
+        if role is None:
+            return await interaction.response.send_message("❌ `개발알림` 역할을 만들 수 없습니다. 봇 역할 위치/권한을 확인해주세요.", ephemeral=True)
+        try:
+            if role in interaction.user.roles:
+                await interaction.user.remove_roles(role, reason="개발로그 알림 역할 해제")
+                await interaction.response.send_message("🔕 개발알림 역할을 해제했습니다.", ephemeral=True)
+            else:
+                await interaction.user.add_roles(role, reason="개발로그 알림 역할 지급")
+                await interaction.response.send_message("🔔 개발알림 역할을 받았습니다. 업데이트 알림을 확인할 수 있어요.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ 봇 역할 위치가 낮아서 역할을 지급/해제할 수 없습니다.", ephemeral=True)
+        except discord.HTTPException:
+            await interaction.response.send_message("❌ 역할 처리 중 오류가 발생했습니다.", ephemeral=True)
+
+
+async def send_development_log_intro_embeds(guild: discord.Guild):
+    """개발로그 채널별 안내 임베드와 알림 역할 버튼을 중복 없이 전송합니다."""
+    for config in DEVELOPMENT_LOG_CHANNELS:
+        channel = discord.utils.get(guild.text_channels, name=config["name"])
+        if not channel:
+            continue
+        title = config["title"]
+        already = await channel_has_bot_embed_title(channel, title)
+        if not already:
+            try:
+                if config["key"] == "status":
+                    await channel.send(embed=build_development_status_embed(guild))
+                else:
+                    await channel.send(embed=build_development_intro_embed(config))
+                await asyncio.sleep(0.2)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    update_channel = get_development_log_channel(guild, "update")
+    if update_channel and not await channel_has_bot_embed_title(update_channel, "🔔 개발로그 알림 역할"):
+        embed = discord.Embed(
+            title="🔔 개발로그 알림 역할",
+            description=(
+                "업데이트 알림을 받고 싶다면 아래 버튼을 눌러 `개발알림` 역할을 받아주세요.\n\n"
+                "다시 누르면 알림 역할이 해제됩니다."
+            ),
+            color=discord.Color.green()
+        )
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed.set_footer(text="업데이트/패치노트 공지가 올라올 때 알림 역할이 멘션됩니다.")
+        try:
+            await update_channel.send(embed=embed, view=DevAlertRoleView())
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def ensure_development_log_channels(guild: discord.Guild, *, send_intro: bool = True):
+    """이미지에 나온 개발로그 카테고리와 4개 채널을 생성/정리합니다."""
+    alert_role = await get_or_create_development_alert_role(guild)
+    overwrites = build_development_log_overwrites(guild, alert_role)
+    created = []
+    updated = []
+
+    category = discord.utils.get(guild.categories, name=DEVELOPMENT_LOG_CATEGORY_NAME)
+    if category is None:
+        try:
+            category = await guild.create_category(
+                DEVELOPMENT_LOG_CATEGORY_NAME,
+                overwrites=overwrites,
+                reason="개발로그 카테고리 자동 생성"
+            )
+            created.append(f"카테고리: {DEVELOPMENT_LOG_CATEGORY_NAME}")
+            await asyncio.sleep(0.2)
+        except (discord.Forbidden, discord.HTTPException):
+            category = None
+    else:
+        try:
+            await category.edit(overwrites=overwrites, reason="개발로그 카테고리 권한 정리")
+            updated.append(f"카테고리 권한: {DEVELOPMENT_LOG_CATEGORY_NAME}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    channels = {}
+    for index, config in enumerate(DEVELOPMENT_LOG_CHANNELS):
+        channel = discord.utils.get(guild.text_channels, name=config["name"])
+        if channel is None:
+            try:
+                channel = await guild.create_text_channel(
+                    config["name"],
+                    category=category,
+                    overwrites=overwrites,
+                    topic=config["topic"],
+                    reason="개발로그 채널 자동 생성"
+                )
+                created.append(f"채널: {config['name']}")
+                await asyncio.sleep(0.2)
+            except (discord.Forbidden, discord.HTTPException):
+                channel = None
+        else:
+            try:
+                await channel.edit(
+                    category=category,
+                    overwrites=overwrites,
+                    topic=config["topic"],
+                    position=(category.channels[index].position if category and index < len(category.channels) else None),
+                    reason="개발로그 채널 정리"
+                )
+                updated.append(f"채널 정리: {config['name']}")
+                await asyncio.sleep(0.1)
+            except (discord.Forbidden, discord.HTTPException, TypeError):
+                try:
+                    await channel.edit(category=category, overwrites=overwrites, topic=config["topic"], reason="개발로그 채널 정리")
+                    updated.append(f"채널 정리: {config['name']}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        if channel:
+            channels[config["key"]] = channel
+
+    if send_intro:
+        await send_development_log_intro_embeds(guild)
+
+    return {"category": category, "created": created, "updated": updated, "channels": channels, "alert_role": alert_role}
+
+
+class DevelopmentLogPostModal(discord.ui.Modal):
+    def __init__(self, log_key: str):
+        config = get_development_log_channel_config(log_key)
+        super().__init__(title=f"{config['name']} 알림 작성")
+        self.log_key = log_key
+        self.title_input = discord.ui.TextInput(
+            label="제목",
+            placeholder="예: v1.2 업데이트 안내",
+            required=True,
+            max_length=200,
+        )
+        self.content_input = discord.ui.TextInput(
+            label="내용",
+            placeholder="알림 내용을 적어주세요.",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=3500,
+        )
+        self.version_input = discord.ui.TextInput(
+            label="버전/태그",
+            placeholder="예: v1.2.0 / 긴급패치 / 개발중",
+            required=False,
+            max_length=80,
+        )
+        self.image_input = discord.ui.TextInput(
+            label="이미지/GIF URL",
+            placeholder="비워도 됩니다.",
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.content_input)
+        self.add_item(self.version_input)
+        self.add_item(self.image_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        result = await ensure_development_log_channels(interaction.guild, send_intro=False)
+        config = get_development_log_channel_config(self.log_key)
+        channel = result["channels"].get(self.log_key) or discord.utils.get(interaction.guild.text_channels, name=config["name"])
+        if not channel:
+            return await interaction.response.send_message("❌ 개발로그 채널을 찾거나 만들 수 없습니다. 봇 권한을 확인해주세요.", ephemeral=True)
+
+        tag = str(self.version_input.value).strip()
+        title = str(self.title_input.value).strip()
+        content = str(self.content_input.value).strip()
+        image_url = safe_url(str(self.image_input.value).strip())
+
+        embed = discord.Embed(
+            title=f"{config['name'].split('︱')[0]} {title}"[:256],
+            description=content[:4096],
+            color=config.get("color", BOT_COLOR),
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        if tag:
+            embed.add_field(name="태그", value=f"`{tag}`", inline=True)
+        embed.add_field(name="작성자", value=interaction.user.mention, inline=True)
+        if image_url:
+            embed.set_image(url=image_url)
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed.set_footer(text="📈 만능 봇 개발로그 알림")
+
+        alert_role = result.get("alert_role")
+        mention_text = ""
+        allowed = discord.AllowedMentions.none()
+        if self.log_key in {"update", "patch"} and alert_role:
+            mention_text = alert_role.mention
+            allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
+
+        try:
+            await channel.send(content=mention_text, embed=embed, allowed_mentions=allowed)
+            await interaction.response.send_message(f"✅ {channel.mention} 에 알림을 전송했습니다.", ephemeral=True)
+            await send_log(interaction.guild, f"📈 개발로그 알림 전송\n채널: {channel.mention}\n작성자: {interaction.user.mention}\n제목: `{title}`", "general")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"❌ 알림 전송 실패: `{e}`", ephemeral=True)
+
+
+class DevelopmentLogPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="채널 자동생성", emoji="📈", style=discord.ButtonStyle.green, row=0)
+    async def create_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        result = await ensure_development_log_channels(interaction.guild)
+        created_text = "\n".join(f"• {item}" for item in result["created"][:20]) if result["created"] else "새로 생성된 항목 없음"
+        await interaction.followup.send(
+            f"✅ 개발로그 채널 자동 생성/정리가 완료됐습니다.\n\n**생성됨**\n{created_text}\n\n**정리됨** `{len(result['updated'])}`개",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="업데이트 알림", emoji="🚀", style=discord.ButtonStyle.blurple, row=0)
+    async def update_notice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        await interaction.response.send_modal(DevelopmentLogPostModal("update"))
+
+    @discord.ui.button(label="패치노트", emoji="📝", style=discord.ButtonStyle.blurple, row=0)
+    async def patch_note(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        await interaction.response.send_modal(DevelopmentLogPostModal("patch"))
+
+    @discord.ui.button(label="봇상태 갱신", emoji="📊", style=discord.ButtonStyle.gray, row=1)
+    async def bot_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        result = await ensure_development_log_channels(interaction.guild, send_intro=False)
+        channel = result["channels"].get("status") or get_development_log_channel(interaction.guild, "status")
+        if not channel:
+            return await interaction.followup.send("❌ 봇상태 채널을 만들 수 없습니다. 봇 권한을 확인해주세요.", ephemeral=True)
+        try:
+            await channel.send(embed=build_development_status_embed(interaction.guild))
+            await interaction.followup.send(f"✅ {channel.mention} 에 봇상태 알림을 전송했습니다.", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.followup.send(f"❌ 봇상태 전송 실패: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="개발일지", emoji="📅", style=discord.ButtonStyle.secondary, row=1)
+    async def diary_notice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_bot_manager(interaction):
+            return
+        await interaction.response.send_modal(DevelopmentLogPostModal("diary"))
+
+
+# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
+# @bot.tree.command(name="개발로그", description="업데이트/패치노트/봇상태/개발일지 채널과 알림 패널을 자동 생성합니다.")
+async def development_log_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_bot_manager(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    result = await ensure_development_log_channels(interaction.guild)
+    channel_lines = []
+    for config in DEVELOPMENT_LOG_CHANNELS:
+        channel = discord.utils.get(interaction.guild.text_channels, name=config["name"])
+        channel_lines.append(f"{config['name'].split('︱')[0]} {channel.mention if channel else '`생성 실패`'}")
+
+    embed = discord.Embed(
+        title="📈 개발로그 자동 생성 완료",
+        description=(
+            "이미지에 있는 개발로그 채널 구성을 자동으로 생성/정리했습니다.\n\n"
+            + "\n".join(channel_lines)
+            + "\n\n아래 버튼으로 업데이트 알림, 패치노트, 봇상태, 개발일지를 바로 보낼 수 있습니다."
+        ),
+        color=BOT_COLOR
+    )
+    embed.add_field(name="새로 생성", value=f"`{len(result['created'])}`개", inline=True)
+    embed.add_field(name="정리 완료", value=f"`{len(result['updated'])}`개", inline=True)
+    if result.get("alert_role"):
+        embed.add_field(name="알림 역할", value=result["alert_role"].mention, inline=True)
+    embed.set_footer(text="업데이트/패치노트 버튼은 개발알림 역할을 멘션합니다.")
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    await interaction.followup.send(embed=embed, view=DevelopmentLogPanelView(), ephemeral=True)
+    await send_log(interaction.guild, f"📈 개발로그 자동 생성/정리\n관리자: {interaction.user.mention}\n생성: {len(result['created'])}개\n정리: {len(result['updated'])}개", "general")
+
+
+# =========================
+# 실행
+# =========================
+
+# 안전 실행 방식입니다.
+# 1) Render에서는 환경변수 DISCORD_TOKEN에 토큰을 넣으면 됩니다.
+# 2) 로컬에서는 start_bot.bat를 실행하면 토큰을 붙여넣을 수 있습니다.
+if not TOKEN:
+    try:
+        TOKEN = input("봇 토큰을 붙여넣고 Enter를 눌러주세요: ").strip()
+    except EOFError:
+        TOKEN = ""
+
+if not TOKEN:
+    print("❌ 봇 토큰이 비어있습니다. Render Environment에 DISCORD_TOKEN 또는 DISCORD_BOT_TOKEN을 넣어주세요.")
+else:
+    bot.run(TOKEN)
