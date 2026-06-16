@@ -817,6 +817,154 @@ def send_support_welcome(guild_id):
     flash("지원 서버 환영 메시지를 보냈어요." if ok else f"환영 메시지 발송 실패: {msg}")
     return redirect(url_for("dashboard", guild_id=guild_id)+"#support")
 
+
+# === DASHBOARD_SEND_BUTTONS_PATCH_V1 ===
+# 대시보드에서 저장 버튼 옆 발송/테스트 버튼을 쓰기 위한 기능입니다.
+DASH_AUTO_EMBED_CHANNEL_FIELDS = {
+    "rules": "rule_channel_id",
+    "intro": "intro_channel_id",
+    "verify": "verify_channel_id",
+    "ticket": "ticket_channel_id",
+    "shop": "shop_channel_id",
+    "point": "point_channel_id",
+    "level": "level_channel_id",
+    "enhance": "enhance_channel_id",
+    "stock": "stock_channel_id",
+    "event": "event_channel_id",
+    "coupon": "coupon_channel_id",
+    "mission": "mission_channel_id",
+    "title": "title_channel_id",
+    "achievement": "achievement_channel_id",
+    "music": "music_command_channel_id",
+    "tts": "tts_text_channel_id",
+    "dev_update": "dev_update_channel_id",
+    "dev_patch": "dev_patch_channel_id",
+    "bot_status": "dev_status_channel_id",
+    "dev_diary": "dev_diary_channel_id",
+    "support_welcome": "support_welcome_channel_id",
+    "clean": "bot_command_channel_id",
+}
+
+DASH_RECRUIT_CHANNEL_FIELDS = {
+    "benefit": "recruit_benefit_channel_id",
+    "planning": "recruit_planning_channel_id",
+    "newbie": "recruit_newbie_channel_id",
+    "guide": "recruit_guide_channel_id",
+    "promotion": "recruit_promotion_channel_id",
+    "security": "recruit_security_channel_id",
+    "scrim": "recruit_scrim_channel_id",
+    "admin": "recruit_admin_channel_id",
+    "design": "recruit_design_channel_id",
+    "fixed": "recruit_fixed_channel_id",
+    "move": "recruit_guide_channel_id",
+}
+
+
+def dash_get_guild_channel_id(guild_id, field_name):
+    if not field_name:
+        return 0
+    con = db()
+    try:
+        row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
+        if row and field_name in row.keys():
+            return as_int(row[field_name], 0)
+    except Exception:
+        return 0
+    finally:
+        con.close()
+    return 0
+
+
+def dash_render_welcome_text(text, guild_id):
+    text = text or ""
+    user = fetch_user() or {}
+    guild = fetch_bot_guild(guild_id) or {}
+    username = user.get("global_name") or user.get("username") or "관리자"
+    user_id = user.get("id") or "0"
+    server_name = guild.get("name") or "서버"
+    member_count = guild.get("approximate_member_count") or guild.get("member_count") or "0"
+    rule_channel_id = dash_get_guild_channel_id(guild_id, "rule_channel_id")
+    replacements = {
+        "{user}": f"<@{user_id}>",
+        "{username}": username,
+        "{server}": server_name,
+        "{member_count}": str(member_count),
+        "{rule_channel}": f"<# {rule_channel_id}>".replace("# ", "#") if rule_channel_id else "미설정",
+    }
+    for key, value in replacements.items():
+        text = text.replace(key, str(value))
+    return text
+
+
+def dash_send_form_embed(guild_id, channel_field, success_text, redirect_hash, *, render_welcome=False):
+    if not require_admin_guild(guild_id):
+        return redirect(url_for("servers"))
+    channel_id = dash_get_guild_channel_id(guild_id, channel_field)
+    if not channel_id:
+        flash(f"발송할 채널이 미설정이에요. 전체 채널에서 {channel_field}를 먼저 설정해주세요.")
+        return redirect(url_for("dashboard", guild_id=guild_id) + redirect_hash)
+
+    title = request.form.get("title", "만능 봇 알림")
+    description = request.form.get("description", "")
+    footer = request.form.get("footer", "⭐ 만능 봇")
+    if render_welcome:
+        title = dash_render_welcome_text(title, guild_id)
+        description = dash_render_welcome_text(description, guild_id)
+        footer = dash_render_welcome_text(footer, guild_id)
+
+    ok, msg = send_discord_embed(
+        channel_id,
+        title,
+        description,
+        request.form.get("color", "FFB6C1"),
+        request.form.get("image_url", ""),
+        footer,
+    )
+    flash(success_text if ok else f"발송 실패: {msg}")
+    return redirect(url_for("dashboard", guild_id=guild_id) + redirect_hash)
+
+
+@app.route("/dashboard/<guild_id>/welcome/test", methods=["POST"])
+@login_required
+def test_welcome(guild_id):
+    return dash_send_form_embed(
+        guild_id,
+        "welcome_channel_id",
+        "환영 테스트 메시지를 보냈어요.",
+        "#welcome",
+        render_welcome=True,
+    )
+
+
+@app.route("/dashboard/<guild_id>/embed/<embed_type>/send", methods=["POST"])
+@login_required
+def send_auto_embed_now(guild_id, embed_type):
+    if embed_type not in EMBED_TYPES:
+        flash("알 수 없는 기본 임베드 종류예요.")
+        return redirect(url_for("dashboard", guild_id=guild_id) + "#embeds")
+    return dash_send_form_embed(
+        guild_id,
+        DASH_AUTO_EMBED_CHANNEL_FIELDS.get(embed_type, "notice_channel_id"),
+        f"{EMBED_TYPES[embed_type]} 임베드를 발송했어요.",
+        "#embeds",
+    )
+
+
+@app.route("/dashboard/<guild_id>/recruit/<recruit_key>/send", methods=["POST"])
+@login_required
+def send_recruit_now(guild_id, recruit_key):
+    if recruit_key not in RECRUIT_ITEMS:
+        flash("알 수 없는 구인구직 임베드 종류예요.")
+        return redirect(url_for("dashboard", guild_id=guild_id) + "#recruit")
+    return dash_send_form_embed(
+        guild_id,
+        DASH_RECRUIT_CHANNEL_FIELDS.get(recruit_key, "recruit_guide_channel_id"),
+        f"{RECRUIT_ITEMS[recruit_key]} 임베드를 발송했어요.",
+        "#recruit",
+    )
+# === /DASHBOARD_SEND_BUTTONS_PATCH_V1 ===
+
+
 @app.route("/dashboard/<guild_id>/devlog", methods=["POST"])
 @login_required
 def save_devlog_settings(guild_id):
