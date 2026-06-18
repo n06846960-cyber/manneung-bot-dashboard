@@ -1,34 +1,57 @@
-{% extends "base.html" %}
-{% block content %}
-<section class="hero card">
-  <div class="badge">⭐ 친목 서버 관리 봇</div>
-  <h1>🌸 만능 봇 관리센터</h1>
-  <p>환영 메시지, 인증 패널, 규칙 임베드, 자기소개 안내, 보안 설정을 웹에서 편하게 관리해요.</p>
-  <div class="menu-grid">
-    <div class="menu-item"><strong>📌 서버 관리</strong><span class="muted">환영 · 규칙 · 인증</span></div>
-    <div class="menu-item"><strong>🎟️ 티켓 시스템</strong><span class="muted">문의 패널 확장 예정</span></div>
-    <div class="menu-item"><strong>💰 경제 시스템</strong><span class="muted">포인트 · 출석 · 상점</span></div>
-    <div class="menu-item"><strong>🛡️ 보안</strong><span class="muted">검열 · 악성유저 · 테러감지</span></div>
-  </div>
-  <a class="btn big" href="{{ url_for('login') }}">Discord로 로그인</a>
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>만능 봇 관리센터</title>
+  <style>
+    :root{color-scheme:dark;}
+    *{box-sizing:border-box}
+    body{
+      margin:0;min-height:100vh;font-family:Arial,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;
+      background:radial-gradient(circle at top,#ffd7ee 0,#171727 42%,#090910 100%);color:white;
+      display:flex;align-items:center;justify-content:center;padding:28px;
+    }
+    .wrap{width:min(1000px,100%)}
+    .hero,.card{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.16);border-radius:28px;box-shadow:0 24px 70px rgba(0,0,0,.35);backdrop-filter:blur(16px)}
+    .hero{padding:38px;text-align:center;margin-bottom:18px}.card{padding:24px;margin:14px 0}h1{margin:0 0 12px;font-size:38px}h2{margin:0 0 10px}.desc{color:#efeff8;line-height:1.75;margin:0 auto 22px;max-width:720px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.btn{display:inline-block;border:0;cursor:pointer;padding:14px 20px;border-radius:999px;background:linear-gradient(135deg,#ff7ac8,#8c7bff);color:white;font-weight:900;text-decoration:none;box-shadow:0 14px 28px rgba(255,122,200,.24)}.ghost{background:rgba(255,255,255,.12);box-shadow:none}.actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}.bot{background:rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.12);border-radius:20px;padding:18px}.bot h3{margin:0 0 8px}.mini{font-size:13px;opacity:.76;line-height:1.6}code{background:rgba(0,0,0,.35);border-radius:8px;padding:3px 7px}.copy{padding:11px 14px;border-radius:999px;border:0;background:rgba(255,255,255,.15);color:white;font-weight:800;cursor:pointer}.footer{text-align:center;opacity:.62;font-size:13px;margin-top:16px}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>🌸 만능 봇 관리센터</h1>
+      <p class="desc">디스코드 서버 관리, 임베드 설정, 환영 메시지, 보안, 경제, 음악/TTS 보조봇 초대를 한곳에서 관리해요.</p>
+      <div class="actions">
+        <a class="btn" href="{{ url_for('login') }}">Discord로 로그인</a>
+        <a class="btn ghost" href="{{ url_for('bot_invite_page') }}">봇 초대하기</a>
+        {% if main_bot_invite_url %}<a class="btn ghost" href="{{ main_bot_invite_url }}">메인 봇 바로 초대</a>{% endif %}
+      </div>
+    </section>
 
-  <a class="btn big" href="https://discord.com/oauth2/authorize?client_id=1510625526300278879&permissions=8&scope=bot%20applications.commands" target="_blank">
-  봇을 서버에 추가하기
-</a>
-</section>
-{% endblock %}
+    <section class="card">
+      <h2>🤖 보조봇 초대</h2>
+      <p class="mini">Render 환경변수 <code>CUSTOM_BOT_CLIENT_ID_1~3</code>에 Application ID를 넣으면 버튼이 자동으로 표시돼요.</p>
+      {% if custom_bot_invites %}
+        <div class="grid">
+          {% for bot in custom_bot_invites %}
+            <div class="bot">
+              <h3>🎵 {{ bot.name }}</h3>
+              <p class="mini">Application ID {{ bot.client_id_masked }} · 권한값 {{ bot.permissions }}</p>
+              <div class="actions" style="justify-content:flex-start;">
+                <a class="btn" href="{{ bot.invite_url }}">초대하기</a>
+                <button class="copy" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="mini">아직 등록된 보조봇이 없어요. 사이트 서비스 Environment에 <code>CUSTOM_BOT_CLIENT_ID_1</code>부터 추가하고 재배포해주세요.</p>
+      {% endif %}
+      <p class="mini"><a style="color:white" href="{{ url_for('check_custom_bots') }}">환경변수 확인 페이지 열기</a></p>
+    </section>
 
-{% if custom_bots %}
-<div class="card" style="margin-top: 20px;">
-  <h2>🤖 보조봇 초대하기</h2>
-  <p>원하는 보조봇을 선택해서 서버에 초대할 수 있어요.</p>
-
-  <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-    {% for bot in custom_bots %}
-      <a class="btn" href="{{ bot.invite_url }}" target="_blank">
-        {{ bot.name }}
-      </a>
-    {% endfor %}
-  </div>
-</div>
-{% endif %}
+    <div class="footer">⭐ 만능 봇 공식 대시보드</div>
+  </main>
+</body>
+</html>
