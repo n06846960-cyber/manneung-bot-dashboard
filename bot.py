@@ -7417,6 +7417,8 @@ async def on_ready():
     bot.add_view(GameRoleView())
     bot.add_view(VerifyView())
     bot.add_view(MusicPanelView())
+    for _custom_music_slot in (1, 2, 3):
+        bot.add_view(CustomMusicPanelView(_custom_music_slot))
     bot.add_view(BuskingPanelView())
     try:
         bot.add_view(DevAlertRoleView())
@@ -18767,21 +18769,26 @@ class CustomVoiceBotClient(discord.Client):
 
     async def on_ready(self):
         print(f"✅ 커스텀 봇 {self.slot}번 로그인: {self.user}")
-        # 재시작 후 저장된 서버 음성방에 자동 복귀합니다.
-        try:
-            c.execute(
-                "SELECT guild_id, bot_name, voice_channel_id FROM custom_voice_bots WHERE slot=? AND enabled=1",
-                (self.slot,)
-            )
-            rows = c.fetchall()
-            for guild_id, bot_name, voice_channel_id in rows:
-                try:
-                    await custom_bot_connect_slot(self.slot, int(guild_id), int(voice_channel_id or 0), bot_name or f"커스텀봇 {self.slot}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # 이제 커스텀 봇은 저장된 설정으로 자동 입장하지 않습니다.
+        # 관리자가 /커스텀에서 직접 현재 통방으로 초대했을 때만 입장합니다.
 
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        # 관리자가 커스텀 봇을 다른 통방으로 이동시킨 경우에도,
+        # 이동한 통방의 채팅채널에 뮤직패널을 자동으로 준비합니다.
+        if self.user is None or member.id != self.user.id:
+            return
+        if before.channel == after.channel or after.channel is None:
+            return
+        if not isinstance(after.channel, discord.VoiceChannel):
+            return
+        try:
+            main_guild = bot.get_guild(after.channel.guild.id) or after.channel.guild
+            main_voice_channel = main_guild.get_channel(after.channel.id) if main_guild else after.channel
+            if not isinstance(main_voice_channel, discord.VoiceChannel):
+                main_voice_channel = after.channel
+            await send_custom_music_panel_to_voice_channel(main_guild, self.slot, main_voice_channel, None, connect=False)
+        except Exception as e:
+            print(f"⚠️ 커스텀 봇 {self.slot}번 통방 패널 자동 전송 실패: {e}")
 
 async def custom_bot_connect_slot(slot: int, guild_id: int, voice_channel_id: int, nickname: str):
     client = CUSTOM_BOT_CLIENTS.get(slot)
@@ -18836,118 +18843,628 @@ async def custom_bot_disconnect_slot(slot: int, guild_id: int):
                 disconnected = True
             except Exception:
                 pass
+    key = custom_music_key(slot, guild_id) if "custom_music_key" in globals() else (slot, guild_id)
+    if "CUSTOM_MUSIC_QUEUES" in globals():
+        CUSTOM_MUSIC_QUEUES.pop(key, None)
+        CUSTOM_MUSIC_NOW_PLAYING.pop(key, None)
+        CUSTOM_MUSIC_LOOP_ENABLED.pop(key, None)
+        CUSTOM_MUSIC_SKIP_VOTE_USERS.pop(key, None)
     return f"✅ {slot}번 커스텀 봇을 퇴장시켰어요." if disconnected else f"ℹ️ {slot}번 커스텀 봇은 이 서버 음성방에 없어요."
 
 
 def build_custom_bot_panel_embed(guild: discord.Guild):
-    rows = {row[0]: row for row in get_custom_voice_bot_rows(guild.id)}
     embed = discord.Embed(
-        title="🤖 커스텀 봇 만들기",
+        title="🤖 커스텀 보조 봇 통방 초대",
         description=(
-            "아래 버튼으로 보조 봇 1~3번을 직접 설정할 수 있어요.\n"
-            "이름과 들어갈 음성채널을 입력하면, 사진처럼 통방에 커스텀 봇이 들어옵니다.\n\n"
-            "⚙️ 실제로 음성방에 여러 봇이 보이려면 Render 환경변수에 "
-            "`CUSTOM_BOT_TOKEN_1`, `CUSTOM_BOT_TOKEN_2`, `CUSTOM_BOT_TOKEN_3` 보조 봇 토큰을 넣어야 해요."
+            "이제 커스텀 봇 만들기/수정 없이 사용할 수 있어요.\n"
+            "먼저 원하는 통방/음성채널에 들어간 다음 아래 번호 버튼을 누르면,\n"
+            "해당 보조 봇이 그 통방으로 들어오고 통방 채팅채널에 뮤직패널이 자동 전송됩니다.\n\n"
+            "⚙️ 실제로 여러 보조 봇이 보이려면 Render 환경변수에 "
+            "`CUSTOM_BOT_TOKEN_1`, `CUSTOM_BOT_TOKEN_2`, `CUSTOM_BOT_TOKEN_3` 토큰이 있어야 해요."
         ),
         color=0x9B7CFF,
     )
     for slot in (1, 2, 3):
-        row = rows.get(slot)
         token_state = "✅ 토큰 있음" if CUSTOM_BOT_TOKENS.get(slot) else "⚠️ 토큰 없음"
-        if row:
-            _, bot_name, avatar_url, voice_channel_id, enabled, updated_at = row
-            channel = guild.get_channel(int(voice_channel_id or 0))
-            channel_text = channel.mention if channel else "채널 없음"
-            value = f"이름: **{bot_name or f'커스텀봇 {slot}'}**\n음성방: {channel_text}\n상태: {token_state}"
+        client = CUSTOM_BOT_CLIENTS.get(slot)
+        bot_name = get_custom_music_bot_label(guild.id, slot)
+        voice_client = get_custom_music_voice_client(slot, guild.id)
+        if voice_client and getattr(voice_client, "channel", None):
+            channel_text = voice_client.channel.mention
+            live_state = "🟢 통방 입장 중"
         else:
-            value = f"아직 설정되지 않음\n상태: {token_state}"
+            channel_text = "미입장"
+            live_state = "⚪ 대기 중"
+        login_state = "온라인" if client and client.is_ready() else "로그인 대기"
+        value = (
+            f"이름: **{bot_name}**\n"
+            f"상태: {token_state} / {login_state}\n"
+            f"현재 통방: {channel_text}\n"
+            f"입장 상태: {live_state}"
+        )
         embed.add_field(name=f"🎧 {slot}번 커스텀 봇", value=value, inline=True)
     if bot.user:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.set_footer(text="만능 봇 | /커스텀 보조 봇 관리")
+    embed.set_footer(text="만능 봇 | /커스텀 보조 봇 통방 초대")
     return embed
 
 
-class CustomBotConfigModal(discord.ui.Modal):
+
+
+# =========================
+# 커스텀 보조 봇 뮤직 패널
+# =========================
+# 메인 뮤직 패널은 메인 봇 1개만 음성 재생을 처리합니다.
+# 아래 커스텀 뮤직 패널은 CUSTOM_BOT_TOKEN_1~3에 연결된 보조 봇마다
+# 독립 대기열/반복/볼륨/스킵 투표를 가지도록 분리해서 동작합니다.
+
+CUSTOM_MUSIC_QUEUES = {}
+CUSTOM_MUSIC_NOW_PLAYING = {}
+CUSTOM_MUSIC_LOOP_ENABLED = {}
+CUSTOM_MUSIC_VOLUME_LEVELS = {}
+CUSTOM_MUSIC_SKIP_VOTE_USERS = {}
+CUSTOM_MUSIC_PANEL_LAST_SENT = {}
+
+
+def custom_music_key(slot: int, guild_id: int):
+    return (int(slot), int(guild_id))
+
+
+def get_custom_music_queue(slot: int, guild_id: int):
+    key = custom_music_key(slot, guild_id)
+    if key not in CUSTOM_MUSIC_QUEUES:
+        CUSTOM_MUSIC_QUEUES[key] = deque()
+    return CUSTOM_MUSIC_QUEUES[key]
+
+
+def get_custom_music_volume(slot: int, guild_id: int):
+    return CUSTOM_MUSIC_VOLUME_LEVELS.get(custom_music_key(slot, guild_id), 0.5)
+
+
+def get_custom_music_voice_client(slot: int, guild_id: int):
+    client = CUSTOM_BOT_CLIENTS.get(int(slot))
+    if not client:
+        return None
+    for vc in list(client.voice_clients):
+        if vc.guild and vc.guild.id == int(guild_id):
+            return vc
+    return None
+
+
+def get_custom_music_bot_label(guild_id: int, slot: int):
+    client = CUSTOM_BOT_CLIENTS.get(int(slot))
+    if client and getattr(client, "user", None):
+        return getattr(client.user, "display_name", None) or getattr(client.user, "name", None) or f"커스텀봇 {slot}"
+    row = get_custom_voice_bot_setting(int(guild_id), int(slot))
+    if row and row[1]:
+        return row[1]
+    return f"커스텀봇 {slot}"
+
+def build_custom_music_panel_embed(guild: discord.Guild, slot: int):
+    bot_name = get_custom_music_bot_label(guild.id, slot)
+    token_state = "✅ 토큰 있음" if CUSTOM_BOT_TOKENS.get(int(slot)) else "⚠️ 토큰 없음"
+    channel_text = "미입장"
+    voice_client = get_custom_music_voice_client(slot, guild.id)
+    if voice_client and getattr(voice_client, "channel", None):
+        channel_text = voice_client.channel.mention
+
+    embed = discord.Embed(
+        title=f"🎵 {slot}번 커스텀 뮤직 패널",
+        description=(
+            f"**{bot_name}** 보조 봇으로 음악을 재생합니다.\n"
+            "먼저 `/커스텀`에서 원하는 번호의 **통방 초대** 버튼을 누르면,\n"
+            "내가 들어가 있는 통방으로 봇이 들어오고 이 채팅채널에 패널이 열립니다.\n\n"
+            "🎶 **재생** 버튼을 누르고 노래 제목이나 링크를 입력하세요.\n"
+            "📜 **대기열** 버튼으로 현재 곡과 예약 곡을 확인할 수 있어요."
+        ),
+        color=0x9B7CFF,
+    )
+    embed.add_field(name="🤖 보조 봇", value=f"{slot}번 · **{bot_name}**", inline=True)
+    embed.add_field(name="🔊 현재 통방", value=channel_text, inline=True)
+    embed.add_field(name="🔐 토큰 상태", value=token_state, inline=True)
+    embed.add_field(
+        name="🎚️ 조작 버튼",
+        value="`재생` `일시정지` `다시재생` `스킵 투표` `대기열` `반복` `셔플` `볼륨` `종료`",
+        inline=False,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="만능 봇 | 커스텀 보조 봇 뮤직 패널")
+    return embed
+
+
+
+def normalize_custom_music_channel_name(name: str):
+    return re.sub(r"[^0-9a-zA-Z가-힣]", "", (name or "").lower())
+
+
+def resolve_custom_music_text_channel(guild: discord.Guild, voice_channel=None, fallback_channel=None):
+    """커스텀 봇이 들어간 통방/음성방에서 사용할 채팅채널을 찾습니다.
+
+    1순위: Discord의 음성채널 채팅(VoiceChannel.send 지원 시)
+    2순위: 같은 카테고리의 통방/뮤직/채팅 텍스트 채널
+    3순위: 대시보드/자동생성 뮤직명령어 채널
+    4순위: 버튼을 누른 현재 채널
+    """
+    if guild is None:
+        return fallback_channel if callable(getattr(fallback_channel, "send", None)) else None
+
+    # Discord의 "음성 채널 채팅"을 지원하는 discord.py 버전이면 음성채널 자체에 패널을 보냅니다.
+    if voice_channel is not None and callable(getattr(voice_channel, "send", None)):
+        return voice_channel
+
+    text_channels = list(getattr(guild, "text_channels", []))
+    voice_norm = normalize_custom_music_channel_name(getattr(voice_channel, "name", "")) if voice_channel else ""
+    keywords = ["통방", "채팅", "뮤직", "음악", "노래", "명령어", "music", "chat"]
+
+    if voice_channel is not None:
+        same_category = [ch for ch in text_channels if getattr(ch, "category_id", None) == getattr(voice_channel, "category_id", None)]
+
+        # 같은 카테고리에서 음성방 이름과 비슷한 채팅채널을 먼저 찾습니다.
+        for ch in same_category:
+            ch_norm = normalize_custom_music_channel_name(ch.name)
+            if voice_norm and (voice_norm in ch_norm or ch_norm in voice_norm):
+                return ch
+
+        # 같은 카테고리에서 통방/뮤직/채팅/명령어 느낌의 채널을 찾습니다.
+        for ch in same_category:
+            ch_norm = normalize_custom_music_channel_name(ch.name)
+            if any(keyword in ch_norm for keyword in keywords):
+                return ch
+
+        # 같은 카테고리에 텍스트 채널이 하나라도 있으면 그 채널을 사용합니다.
+        if same_category:
+            return same_category[0]
+
+    # 대시보드나 자동생성으로 저장된 뮤직 명령어 채널을 사용합니다.
+    for column in ("music_command_channel_id", "bot_command_channel_id"):
+        try:
+            saved_id = get_saved_channel_id(guild.id, column)
+        except Exception:
+            saved_id = 0
+        channel = guild.get_channel(int(saved_id or 0)) if saved_id else None
+        if channel and callable(getattr(channel, "send", None)):
+            return channel
+
+    fallback_names = [
+        "🎵-뮤직명령어", "🎵︱뮤직명령어", "뮤직명령어",
+        "통방채팅", "통방-채팅", "💬-통방채팅", "채팅", "일반",
+    ]
+    channel = get_channel_by_id_or_name(guild, 0, fallback_names, "text")
+    if channel:
+        return channel
+
+    if fallback_channel and callable(getattr(fallback_channel, "send", None)):
+        return fallback_channel
+    return None
+
+
+def get_custom_music_saved_voice_channel(guild: discord.Guild, slot: int):
+    # 예전 DB 저장 방식 호환용입니다. 새 방식은 저장 설정 없이 현재 통방으로 직접 초대합니다.
+    voice_client = get_custom_music_voice_client(slot, guild.id) if guild else None
+    if voice_client and getattr(voice_client, "channel", None):
+        return voice_client.channel, get_custom_music_bot_label(guild.id, slot)
+    return None, get_custom_music_bot_label(guild.id, slot) if guild else f"커스텀봇 {slot}"
+
+
+async def send_custom_music_panel_to_voice_channel(guild: discord.Guild, slot: int, voice_channel: discord.VoiceChannel, fallback_channel=None, *, connect: bool = True):
+    """선택한 보조 봇을 지정 통방에 초대하고, 그 통방의 채팅채널에 뮤직패널을 보냅니다."""
+    if guild is None:
+        return "❌ 서버에서만 사용할 수 있어요."
+    if not isinstance(voice_channel, discord.VoiceChannel):
+        return "❌ 초대할 통방/음성채널을 찾지 못했어요. 먼저 통방에 들어가주세요."
+
+    connect_result = ""
+    if connect:
+        connect_result = await custom_bot_connect_slot(int(slot), guild.id, voice_channel.id, "")
+
+    panel_channel = resolve_custom_music_text_channel(guild, voice_channel, fallback_channel)
+    if panel_channel is None:
+        return f"{connect_result}\n⚠️ 뮤직패널을 보낼 채팅채널을 찾지 못했어요.".strip()
+
+    # 봇 입장/이동 이벤트와 버튼 클릭이 동시에 들어와도 같은 채널에 패널을 너무 많이 보내지 않게 막습니다.
+    now_ts = datetime.datetime.now().timestamp()
+    panel_key = (int(slot), int(guild.id), int(getattr(panel_channel, "id", 0) or 0))
+    last_ts = CUSTOM_MUSIC_PANEL_LAST_SENT.get(panel_key, 0)
+    if now_ts - last_ts < 10:
+        return (
+            f"{connect_result}\n"
+            f"ℹ️ {slot}번 커스텀 뮤직패널은 방금 {getattr(panel_channel, 'mention', '채팅채널')}에 전송됐어요."
+        ).strip()
+
+    try:
+        await panel_channel.send(
+            embed=build_custom_music_panel_embed(guild, int(slot)),
+            view=CustomMusicPanelView(int(slot)),
+        )
+        CUSTOM_MUSIC_PANEL_LAST_SENT[panel_key] = now_ts
+        return (
+            f"{connect_result}\n"
+            f"🎛️ {slot}번 커스텀 뮤직패널을 {panel_channel.mention}에 전송했어요.\n"
+            f"이제 그 채팅채널에서 버튼으로 재생/스킵/볼륨/종료를 사용할 수 있어요."
+        ).strip()
+    except (discord.Forbidden, discord.HTTPException) as e:
+        return f"{connect_result}\n❌ 패널 전송 실패: `{e}`".strip()
+
+
+async def send_custom_music_panel_to_saved_channel(guild: discord.Guild, slot: int, fallback_channel=None):
+    """이전 버전 호환용 래퍼입니다. 저장 설정 대신 현재 접속 중인 통방 기준으로 패널을 보냅니다."""
+    voice_client = get_custom_music_voice_client(slot, guild.id) if guild else None
+    voice_channel = getattr(voice_client, "channel", None) if voice_client else None
+    if not voice_channel:
+        return f"❌ {slot}번 커스텀 봇이 아직 통방에 없어요. `/커스텀`에서 {slot}번 통방 초대를 눌러주세요."
+    return await send_custom_music_panel_to_voice_channel(guild, slot, voice_channel, fallback_channel, connect=False)
+
+def build_custom_now_playing_embed(track: dict, slot: int, guild_id: int, *, queued: bool = False):
+    status = "대기열 추가" if queued else "현재 재생 중"
+    bot_name = get_custom_music_bot_label(guild_id, slot)
+    service = track.get("service", "검색")
+    service_emoji = track.get("service_emoji", "🎧")
+    embed = discord.Embed(
+        title=f"{service_emoji} {bot_name} · {status}",
+        description=f"**{track.get('title', '제목 없음')}**",
+        color=0x9B7CFF,
+        url=track.get("webpage_url") or None,
+    )
+    embed.add_field(name="🤖 보조 봇", value=f"{slot}번 · {bot_name}", inline=True)
+    embed.add_field(name="🎧 서비스", value=service, inline=True)
+    embed.add_field(name="⏱️ 길이", value=f"`{format_duration(track.get('duration'))}`", inline=True)
+    embed.add_field(name="🎤 업로더", value=str(track.get("uploader", "알 수 없음"))[:100], inline=True)
+    if track.get("thumbnail"):
+        embed.set_thumbnail(url=track["thumbnail"])
+    embed.set_footer(text="🎵 만능 봇 커스텀 뮤직")
+    return embed
+
+
+async def send_custom_music_now_playing_box(slot: int, guild_id: int, track: dict, *, queued: bool = False):
+    client = CUSTOM_BOT_CLIENTS.get(int(slot))
+    # 임베드/패널 메시지는 메인 봇이 보내야 버튼과 표시가 안정적으로 동작합니다.
+    guild = bot.get_guild(int(guild_id))
+    if guild is None and client:
+        guild = client.get_guild(int(guild_id))
+    if guild is None:
+        return
+    voice_client = get_custom_music_voice_client(slot, guild_id)
+    voice_channel = getattr(voice_client, "channel", None) if voice_client else None
+    channel = resolve_custom_music_text_channel(guild, voice_channel, None)
+    if not channel:
+        channel = get_channel_by_id_or_name(guild, 0, [MUSIC_NOW_PLAYING_CHANNEL_NAME, "현재재생", "now-playing", "🎵-뮤직명령어", "뮤직명령어"], "text")
+    if not channel:
+        return
+    try:
+        await channel.send(embed=build_custom_now_playing_embed(track, slot, guild_id, queued=queued))
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def ensure_custom_music_voice_after_defer(interaction: discord.Interaction, slot: int):
+    if interaction.guild is None:
+        await interaction.followup.send("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+        return None
+
+    client = CUSTOM_BOT_CLIENTS.get(int(slot))
+    if not client:
+        await interaction.followup.send(
+            f"⚠️ {slot}번 보조 봇 토큰이 없습니다. Render 환경변수 `CUSTOM_BOT_TOKEN_{slot}`에 토큰을 넣어주세요.",
+            ephemeral=True,
+        )
+        return None
+    if not client.is_ready():
+        await interaction.followup.send(f"⚠️ {slot}번 보조 봇이 아직 로그인 중입니다. 잠시 후 다시 눌러주세요.", ephemeral=True)
+        return None
+
+    custom_guild = client.get_guild(interaction.guild.id)
+    if custom_guild is None:
+        await interaction.followup.send(f"❌ {slot}번 보조 봇이 이 서버에 초대되어 있지 않습니다.", ephemeral=True)
+        return None
+
+    voice_client = get_custom_music_voice_client(slot, interaction.guild.id)
+    if voice_client:
+        return voice_client
+
+    target_channel_id = 0
+    if interaction.user.voice and interaction.user.voice.channel:
+        target_channel_id = interaction.user.voice.channel.id
+
+    if not target_channel_id:
+        await interaction.followup.send("❌ 먼저 사용할 통방/음성채널에 들어간 다음 버튼을 눌러주세요.", ephemeral=True)
+        return None
+
+    result = await custom_bot_connect_slot(slot, interaction.guild.id, target_channel_id, "")
+    voice_client = get_custom_music_voice_client(slot, interaction.guild.id)
+    if not voice_client:
+        await interaction.followup.send(result, ephemeral=True)
+        return None
+    return voice_client
+
+
+async def play_custom_music_next(slot: int, guild_id: int):
+    client = CUSTOM_BOT_CLIENTS.get(int(slot))
+    if not client:
+        return
+    voice_client = get_custom_music_voice_client(slot, guild_id)
+    if voice_client is None:
+        return
+
+    key = custom_music_key(slot, guild_id)
+    queue = get_custom_music_queue(slot, guild_id)
+
+    if CUSTOM_MUSIC_LOOP_ENABLED.get(key) and CUSTOM_MUSIC_NOW_PLAYING.get(key):
+        queue.appendleft(CUSTOM_MUSIC_NOW_PLAYING[key])
+
+    if not queue:
+        CUSTOM_MUSIC_NOW_PLAYING[key] = None
+        return
+
+    track = queue.popleft()
+    CUSTOM_MUSIC_NOW_PLAYING[key] = track
+    CUSTOM_MUSIC_SKIP_VOTE_USERS.pop(key, None)
+    await send_custom_music_now_playing_box(slot, guild_id, track, queued=False)
+
+    source = discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS)
+    source = discord.PCMVolumeTransformer(source, volume=get_custom_music_volume(slot, guild_id))
+
+    def after_play(error):
+        if error:
+            print(f"커스텀 봇 {slot}번 재생 오류: {error}")
+        future = asyncio.run_coroutine_threadsafe(play_custom_music_next(slot, guild_id), client.loop)
+        try:
+            future.result()
+        except Exception as e:
+            print(f"커스텀 봇 {slot}번 다음 곡 재생 오류: {e}")
+
+    voice_client.play(source, after=after_play)
+
+
+class CustomMusicPlayModal(discord.ui.Modal):
     def __init__(self, slot: int):
-        super().__init__(title=f"🤖 {slot}번 커스텀 봇 만들기/수정")
-        self.slot = slot
-        self.bot_name = discord.ui.TextInput(
-            label="봇 이름",
-            placeholder="예: 알로항 / 알로항 2 / 노래도우미",
+        super().__init__(title=f"🎶 {slot}번 커스텀 봇 음악 재생")
+        self.slot = int(slot)
+        self.query = discord.ui.TextInput(
+            label="노래 제목 또는 링크",
+            placeholder="예: 아이유 좋은날 / 유튜브 링크 / 사운드클라우드 / 멜론 / 지니뮤직",
             required=True,
-            max_length=32,
+            max_length=300,
         )
-        self.voice_channel = discord.ui.TextInput(
-            label="들어갈 음성채널 이름 또는 ID",
-            placeholder="예: 음성채널 1 / 1512345678901234567",
-            required=True,
-            max_length=100,
-        )
-        self.avatar_url = discord.ui.TextInput(
-            label="프로필 이미지 URL 선택사항",
-            placeholder="이미지는 보조 봇 계정에서 직접 바꾸는 것을 추천해요.",
-            required=False,
-            max_length=500,
-        )
-        self.add_item(self.bot_name)
-        self.add_item(self.voice_channel)
-        self.add_item(self.avatar_url)
+        self.add_item(self.query)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        voice_client = await ensure_custom_music_voice_after_defer(interaction, self.slot)
+        if voice_client is None:
+            return
+
+        query_text = str(self.query.value).strip()
+        try:
+            track = await extract_music_info(query_text)
+        except Exception as e:
+            return await interaction.followup.send(f"❌ 노래 정보를 가져오지 못했어요.\n`{e}`", ephemeral=True)
+
+        queue = get_custom_music_queue(self.slot, interaction.guild.id)
+        queue.append(track)
+
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await play_custom_music_next(self.slot, interaction.guild.id)
+            msg = (
+                f"🎶 **{self.slot}번 커스텀 봇**으로 바로 재생을 시작했어요!\n"
+                f"{track.get('service_emoji', '🎧')} **{track['title']}**\n"
+                f"서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track.get('duration'))}`"
+            )
+        else:
+            await send_custom_music_now_playing_box(self.slot, interaction.guild.id, track, queued=True)
+            msg = (
+                f"✅ **{self.slot}번 커스텀 봇** 대기열에 추가했어요!\n"
+                f"{track.get('service_emoji', '🎧')} **{track['title']}**\n"
+                f"서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track.get('duration'))}`"
+            )
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+class CustomMusicVolumeModal(discord.ui.Modal):
+    def __init__(self, slot: int):
+        super().__init__(title=f"🔊 {slot}번 커스텀 봇 볼륨 설정")
+        self.slot = int(slot)
+        self.volume = discord.ui.TextInput(
+            label="볼륨 1~100",
+            placeholder="예: 50",
+            required=True,
+            max_length=3,
+        )
+        self.add_item(self.volume)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = int(str(self.volume.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("❌ 숫자만 입력해주세요.", ephemeral=True)
+        if value < 1 or value > 100:
+            return await interaction.response.send_message("❌ 1부터 100까지만 입력해주세요.", ephemeral=True)
+
+        key = custom_music_key(self.slot, interaction.guild.id)
+        CUSTOM_MUSIC_VOLUME_LEVELS[key] = value / 100
+        voice_client = get_custom_music_voice_client(self.slot, interaction.guild.id)
+        if voice_client and voice_client.source and isinstance(voice_client.source, discord.PCMVolumeTransformer):
+            voice_client.source.volume = value / 100
+        await interaction.response.send_message(f"🔊 {self.slot}번 커스텀 봇 볼륨을 **{value}%** 로 설정했어요.", ephemeral=True)
+
+
+class CustomMusicPanelView(discord.ui.View):
+    def __init__(self, slot: int):
+        super().__init__(timeout=None)
+        self.slot = int(slot)
+        self._add_button("재생", "🎶", discord.ButtonStyle.green, f"custom_music_{self.slot}_play", self.play_button, row=0)
+        self._add_button("일시정지", "⏸️", discord.ButtonStyle.gray, f"custom_music_{self.slot}_pause", self.pause_button, row=0)
+        self._add_button("다시재생", "▶️", discord.ButtonStyle.blurple, f"custom_music_{self.slot}_resume", self.resume_button, row=0)
+        self._add_button("스킵 투표", "⏭️", discord.ButtonStyle.red, f"custom_music_{self.slot}_skip", self.skip_button, row=0)
+        self._add_button("대기열", "📜", discord.ButtonStyle.gray, f"custom_music_{self.slot}_queue", self.queue_button, row=1)
+        self._add_button("반복", "🔁", discord.ButtonStyle.green, f"custom_music_{self.slot}_loop", self.loop_button, row=1)
+        self._add_button("셔플", "🔀", discord.ButtonStyle.gray, f"custom_music_{self.slot}_shuffle", self.shuffle_button, row=1)
+        self._add_button("볼륨", "🔊", discord.ButtonStyle.blurple, f"custom_music_{self.slot}_volume", self.volume_button, row=1)
+        self._add_button("종료", "❌", discord.ButtonStyle.red, f"custom_music_{self.slot}_leave", self.leave_button, row=1)
+
+    def _add_button(self, label, emoji, style, custom_id, callback, row=0):
+        button = discord.ui.Button(label=label, emoji=emoji, style=style, custom_id=custom_id, row=row)
+        button.callback = callback
+        self.add_item(button)
+
+    async def play_button(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CustomMusicPlayModal(self.slot))
+
+    async def pause_button(self, interaction: discord.Interaction):
+        vc = get_custom_music_voice_client(self.slot, interaction.guild.id)
+        if vc and vc.is_playing():
+            vc.pause()
+            return await interaction.response.send_message(f"⏸️ {self.slot}번 커스텀 봇 음악을 일시정지했어요.", ephemeral=True)
+        await interaction.response.send_message("❌ 현재 재생 중인 음악이 없어요.", ephemeral=True)
+
+    async def resume_button(self, interaction: discord.Interaction):
+        vc = get_custom_music_voice_client(self.slot, interaction.guild.id)
+        if vc and vc.is_paused():
+            vc.resume()
+            return await interaction.response.send_message(f"▶️ {self.slot}번 커스텀 봇 음악을 다시 재생했어요.", ephemeral=True)
+        await interaction.response.send_message("❌ 일시정지된 음악이 없어요.", ephemeral=True)
+
+    async def skip_button(self, interaction: discord.Interaction):
+        vc = get_custom_music_voice_client(self.slot, interaction.guild.id)
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            return await interaction.response.send_message("❌ 스킵할 음악이 없어요.", ephemeral=True)
+        if not interaction.user.voice or not interaction.user.voice.channel or interaction.user.voice.channel.id != vc.channel.id:
+            return await interaction.response.send_message("❌ 같은 음성 채널에 있어야 스킵 투표를 할 수 있어요.", ephemeral=True)
+
+        key = custom_music_key(self.slot, interaction.guild.id)
+        votes = CUSTOM_MUSIC_SKIP_VOTE_USERS.setdefault(key, set())
+        valid_user_ids = {member.id for member in vc.channel.members if not member.bot}
+        votes.intersection_update(valid_user_ids)
+        required_votes = get_skip_vote_required(vc.channel)
+
+        if interaction.user.id in votes:
+            return await interaction.response.send_message(f"⏭️ 이미 스킵 투표했어요. 현재 **{len(votes)}/{required_votes}**", ephemeral=True)
+        votes.add(interaction.user.id)
+        vote_count = len(votes)
+        if vote_count >= required_votes:
+            CUSTOM_MUSIC_SKIP_VOTE_USERS.pop(key, None)
+            vc.stop()
+            return await interaction.response.send_message(
+                f"⏭️ {self.slot}번 커스텀 봇 스킵 투표 **{vote_count}/{required_votes}** 완료! 현재 곡을 스킵했어요.",
+                ephemeral=False,
+            )
+        await interaction.response.send_message(f"⏭️ 스킵 투표 완료! 현재 **{vote_count}/{required_votes}**", ephemeral=True)
+
+    async def queue_button(self, interaction: discord.Interaction):
+        key = custom_music_key(self.slot, interaction.guild.id)
+        queue = get_custom_music_queue(self.slot, interaction.guild.id)
+        current = CUSTOM_MUSIC_NOW_PLAYING.get(key)
+        text = ""
+        if current:
+            text += f"🎵 **현재 재생 중**\n{current.get('service_emoji', '🎧')} {current['title']} `[{format_duration(current.get('duration'))}]`\n\n"
+        if queue:
+            text += "📜 **대기열**\n"
+            for i, track in enumerate(list(queue)[:10], start=1):
+                text += f"{i}. {track.get('service_emoji', '🎧')} {track['title']} `[{format_duration(track.get('duration'))}]`\n"
+        else:
+            text += "대기 중인 곡이 없어요."
+        embed = create_embed(f"📜 {self.slot}번 커스텀 봇 대기열", text[:4000], color=0x9B7CFF)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def loop_button(self, interaction: discord.Interaction):
+        key = custom_music_key(self.slot, interaction.guild.id)
+        CUSTOM_MUSIC_LOOP_ENABLED[key] = not CUSTOM_MUSIC_LOOP_ENABLED.get(key, False)
+        state = "켜짐" if CUSTOM_MUSIC_LOOP_ENABLED[key] else "꺼짐"
+        await interaction.response.send_message(f"🔁 {self.slot}번 커스텀 봇 반복 재생: **{state}**", ephemeral=True)
+
+    async def shuffle_button(self, interaction: discord.Interaction):
+        queue = get_custom_music_queue(self.slot, interaction.guild.id)
+        if len(queue) < 2:
+            return await interaction.response.send_message("❌ 섞을 대기열이 부족해요. 노래가 2곡 이상 있어야 합니다.", ephemeral=True)
+        items = list(queue)
+        random.shuffle(items)
+        queue.clear()
+        queue.extend(items)
+        await interaction.response.send_message(f"🔀 {self.slot}번 커스텀 봇 대기열 **{len(queue)}곡**을 랜덤으로 섞었어요.", ephemeral=True)
+
+    async def volume_button(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CustomMusicVolumeModal(self.slot))
+
+    async def leave_button(self, interaction: discord.Interaction):
+        vc = get_custom_music_voice_client(self.slot, interaction.guild.id)
+        key = custom_music_key(self.slot, interaction.guild.id)
+        CUSTOM_MUSIC_QUEUES.pop(key, None)
+        CUSTOM_MUSIC_NOW_PLAYING.pop(key, None)
+        CUSTOM_MUSIC_LOOP_ENABLED.pop(key, None)
+        CUSTOM_MUSIC_SKIP_VOTE_USERS.pop(key, None)
+        if vc:
+            await vc.disconnect(force=True)
+            return await interaction.response.send_message(f"❌ {self.slot}번 커스텀 봇 음악을 종료하고 음성 채널에서 나갔어요.", ephemeral=True)
+        await interaction.response.send_message("❌ 커스텀 봇이 음성 채널에 없어요.", ephemeral=True)
+
+
+class CustomMusicSlotSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    async def send_slot_panel(self, interaction: discord.Interaction, slot: int):
         if await reject_if_not_setup_manager(interaction):
             return
-        channel = resolve_custom_voice_channel(interaction.guild, str(self.voice_channel.value))
-        if channel is None:
-            return await interaction.response.send_message("❌ 음성채널을 찾지 못했어요. 정확한 채널 이름이나 ID를 입력해주세요.", ephemeral=True)
-        save_custom_voice_bot_setting(
-            interaction.guild.id,
-            self.slot,
-            str(self.bot_name.value).strip(),
-            str(self.avatar_url.value).strip(),
-            channel.id,
-            interaction.user.id,
-        )
         await interaction.response.defer(ephemeral=True)
-        result = await custom_bot_connect_slot(self.slot, interaction.guild.id, channel.id, str(self.bot_name.value).strip())
-        await interaction.followup.send(result, ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            return await interaction.followup.send("❌ 먼저 원하는 통방/음성채널에 들어간 다음 눌러주세요.", ephemeral=True)
+        result = await send_custom_music_panel_to_voice_channel(
+            interaction.guild,
+            slot,
+            interaction.user.voice.channel,
+            interaction.channel,
+            connect=True,
+        )
+        await interaction.followup.send(result[:1900], ephemeral=True)
+
+    @discord.ui.button(label="1번 뮤직패널", emoji="🎵", style=discord.ButtonStyle.green)
+    async def slot_one_music(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_slot_panel(interaction, 1)
+
+    @discord.ui.button(label="2번 뮤직패널", emoji="🎵", style=discord.ButtonStyle.green)
+    async def slot_two_music(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_slot_panel(interaction, 2)
+
+    @discord.ui.button(label="3번 뮤직패널", emoji="🎵", style=discord.ButtonStyle.green)
+    async def slot_three_music(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_slot_panel(interaction, 3)
+
 
 
 class CustomBotPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=600)
 
-    @discord.ui.button(label="1번 만들기/수정", emoji="🤖", style=discord.ButtonStyle.blurple)
-    async def slot_one(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await reject_if_not_setup_manager(interaction):
-            return
-        await interaction.response.send_modal(CustomBotConfigModal(1))
-
-    @discord.ui.button(label="2번 만들기/수정", emoji="🤖", style=discord.ButtonStyle.blurple)
-    async def slot_two(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await reject_if_not_setup_manager(interaction):
-            return
-        await interaction.response.send_modal(CustomBotConfigModal(2))
-
-    @discord.ui.button(label="3번 만들기/수정", emoji="🤖", style=discord.ButtonStyle.blurple)
-    async def slot_three(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await reject_if_not_setup_manager(interaction):
-            return
-        await interaction.response.send_modal(CustomBotConfigModal(3))
-
-    @discord.ui.button(label="저장된 봇 입장", emoji="🔊", style=discord.ButtonStyle.green)
-    async def connect_saved(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def invite_slot(self, interaction: discord.Interaction, slot: int):
         if await reject_if_not_setup_manager(interaction):
             return
         await interaction.response.defer(ephemeral=True)
-        rows = get_custom_voice_bot_rows(interaction.guild.id)
-        if not rows:
-            return await interaction.followup.send("❌ 아직 저장된 커스텀 봇이 없어요. 먼저 만들기/수정을 눌러주세요.", ephemeral=True)
-        messages = []
-        for slot, bot_name, avatar_url, voice_channel_id, enabled, updated_at in rows:
-            if enabled:
-                messages.append(await custom_bot_connect_slot(int(slot), interaction.guild.id, int(voice_channel_id or 0), bot_name or f"커스텀봇 {slot}"))
-        await interaction.followup.send("\n".join(messages)[:1900], ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            return await interaction.followup.send("❌ 먼저 초대할 통방/음성채널에 들어간 다음 눌러주세요.", ephemeral=True)
+        result = await send_custom_music_panel_to_voice_channel(
+            interaction.guild,
+            slot,
+            interaction.user.voice.channel,
+            interaction.channel,
+            connect=True,
+        )
+        await interaction.followup.send(result[:1900], ephemeral=True)
+
+    @discord.ui.button(label="1번 통방 초대", emoji="🤖", style=discord.ButtonStyle.green)
+    async def slot_one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.invite_slot(interaction, 1)
+
+    @discord.ui.button(label="2번 통방 초대", emoji="🤖", style=discord.ButtonStyle.green)
+    async def slot_two(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.invite_slot(interaction, 2)
+
+    @discord.ui.button(label="3번 통방 초대", emoji="🤖", style=discord.ButtonStyle.green)
+    async def slot_three(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.invite_slot(interaction, 3)
 
     @discord.ui.button(label="모두 퇴장", emoji="👋", style=discord.ButtonStyle.red)
     async def disconnect_all(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -18959,8 +19476,24 @@ class CustomBotPanelView(discord.ui.View):
             messages.append(await custom_bot_disconnect_slot(slot, interaction.guild.id))
         await interaction.followup.send("\n".join(messages), ephemeral=True)
 
+    @discord.ui.button(label="커스텀 뮤직패널", emoji="🎵", style=discord.ButtonStyle.blurple, row=1)
+    async def custom_music_panels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        embed = discord.Embed(
+            title="🎵 커스텀 봇 뮤직패널 선택",
+            description=(
+                "아래에서 뮤직패널을 열 보조 봇 번호를 선택하세요.\n"
+                "선택하면 내가 들어가 있는 통방으로 해당 봇을 초대하고,\n"
+                "그 통방의 채팅채널에 버튼형 음악 패널을 전송합니다."
+            ),
+            color=0x9B7CFF,
+        )
+        await interaction.response.send_message(embed=embed, view=CustomMusicSlotSelectView(), ephemeral=True)
 
-@bot.tree.command(name="커스텀", description="사진처럼 통방에 들어오는 커스텀 보조 봇을 만들고 관리합니다.")
+
+
+@bot.tree.command(name="커스텀", description="커스텀 보조 봇을 내가 있는 통방으로 초대하고 뮤직패널을 엽니다.")
 async def custom_bot_panel(interaction: discord.Interaction):
     if interaction.guild is None:
         return await interaction.response.send_message("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
