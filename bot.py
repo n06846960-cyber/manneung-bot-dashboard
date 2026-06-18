@@ -10620,14 +10620,100 @@ loop_enabled = {}
 volume_levels = {}
 skip_vote_users = {}
 
-YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "extract_flat": False,
-}
+def resolve_ytdlp_cookie_file():
+    """Render Secret File 또는 로컬 cookies.txt 경로를 자동으로 찾습니다."""
+    candidates = []
+
+    env_path = os.getenv("YTDLP_COOKIE_FILE", "").strip()
+    if env_path:
+        candidates.append(env_path)
+
+    # Render Secret Files 기본 경로
+    candidates.append("/etc/secrets/cookies.txt")
+
+    # 로컬 실행용: bot.py와 같은 폴더의 cookies.txt
+    try:
+        candidates.append(str((os.path.dirname(os.path.abspath(__file__)) and os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"))))
+    except Exception:
+        pass
+
+    # Windows 다운로드 폴더에 저장해둔 경우도 자동 탐색
+    try:
+        home = os.path.expanduser("~")
+        if home:
+            candidates.append(os.path.join(home, "Downloads", "cookies.txt"))
+    except Exception:
+        pass
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return env_path
+
+
+YTDLP_COOKIE_FILE = resolve_ytdlp_cookie_file()
+
+
+def check_ytdlp_cookie_file(path: str):
+    """cookies.txt가 yt-dlp가 읽을 수 있는 Netscape 형식인지 간단히 확인합니다."""
+    if not path or not os.path.exists(path):
+        return False, "쿠키 파일 없음"
+    try:
+        text = open(path, "r", encoding="utf-8", errors="ignore").read(200000)
+    except Exception as e:
+        return False, f"쿠키 파일 읽기 실패: {e}"
+
+    has_header = ("Netscape HTTP Cookie File" in text) or ("HTTP Cookie File" in text)
+    has_youtube = ("youtube.com" in text) or (".youtube.com" in text)
+    has_login_cookie = any(name in text for name in ["LOGIN_INFO", "SAPISID", "APISID", "__Secure-1PSID", "__Secure-3PSID"])
+    if not has_header:
+        return False, "Netscape 형식 아님"
+    if not has_youtube:
+        return False, "youtube.com 쿠키 없음"
+    if not has_login_cookie:
+        return False, "로그인 쿠키 부족"
+    return True, "정상으로 보임"
+
+
+def build_ytdl_options(format_value: str = None):
+    """YouTube가 특정 포맷을 막거나 Render IP를 의심해도 최대한 재시도할 수 있게 yt-dlp 옵션을 만듭니다."""
+    options = {
+        # 일부 영상에서 m4a/webm 중 하나만 열리는 경우가 있어서 여러 후보를 순서대로 둡니다.
+        "format": format_value or "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch1",
+        "source_address": "0.0.0.0",
+        "force_ipv4": True,
+        "extract_flat": False,
+        "geo_bypass": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 15,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+        "extractor_args": {
+            "youtube": {
+                # android 클라이언트에서 포맷이 비거나 쿠키가 덜 먹는 경우가 있어 web 우선으로 고정합니다.
+                "player_client": ["web"],
+            }
+        },
+    }
+    if YTDLP_COOKIE_FILE:
+        options["cookiefile"] = YTDLP_COOKIE_FILE
+    return options
+
+
+_cookie_ok, _cookie_msg = check_ytdlp_cookie_file(YTDLP_COOKIE_FILE)
+if YTDLP_COOKIE_FILE:
+    print(f"✅ yt-dlp cookies.txt 사용: {YTDLP_COOKIE_FILE} / 검사: {_cookie_msg}")
+else:
+    print("⚠️ yt-dlp cookies.txt를 찾지 못했습니다. YouTube 링크가 막힐 수 있습니다.")
+
+YTDL_OPTIONS = build_ytdl_options()
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -10731,28 +10817,38 @@ def build_music_search_query(query: str):
     service, _emoji = detect_music_service(query)
     lower = query.lower()
 
+    # Render 서버에서는 YouTube가 자주 봇 감지를 걸어서 cookies.txt를 넣어도 막힐 수 있습니다.
+    # 그래서 YouTube 직접 링크는 더 이상 시도하지 않고, 제목 검색은 SoundCloud 검색으로 우회합니다.
+    if re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I):
+        return "__YOUTUBE_DIRECT_LINK_BLOCKED__", "YouTube", query
+
+    # SoundCloud 직접 링크는 그대로 사용합니다.
+    if "soundcloud.com" in lower:
+        return query, "SoundCloud", query
+
     if service in {"Melon", "Genie Music"}:
         page_title = fetch_page_title(query) if lower.startswith(("http://", "https://")) else None
         keyword = page_title or query
         keyword = re.sub(r"https?://\S+", "", keyword).strip() or query
-        return f"ytsearch1:{keyword}", service, keyword
+        return f"scsearch1:{keyword}", service, keyword
 
-    return query, service, query
+    # 일반 노래 제목 검색은 YouTube 대신 SoundCloud를 먼저 사용합니다.
+    # 이렇게 해야 Render/무료 호스팅 IP에서 YouTube 봇 감지 오류가 거의 사라집니다.
+    keyword = re.sub(r"(youtube|유튜브)", "", query, flags=re.I).strip() or query
+    return f"scsearch1:{keyword}", "SoundCloud", keyword
 
 
 async def extract_music_info(query: str):
     loop = asyncio.get_running_loop()
 
-    def run_extract():
-        search_query, requested_service, searched_keyword = build_music_search_query(query)
-        info = ytdl.extract_info(search_query, download=False)
+    def _normalize_info(info, original_query, requested_service, searched_keyword):
         if "entries" in info:
             entries = [entry for entry in info["entries"] if entry]
             if not entries:
                 raise ValueError("검색 결과가 없습니다.")
             info = entries[0]
 
-        detected_service, service_emoji = detect_music_service(query, info)
+        detected_service, service_emoji = detect_music_service(original_query, info)
         if requested_service in {"Melon", "Genie Music"}:
             detected_service = requested_service
             service_emoji = "🍈" if requested_service == "Melon" else "🧞"
@@ -10760,18 +10856,65 @@ async def extract_music_info(query: str):
         return {
             "title": clean_music_title(info.get("title", "제목 없음")),
             "url": info.get("url"),
-            "webpage_url": info.get("webpage_url", query),
+            "webpage_url": info.get("webpage_url", original_query),
             "duration": info.get("duration", 0),
             "thumbnail": info.get("thumbnail"),
             "service": detected_service,
             "service_emoji": service_emoji,
-            "requested_query": query,
+            "requested_query": original_query,
             "searched_keyword": searched_keyword,
             "uploader": info.get("uploader") or info.get("channel") or "알 수 없음",
         }
 
-    return await loop.run_in_executor(None, run_extract)
+    def run_extract():
+        search_query, requested_service, searched_keyword = build_music_search_query(query)
+        if search_query == "__YOUTUBE_DIRECT_LINK_BLOCKED__":
+            raise ValueError(
+                "YouTube 링크는 Render/무료 호스팅에서 계속 봇 감지로 막힐 수 있어요. "
+                "링크 대신 노래 제목만 입력하거나 SoundCloud 링크를 사용해주세요. "
+                "예: `아이유 좋은날`, `뉴진스 Ditto`"
+            )
+        try:
+            local_ytdl = yt_dlp.YoutubeDL(build_ytdl_options())
+            info = local_ytdl.extract_info(search_query, download=False)
+            return _normalize_info(info, query, requested_service, searched_keyword)
+        except Exception as e:
+            error_text = str(e)
+            youtube_bot_blocked = "Sign in to confirm" in error_text or "not a bot" in error_text
+            format_blocked = "Requested format is not available" in error_text or "format is not available" in error_text
 
+            if format_blocked:
+                # 어떤 영상은 bestaudio 후보가 비어 있어서 포맷을 더 넓게 풀고 한 번 더 시도합니다.
+                try:
+                    fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options("best/bestaudio/bestvideo+bestaudio"))
+                    fallback_info = fallback_ytdl.extract_info(search_query, download=False)
+                    return _normalize_info(fallback_info, query, requested_service, searched_keyword)
+                except Exception as format_retry_error:
+                    error_text = str(format_retry_error)
+                    youtube_bot_blocked = youtube_bot_blocked or "Sign in to confirm" in error_text or "not a bot" in error_text
+
+            if youtube_bot_blocked:
+                cookie_ok, cookie_msg = check_ytdlp_cookie_file(YTDLP_COOKIE_FILE)
+                cookie_hint = f"현재 쿠키 경로: {YTDLP_COOKIE_FILE or '미설정'} / 쿠키 검사: {cookie_msg}"
+                is_direct_youtube_url = re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I)
+
+                # 유튜브 직접 링크가 아니라 제목 검색이면 SoundCloud로 한 번 더 시도합니다.
+                if not is_direct_youtube_url:
+                    try:
+                        fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options("bestaudio/best"))
+                        fallback_info = fallback_ytdl.extract_info(f"scsearch1:{query}", download=False)
+                        return _normalize_info(fallback_info, query, "SoundCloud", query)
+                    except Exception:
+                        pass
+
+                raise ValueError(
+                    "YouTube가 서버를 봇으로 감지해서 재생을 막았어요. "
+                    "cookies.txt가 적용되지 않았거나, 쿠키가 만료됐거나, 로그인 쿠키가 빠졌을 수 있어요. "
+                    f"{cookie_hint}"
+                )
+            raise
+
+    return await loop.run_in_executor(None, run_extract)
 
 def build_now_playing_embed(track: dict, *, queued: bool = False):
     status = "대기열 추가" if queued else "현재 재생 중"
