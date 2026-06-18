@@ -9,6 +9,7 @@ import asyncio
 import html
 import json
 import urllib.request
+import urllib.parse
 from collections import deque
 
 import yt_dlp
@@ -10812,15 +10813,38 @@ def fetch_page_title(url: str):
     return None
 
 
+
+
+def fetch_youtube_oembed_title(url: str):
+    """YouTube 직접 재생이 막힐 때 링크 제목만 안전하게 가져와 SoundCloud 검색어로 사용합니다."""
+    try:
+        encoded_url = urllib.parse.quote(url, safe="")
+        oembed_url = f"https://www.youtube.com/oembed?format=json&url={encoded_url}"
+        req = urllib.request.Request(
+            oembed_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read(100000)
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
+        title = clean_music_title(data.get("title", ""))
+        return title if title and title != "제목 없음" else None
+    except Exception:
+        return None
+
 def build_music_search_query(query: str):
     query = (query or "").strip()
     service, _emoji = detect_music_service(query)
     lower = query.lower()
 
-    # Render 서버에서는 YouTube가 자주 봇 감지를 걸어서 cookies.txt를 넣어도 막힐 수 있습니다.
-    # 그래서 YouTube 직접 링크는 더 이상 시도하지 않고, 제목 검색은 SoundCloud 검색으로 우회합니다.
+    # Render 서버에서는 YouTube 직접 음원 추출이 자주 봇 감지로 막힙니다.
+    # 그래도 사용자가 YouTube 링크를 붙여넣으면, 링크 제목만 가져와 SoundCloud에서 같은 제목을 검색해 재생합니다.
+    # 즉, 입력은 YouTube 링크로 가능하지만 실제 재생 소스는 SoundCloud가 될 수 있습니다.
     if re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I):
-        return "__YOUTUBE_DIRECT_LINK_BLOCKED__", "YouTube", query
+        youtube_title = fetch_youtube_oembed_title(query) or fetch_page_title(query)
+        if youtube_title:
+            return f"scsearch1:{youtube_title}", "YouTube 링크→SoundCloud", youtube_title
+        return "__YOUTUBE_TITLE_LOOKUP_FAILED__", "YouTube", query
 
     # SoundCloud 직접 링크는 그대로 사용합니다.
     if "soundcloud.com" in lower:
@@ -10834,7 +10858,7 @@ def build_music_search_query(query: str):
 
     # 일반 노래 제목 검색은 YouTube 대신 SoundCloud를 먼저 사용합니다.
     # 이렇게 해야 Render/무료 호스팅 IP에서 YouTube 봇 감지 오류가 거의 사라집니다.
-    keyword = re.sub(r"(youtube|유튜브)", "", query, flags=re.I).strip() or query
+    keyword = re.sub(r"\b(youtube|유튜브)\b", "", query, flags=re.I).strip() or query
     return f"scsearch1:{keyword}", "SoundCloud", keyword
 
 
@@ -10852,6 +10876,9 @@ async def extract_music_info(query: str):
         if requested_service in {"Melon", "Genie Music"}:
             detected_service = requested_service
             service_emoji = "🍈" if requested_service == "Melon" else "🧞"
+        elif str(requested_service).startswith("YouTube 링크"):
+            detected_service = requested_service
+            service_emoji = "▶️"
 
         return {
             "title": clean_music_title(info.get("title", "제목 없음")),
@@ -10868,11 +10895,11 @@ async def extract_music_info(query: str):
 
     def run_extract():
         search_query, requested_service, searched_keyword = build_music_search_query(query)
-        if search_query == "__YOUTUBE_DIRECT_LINK_BLOCKED__":
+        if search_query == "__YOUTUBE_TITLE_LOOKUP_FAILED__":
             raise ValueError(
-                "YouTube 링크는 Render/무료 호스팅에서 계속 봇 감지로 막힐 수 있어요. "
-                "링크 대신 노래 제목만 입력하거나 SoundCloud 링크를 사용해주세요. "
-                "예: `아이유 좋은날`, `뉴진스 Ditto`"
+                "YouTube 링크 제목을 가져오지 못했어요. "
+                "이 링크는 YouTube에서 외부 제목 조회도 막힌 상태라서 재생할 수 없어요. "
+                "SoundCloud 링크를 사용하거나 노래 제목으로 입력해주세요."
             )
         try:
             local_ytdl = yt_dlp.YoutubeDL(build_ytdl_options())
@@ -10931,7 +10958,13 @@ def build_now_playing_embed(track: dict, *, queued: bool = False):
     if service in {"Melon", "Genie Music"}:
         embed.add_field(
             name="📌 안내",
-            value="멜론/지니뮤직 링크·검색어는 제목을 기준으로 유튜브/사운드클라우드에서 찾아 재생해요.",
+            value="멜론/지니뮤직 링크·검색어는 제목을 기준으로 사운드클라우드에서 찾아 재생해요.",
+            inline=False,
+        )
+    if str(service).startswith("YouTube 링크"):
+        embed.add_field(
+            name="📌 안내",
+            value="YouTube 링크 입력은 받지만 Render에서 직접 재생이 막힐 수 있어 제목 기준으로 SoundCloud에서 찾아 재생했어요.",
             inline=False,
         )
     if track.get("thumbnail"):
