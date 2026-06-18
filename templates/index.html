@@ -17,3 +17,18 @@
 </a>
 </section>
 {% endblock %}
+
+{% if custom_bots %}
+<div class="card" style="margin-top: 20px;">
+  <h2>🤖 보조봇 초대하기</h2>
+  <p>원하는 보조봇을 선택해서 서버에 초대할 수 있어요.</p>
+
+  <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+    {% for bot in custom_bots %}
+      <a class="btn" href="{{ bot.invite_url }}" target="_blank">
+        {{ bot.name }}
+      </a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
