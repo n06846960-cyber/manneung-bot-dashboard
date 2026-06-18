@@ -1462,6 +1462,33 @@ def bot_invite_page():
     </html>
     """
 
+def make_custom_bot_invite_url(client_id):
+    return (
+        "https://discord.com/oauth2/authorize"
+        f"?client_id={client_id}"
+        "&permissions=8"
+        "&scope=bot%20applications.commands"
+    )
+
+
+@app.context_processor
+def inject_custom_bot_invites():
+    custom_bots = []
+
+    for i in range(1, 4):
+        client_id = os.getenv(f"CUSTOM_BOT_CLIENT_ID_{i}")
+
+        if client_id:
+            custom_bots.append({
+                "number": i,
+                "name": f"보조봇 {i} 초대하기",
+                "invite_url": make_custom_bot_invite_url(client_id)
+            })
+
+    return {
+        "custom_bots": custom_bots
+    }
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
