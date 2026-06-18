@@ -31,13 +31,11 @@
 
     <section class="card">
       <h2>🤖 보조봇 초대</h2>
-      <p class="mini">Render 환경변수 <code>CUSTOM_BOT_CLIENT_ID_1~3</code>에 Application ID를 넣으면 버튼이 자동으로 표시돼요.</p>
       {% if custom_bot_invites %}
         <div class="grid">
           {% for bot in custom_bot_invites %}
             <div class="bot">
               <h3>🎵 {{ bot.name }}</h3>
-              <p class="mini">Application ID {{ bot.client_id_masked }} · 권한값 {{ bot.permissions }}</p>
               <div class="actions" style="justify-content:flex-start;">
                 <a class="btn" href="{{ bot.invite_url }}">초대하기</a>
                 <button class="copy" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
@@ -46,7 +44,7 @@
           {% endfor %}
         </div>
       {% else %}
-        <p class="mini">아직 등록된 보조봇이 없어요. 사이트 서비스 Environment에 <code>CUSTOM_BOT_CLIENT_ID_1</code>부터 추가하고 재배포해주세요.</p>
+        <p class="mini">아직 등록된 보조봇이 없어요.</p>
       {% endif %}
       <p class="mini"><a style="color:white" href="{{ url_for('check_custom_bots') }}">환경변수 확인 페이지 열기</a></p>
     </section>

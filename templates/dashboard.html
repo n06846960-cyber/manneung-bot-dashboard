@@ -23,7 +23,6 @@
 
   <section id="custom-bots" class="card invite-card">
     <h2>🤖 보조봇 초대하기</h2>
-    <p>Render 환경변수 <code>CUSTOM_BOT_CLIENT_ID_1~3</code>에 넣은 Application ID로 초대 버튼을 자동 생성해요.</p>
     <div class="button-row" style="margin-bottom:12px;">
       <a class="invite-btn" href="{{ url_for('bot_invite_page') }}" target="_blank">초대 전용 페이지 열기</a>
       <a class="invite-btn" href="{{ url_for('check_custom_bots') }}" target="_blank">환경변수 확인</a>
@@ -35,7 +34,6 @@
         {% for bot in custom_bot_invites %}
           <div class="card">
             <h3>🎵 {{ bot.name }}</h3>
-            <p class="mini">슬롯 {{ bot.slot }} · Application ID {{ bot.client_id_masked }} · 권한값 {{ bot.permissions }}</p>
             <div class="invite-actions">
               <a class="invite-btn" href="{{ bot.invite_url }}" target="_blank">초대하기</a>
               <button class="invite-copy" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
@@ -44,7 +42,7 @@
         {% endfor %}
       </div>
     {% else %}
-      <p class="mini">아직 등록된 보조봇이 없어요. Render 사이트 서비스 Environment에 <code>CUSTOM_BOT_CLIENT_ID_1</code>부터 넣고 재배포해주세요.</p>
+      <p class="mini">아직 등록된 보조봇이 없어요.</p>
     {% endif %}
 
     <div class="grid" style="margin-top:12px;">

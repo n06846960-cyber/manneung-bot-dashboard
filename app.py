@@ -1266,7 +1266,7 @@ CUSTOM_BOTS_PAGE_TEMPLATE = """
     {% if invite_urls.get(slot) %}
       <a class="custom-btn custom-ghost" href="{{ invite_urls.get(slot) }}" target="_blank">➕ {{ slot }}번 보조 봇 서버에 초대</a>
     {% else %}
-      <p class="custom-note">초대 버튼을 쓰려면 Render 환경변수 <b>CUSTOM_BOT_CLIENT_ID_{{ slot }}</b>도 넣어주세요.</p>
+      <p class="custom-note">아직 초대 버튼이 준비되지 않았어요.</p>
     {% endif %}
   </section>
 {% endfor %}
@@ -1609,13 +1609,11 @@ def bot_invite_page():
 
                 <div class="card">
                     <h1>🎵 보조봇 초대</h1>
-                    <p>Render 환경변수 <code>CUSTOM_BOT_CLIENT_ID_1~3</code>에 등록한 보조봇만 자동으로 표시돼요.</p>
                     {% if custom_bots %}
                       <div class="grid">
                         {% for bot in custom_bots %}
                           <div class="card bot-card">
                             <h3>🤖 {{ bot.name }}</h3>
-                            <p class="sub">Application ID: {{ bot.client_id_masked }}</p>
                             <div class="actions">
                               <a class="btn" href="{{ bot.invite_url }}">초대하기</a>
                               <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
@@ -1624,7 +1622,7 @@ def bot_invite_page():
                         {% endfor %}
                       </div>
                     {% else %}
-                      <p>아직 등록된 보조봇이 없어요. Render 환경변수에 <code>CUSTOM_BOT_CLIENT_ID_1</code>부터 추가해주세요.</p>
+                      <p>아직 등록된 보조봇이 없어요.</p>
                     {% endif %}
                     <a class="back" href="{{ url_for('check_custom_bots') }}">환경변수 확인하기</a>
                 </div>
