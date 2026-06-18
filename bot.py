@@ -10909,6 +10909,18 @@ def resolve_ytdlp_cookie_file():
 
 YTDLP_COOKIE_FILE = resolve_ytdlp_cookie_file()
 
+# YouTube 영상마다 제공 포맷이 달라서 특정 포맷만 고르면
+# "Requested format is not available" 오류가 날 수 있습니다.
+# 아래처럼 오디오 후보를 넓게 두고, 실패하면 여러 클라이언트/포맷으로 재시도합니다.
+YTDLP_SAFE_AUDIO_FORMAT = "bestaudio[acodec!=none]/best[acodec!=none]/bestaudio/best"
+YTDLP_FALLBACK_PROFILES = [
+    (YTDLP_SAFE_AUDIO_FORMAT, ["android", "ios", "web"]),
+    ("bestaudio/best", ["ios", "android", "web"]),
+    ("best[acodec!=none]/bestaudio/best", ["web", "android", "ios"]),
+    ("worstaudio[acodec!=none]/worst[acodec!=none]/best", ["android", "web", "ios"]),
+    ("best", ["ios", "android", "web"]),
+]
+
 
 def check_ytdlp_cookie_file(path: str):
     """cookies.txt가 yt-dlp가 읽을 수 있는 Netscape 형식인지 간단히 확인합니다."""
@@ -10933,28 +10945,35 @@ def check_ytdlp_cookie_file(path: str):
 
 def build_ytdl_options(format_value: str = None, player_clients=None):
     """YouTube가 특정 포맷을 막아도 여러 포맷/클라이언트로 재시도할 수 있게 yt-dlp 옵션을 만듭니다."""
-    clients = player_clients or ["android", "web", "ios"]
+    clients = player_clients or ["android", "ios", "web"]
     options = {
-        # Render에서 YouTube가 일부 m4a/webm 포맷을 안 주는 경우가 있어 가장 넓은 오디오 후보를 기본으로 둡니다.
-        "format": format_value or "bestaudio/best",
+        # 특정 m4a/webm/format id에 고정하지 않고, 오디오가 있는 후보를 넓게 허용합니다.
+        "format": format_value or YTDLP_SAFE_AUDIO_FORMAT,
+        "format_sort": ["hasaud", "abr", "tbr", "filesize"],
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "default_search": "ytsearch1",
         "source_address": "0.0.0.0",
         "force_ipv4": True,
+        "skip_download": True,
+        "cachedir": False,
         "extract_flat": False,
         "geo_bypass": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 15,
+        "nocheckcertificate": True,
+        # 포맷 선택이 실패해도 가능한 정보/formats를 최대한 받아서 아래 코드에서 직접 고릅니다.
+        "ignore_no_formats_error": True,
+        "retries": 8,
+        "fragment_retries": 8,
+        "extractor_retries": 3,
+        "socket_timeout": 20,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         },
         "extractor_args": {
             "youtube": {
-                # web 하나만 쓰면 Requested format is not available 이 뜨는 영상이 있어서 여러 클라이언트를 순서대로 시도합니다.
+                # web 하나만 쓰면 일부 영상에서 포맷/봇감지 오류가 나서 여러 클라이언트를 순서대로 시도합니다.
                 "player_client": clients,
             }
         },
@@ -11215,34 +11234,36 @@ async def extract_music_info(query: str, preferred_source: str = None):
             return _normalize_info(info, query, requested_service, searched_keyword)
         except Exception as e:
             error_text = str(e)
-            youtube_bot_blocked = "Sign in to confirm" in error_text or "not a bot" in error_text
-            format_blocked = "Requested format is not available" in error_text or "format is not available" in error_text
+            lower_error = error_text.lower()
+            youtube_bot_blocked = "sign in to confirm" in lower_error or "not a bot" in lower_error
+            format_blocked = (
+                "requested format is not available" in lower_error
+                or "format is not available" in lower_error
+                or "requested formats are incompatible" in lower_error
+                or "no video formats found" in lower_error
+            )
 
             if format_blocked:
                 # YouTube가 선택된 포맷을 안 줄 때 포맷/클라이언트를 여러 조합으로 다시 시도합니다.
-                retry_profiles = [
-                    ("bestaudio/best", ["android", "web", "ios"]),
-                    ("best[acodec!=none]/bestaudio/best", ["web", "android", "ios"]),
-                    ("best", ["ios", "android", "web"]),
-                ]
                 last_retry_error = error_text
-                for retry_format, retry_clients in retry_profiles:
+                for retry_format, retry_clients in YTDLP_FALLBACK_PROFILES:
                     try:
                         fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options(retry_format, retry_clients))
                         fallback_info = fallback_ytdl.extract_info(search_query, download=False)
                         return _normalize_info(fallback_info, query, requested_service, searched_keyword)
                     except Exception as format_retry_error:
                         last_retry_error = str(format_retry_error)
-                        youtube_bot_blocked = youtube_bot_blocked or "Sign in to confirm" in last_retry_error or "not a bot" in last_retry_error
+                        lower_retry_error = last_retry_error.lower()
+                        youtube_bot_blocked = youtube_bot_blocked or "sign in to confirm" in lower_retry_error or "not a bot" in lower_retry_error
 
-                # 그래도 안 되면 YouTube 제목 검색만 SoundCloud로 자동 우회합니다.
-                if requested_service == "YouTube 제목 검색":
-                    try:
-                        fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options("bestaudio/best"))
-                        fallback_info = fallback_ytdl.extract_info(f"scsearch1:{searched_keyword or query}", download=False)
-                        return _normalize_info(fallback_info, query, "SoundCloud 제목 검색", searched_keyword or query)
-                    except Exception:
-                        pass
+                # 그래도 안 되면 제목 기준으로 SoundCloud에 자동 우회합니다.
+                # 이렇게 하면 YouTube 특정 영상의 포맷이 막혀도 음악 재생 자체가 멈추는 일을 줄일 수 있습니다.
+                try:
+                    fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options(YTDLP_SAFE_AUDIO_FORMAT, ["android", "ios", "web"]))
+                    fallback_info = fallback_ytdl.extract_info(f"scsearch1:{searched_keyword or query}", download=False)
+                    return _normalize_info(fallback_info, query, "SoundCloud 제목 검색", searched_keyword or query)
+                except Exception:
+                    pass
                 error_text = last_retry_error
 
             if youtube_bot_blocked:
