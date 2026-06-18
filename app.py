@@ -339,6 +339,31 @@ def ensure_tables(con):
     cur.execute("""CREATE TABLE IF NOT EXISTS support_settings (guild_id INTEGER PRIMARY KEY,support_invite TEXT,dashboard_url TEXT,welcome_title TEXT,welcome_description TEXT,welcome_channel_id INTEGER DEFAULT 0,updated_at TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS clean_settings (guild_id INTEGER PRIMARY KEY,max_delete INTEGER DEFAULT 0,batch_size INTEGER DEFAULT 100,delay_seconds REAL DEFAULT 1.0,log_enabled INTEGER DEFAULT 1,updated_at TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS feature_flags (guild_id INTEGER,feature_key TEXT,is_enabled INTEGER DEFAULT 1,updated_at TEXT,PRIMARY KEY (guild_id, feature_key))""")
+
+    # 커스텀 보조 봇 슬롯 설정
+    # 실제 봇 토큰은 Render 환경변수 CUSTOM_BOT_TOKEN_1~3에 저장하고,
+    # 이 테이블은 서버별로 어떤 슬롯을 어떤 통방/음성채널에 연결할지만 저장합니다.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS custom_voice_bots (
+            guild_id INTEGER,
+            slot INTEGER,
+            bot_name TEXT,
+            avatar_url TEXT,
+            voice_channel_id INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            created_by INTEGER DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY (guild_id, slot)
+        )
+    """)
+    for col, default in {
+        "avatar_url": "TEXT",
+        "voice_channel_id": "INTEGER DEFAULT 0",
+        "enabled": "INTEGER DEFAULT 1",
+        "created_by": "INTEGER DEFAULT 0",
+        "updated_at": "TEXT",
+    }.items():
+        ensure_column(cur, "custom_voice_bots", col, default)
     con.commit()
 
 def discord_headers(token=None):
@@ -1130,6 +1155,234 @@ def api_channel_settings(guild_id):
         "settings": dict(row) if row else {},
         "fields": CHANNEL_SETTING_GROUPS,
     })
+
+
+# =========================
+# 커스텀 보조 봇 대시보드
+# =========================
+CUSTOM_BOT_SLOT_COUNT = 3
+CUSTOM_BOT_INVITE_PERMISSIONS = os.getenv("CUSTOM_BOT_INVITE_PERMISSIONS", "8").strip()
+
+
+def custom_bot_token_status(slot: int):
+    return bool(os.getenv(f"CUSTOM_BOT_TOKEN_{slot}", "").strip())
+
+
+def custom_bot_client_id(slot: int):
+    return os.getenv(f"CUSTOM_BOT_CLIENT_ID_{slot}", "").strip()
+
+
+def custom_bot_invite_url(slot: int, guild_id=None):
+    client_id = custom_bot_client_id(slot)
+    if not client_id:
+        return ""
+    base = "https://discord.com/oauth2/authorize"
+    url = (
+        f"{base}?client_id={client_id}"
+        f"&permissions={CUSTOM_BOT_INVITE_PERMISSIONS}"
+        f"&integration_type=0"
+        f"&scope=bot"
+    )
+    if guild_id:
+        url += f"&guild_id={guild_id}&disable_guild_select=true"
+    return url
+
+
+def voice_channels(channels):
+    return [c for c in channels if c.get("type") == 2]
+
+
+CUSTOM_BOTS_PAGE_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<style>
+.custom-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
+.custom-card { padding:18px; border-radius:18px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.06); }
+.custom-card h2 { margin:0 0 10px; }
+.custom-card label { display:block; margin:10px 0 6px; font-weight:700; }
+.custom-card input,.custom-card select { width:100%; padding:10px; border-radius:10px; border:1px solid rgba(255,255,255,.18); box-sizing:border-box; }
+.custom-card button,.custom-btn { display:inline-block; border:0; border-radius:999px; padding:10px 14px; font-weight:800; text-decoration:none; cursor:pointer; margin-top:10px; }
+.custom-save { background:linear-gradient(135deg,#ff7ac8,#8c7bff); color:white; }
+.custom-danger { background:#ff5f7a; color:white; }
+.custom-ghost { background:rgba(255,255,255,.12); color:inherit; }
+.custom-note { opacity:.82; line-height:1.6; }
+.badge { display:inline-block; padding:5px 9px; border-radius:999px; font-size:12px; font-weight:800; }
+.ok { background:rgba(87,242,135,.16); color:#57f287; }
+.warn { background:rgba(255,214,102,.16); color:#ffd666; }
+</style>
+
+<h1>🤖 커스텀 봇 추가</h1>
+<p class="custom-note">
+  이 페이지에서 서버별 커스텀 봇 1~3번 슬롯을 추가/수정할 수 있어요.<br>
+  실제 보조 봇은 Render 환경변수 <b>CUSTOM_BOT_TOKEN_1~3</b>에 토큰이 있어야 온라인이 됩니다.
+</p>
+<p>
+  <a class="custom-btn custom-ghost" href="{{ url_for('dashboard', guild_id=guild_id) }}">← 대시보드로 돌아가기</a>
+  <a class="custom-btn custom-ghost" href="{{ url_for('channel_settings_page', guild_id=guild_id) }}">📦 채널 연결</a>
+</p>
+
+<div class="custom-grid">
+{% for slot in [1,2,3] %}
+  {% set row = custom_bots.get(slot) %}
+  <section class="custom-card">
+    <h2>🎧 {{ slot }}번 커스텀 봇</h2>
+    {% if token_status.get(slot) %}
+      <span class="badge ok">✅ 토큰 있음</span>
+    {% else %}
+      <span class="badge warn">⚠️ CUSTOM_BOT_TOKEN_{{ slot }} 없음</span>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('save_custom_bot_slot', guild_id=guild_id, slot=slot) }}">
+      <label>봇 표시 이름</label>
+      <input name="bot_name" maxlength="32" value="{{ row.bot_name if row else '커스텀봇 ' ~ slot }}" placeholder="예: 만능 뮤직 {{ slot }}">
+
+      <label>입장할 통방/음성채널</label>
+      <select name="voice_channel_id" required>
+        <option value="0">통방/음성채널 선택</option>
+        {% for c in voice_channels %}
+          <option value="{{ c.id }}" {% if row and (row.voice_channel_id|string)==(c.id|string) %}selected{% endif %}>🔊 {{ c.name }}</option>
+        {% endfor %}
+      </select>
+
+      <label>프로필 이미지 URL 선택사항</label>
+      <input name="avatar_url" maxlength="500" value="{{ row.avatar_url if row else '' }}" placeholder="https://...">
+
+      <label style="display:flex;align-items:center;gap:8px;font-weight:700;">
+        <input type="checkbox" name="enabled" value="1" style="width:auto;" {% if not row or row.enabled %}checked{% endif %}>
+        활성화
+      </label>
+
+      <button class="custom-save" type="submit">✅ {{ slot }}번 커스텀 봇 추가/저장</button>
+    </form>
+
+    {% if row %}
+      <form method="post" action="{{ url_for('delete_custom_bot_slot', guild_id=guild_id, slot=slot) }}" onsubmit="return confirm('{{ slot }}번 커스텀 봇 설정을 삭제할까요?');">
+        <button class="custom-danger" type="submit">🗑️ 설정 삭제</button>
+      </form>
+      <p class="custom-note">최근 수정: {{ row.updated_at or '기록 없음' }}</p>
+    {% endif %}
+
+    {% if invite_urls.get(slot) %}
+      <a class="custom-btn custom-ghost" href="{{ invite_urls.get(slot) }}" target="_blank">➕ {{ slot }}번 보조 봇 서버에 초대</a>
+    {% else %}
+      <p class="custom-note">초대 버튼을 쓰려면 Render 환경변수 <b>CUSTOM_BOT_CLIENT_ID_{{ slot }}</b>도 넣어주세요.</p>
+    {% endif %}
+  </section>
+{% endfor %}
+</div>
+
+<section class="custom-card" style="margin-top:18px;">
+  <h2>사용 순서</h2>
+  <p class="custom-note">
+    1. Discord Developer Portal에서 보조 봇 1~3개를 만들고 서버에 초대<br>
+    2. Render Environment에 <b>CUSTOM_BOT_TOKEN_1</b>, <b>CUSTOM_BOT_TOKEN_2</b>, <b>CUSTOM_BOT_TOKEN_3</b> 입력<br>
+    3. 여기에서 각 슬롯의 이름과 통방을 저장<br>
+    4. Discord에서 <b>/커스텀</b> 실행 후 1번/2번/3번 통방 입장 사용
+  </p>
+</section>
+{% endblock %}
+"""
+
+
+CUSTOM_BOTS_SELECT_SERVER_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<h1>🤖 커스텀 봇 서버 선택</h1>
+<p>커스텀 봇을 추가할 서버를 선택해주세요.</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;">
+{% for g in guilds %}
+  <section style="padding:18px;border-radius:16px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);">
+    <h2 style="margin-top:0;">{{ g.name }}</h2>
+    <a style="display:inline-block;padding:10px 14px;border-radius:999px;background:linear-gradient(135deg,#ff7ac8,#8c7bff);color:white;text-decoration:none;font-weight:800;" href="{{ url_for('custom_bots_page', guild_id=g.id) }}">커스텀 봇 추가</a>
+  </section>
+{% endfor %}
+</div>
+{% endblock %}
+"""
+
+
+@app.route("/custom-bots")
+@login_required
+def custom_bots_select_server():
+    return render_template_string(CUSTOM_BOTS_SELECT_SERVER_TEMPLATE, guilds=fetch_user_guilds())
+
+
+@app.route("/dashboard/<guild_id>/custom-bots")
+@login_required
+def custom_bots_page(guild_id):
+    if not require_admin_guild(guild_id):
+        flash("이 서버를 설정할 관리자 권한이 없어요.")
+        return redirect(url_for("servers"))
+    channels = fetch_channels(guild_id)
+    con = db()
+    rows = con.execute(
+        "SELECT slot, bot_name, avatar_url, voice_channel_id, enabled, updated_at FROM custom_voice_bots WHERE guild_id=? ORDER BY slot",
+        (guild_id,),
+    ).fetchall()
+    con.close()
+    custom_bots = {int(r["slot"]): dict(r) for r in rows}
+    token_status = {slot: custom_bot_token_status(slot) for slot in range(1, CUSTOM_BOT_SLOT_COUNT + 1)}
+    invite_urls = {slot: custom_bot_invite_url(slot, guild_id) for slot in range(1, CUSTOM_BOT_SLOT_COUNT + 1)}
+    return render_template_string(
+        CUSTOM_BOTS_PAGE_TEMPLATE,
+        guild_id=guild_id,
+        channels=channels,
+        voice_channels=voice_channels(channels),
+        custom_bots=custom_bots,
+        token_status=token_status,
+        invite_urls=invite_urls,
+    )
+
+
+@app.route("/dashboard/<guild_id>/custom-bots/<int:slot>/save", methods=["POST"])
+@login_required
+def save_custom_bot_slot(guild_id, slot):
+    if not require_admin_guild(guild_id):
+        return redirect(url_for("servers"))
+    if slot < 1 or slot > CUSTOM_BOT_SLOT_COUNT:
+        flash("커스텀 봇 슬롯은 1~3번만 사용할 수 있어요.")
+        return redirect(url_for("custom_bots_page", guild_id=guild_id))
+
+    bot_name = (request.form.get("bot_name") or f"커스텀봇 {slot}").strip()[:32]
+    avatar_url = (request.form.get("avatar_url") or "").strip()[:500]
+    voice_channel_id = as_int(request.form.get("voice_channel_id"), 0)
+    enabled = as_bool_form("enabled")
+
+    if not voice_channel_id:
+        flash("입장할 통방/음성채널을 선택해주세요.")
+        return redirect(url_for("custom_bots_page", guild_id=guild_id))
+
+    con = db()
+    con.execute(
+        """
+        INSERT INTO custom_voice_bots(guild_id, slot, bot_name, avatar_url, voice_channel_id, enabled, created_by, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+        ON CONFLICT(guild_id, slot) DO UPDATE SET
+            bot_name=excluded.bot_name,
+            avatar_url=excluded.avatar_url,
+            voice_channel_id=excluded.voice_channel_id,
+            enabled=excluded.enabled,
+            created_by=excluded.created_by,
+            updated_at=excluded.updated_at
+        """,
+        (guild_id, slot, bot_name, avatar_url, voice_channel_id, enabled, current_user_id()),
+    )
+    con.commit(); con.close()
+    flash(f"{slot}번 커스텀 봇 설정을 저장했어요. Discord에서 /커스텀으로 입장시킬 수 있어요.")
+    return redirect(url_for("custom_bots_page", guild_id=guild_id))
+
+
+@app.route("/dashboard/<guild_id>/custom-bots/<int:slot>/delete", methods=["POST"])
+@login_required
+def delete_custom_bot_slot(guild_id, slot):
+    if not require_admin_guild(guild_id):
+        return redirect(url_for("servers"))
+    con = db()
+    con.execute("DELETE FROM custom_voice_bots WHERE guild_id=? AND slot=?", (guild_id, slot))
+    con.commit(); con.close()
+    flash(f"{slot}번 커스텀 봇 설정을 삭제했어요.")
+    return redirect(url_for("custom_bots_page", guild_id=guild_id))
+
 
 
 # =========================
