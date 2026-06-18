@@ -10,3 +10,5 @@ edge-tts
 Pillow
 Flask
 python-dotenv
+discord.py[voice]
+PyNaCl
