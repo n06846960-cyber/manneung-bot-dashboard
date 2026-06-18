@@ -2,13 +2,6 @@ Flask==3.0.3
 requests==2.32.3
 python-dotenv==1.0.1
 gunicorn
-discord.py
 yt-dlp
-PyNaCl
-gTTS
-edge-tts
-Pillow
-Flask
-python-dotenv
 discord.py[voice]
 PyNaCl
