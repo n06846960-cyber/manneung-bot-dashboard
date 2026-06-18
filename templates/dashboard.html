@@ -7,6 +7,8 @@
   .card{padding:18px;border:1px solid rgba(255,255,255,.12);border-radius:18px;margin:16px 0;background:rgba(255,255,255,.035)}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
   label{display:block;font-weight:700}input,textarea,select{width:100%;box-sizing:border-box;margin-top:6px;margin-bottom:10px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.22);color:inherit}textarea{min-height:100px}button{padding:10px 14px;border-radius:12px;border:0;font-weight:800;cursor:pointer}.mini{font-size:.88em;opacity:.75}.list{padding:10px;border-radius:12px;background:rgba(0,0,0,.16);margin:8px 0}.danger{background:#ff6b6b;color:#111}.ok{background:#9be28f;color:#111}.wide{grid-column:1/-1}.preview{white-space:pre-wrap;padding:12px;border-radius:12px;background:rgba(0,0,0,.22)}.button-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.send{background:#8ecbff;color:#111}
+
+  .invite-card{position:relative;overflow:hidden}.invite-card:before{content:"";position:absolute;inset:-80px auto auto -80px;width:180px;height:180px;background:rgba(255,182,193,.16);border-radius:50%;pointer-events:none}.invite-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.invite-btn{display:inline-block;padding:10px 13px;border-radius:12px;text-decoration:none;font-weight:800;background:#ff9ed8;color:#111}.invite-copy{padding:10px 13px;border-radius:12px;border:0;font-weight:800;background:rgba(255,255,255,.16);color:inherit}.env-ok{color:#9be28f;font-weight:800}.env-bad{color:#ff9a9a;font-weight:800}
 </style>
 <div class="dash-wrap">
   <div class="hero">
@@ -16,8 +18,51 @@
   </div>
 
   <div class="tabs">
-    <a href="#guild-settings">📦 전체 채널</a><a href="#welcome">🌸 환영</a><a href="#security">🛡️ 보안</a><a href="#embeds">🧩 임베드</a><a href="#recruit">🌸 구인구직</a><a href="#economy">💰 경제</a><a href="#mission">🎯 미션</a><a href="#coupon">🎟️ 쿠폰</a><a href="#title">🏷️ 칭호</a><a href="#devlog">📈 개발로그</a><a href="#support">💬 지원서버</a><a href="#clean">🧹 청소</a><a href="#event">🎉 이벤트</a>
+    <a href="#custom-bots">🤖 보조봇 초대</a><a href="#guild-settings">📦 전체 채널</a><a href="#welcome">🌸 환영</a><a href="#security">🛡️ 보안</a><a href="#embeds">🧩 임베드</a><a href="#recruit">🌸 구인구직</a><a href="#economy">💰 경제</a><a href="#mission">🎯 미션</a><a href="#coupon">🎟️ 쿠폰</a><a href="#title">🏷️ 칭호</a><a href="#devlog">📈 개발로그</a><a href="#support">💬 지원서버</a><a href="#clean">🧹 청소</a><a href="#event">🎉 이벤트</a>
   </div>
+
+  <section id="custom-bots" class="card invite-card">
+    <h2>🤖 보조봇 초대하기</h2>
+    <p>Render 환경변수 <code>CUSTOM_BOT_CLIENT_ID_1~3</code>에 넣은 Application ID로 초대 버튼을 자동 생성해요.</p>
+    <div class="button-row" style="margin-bottom:12px;">
+      <a class="invite-btn" href="{{ url_for('bot_invite_page') }}" target="_blank">초대 전용 페이지 열기</a>
+      <a class="invite-btn" href="{{ url_for('check_custom_bots') }}" target="_blank">환경변수 확인</a>
+      {% if main_bot_invite_url %}<a class="invite-btn" href="{{ main_bot_invite_url }}" target="_blank">메인 봇 초대</a>{% endif %}
+    </div>
+
+    {% if custom_bot_invites %}
+      <div class="grid">
+        {% for bot in custom_bot_invites %}
+          <div class="card">
+            <h3>🎵 {{ bot.name }}</h3>
+            <p class="mini">슬롯 {{ bot.slot }} · Application ID {{ bot.client_id_masked }} · 권한값 {{ bot.permissions }}</p>
+            <div class="invite-actions">
+              <a class="invite-btn" href="{{ bot.invite_url }}" target="_blank">초대하기</a>
+              <button class="invite-copy" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="mini">아직 등록된 보조봇이 없어요. Render 사이트 서비스 Environment에 <code>CUSTOM_BOT_CLIENT_ID_1</code>부터 넣고 재배포해주세요.</p>
+    {% endif %}
+
+    <div class="grid" style="margin-top:12px;">
+      {% for item in custom_bot_env_status %}
+        <div class="list">
+          <b>{{ item.name }}</b><br>
+          <code>{{ item.key }}</code><br>
+          {% if item.valid %}
+            <span class="env-ok">✅ 정상</span> <span class="mini">{{ item.masked }}</span>
+          {% elif item.exists %}
+            <span class="env-bad">⚠️ 숫자 형식 아님</span>
+          {% else %}
+            <span class="env-bad">❌ 미등록</span>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </section>
 
   <section id="guild-settings" class="card">
     <h2>📦 서버 채널 연결 전체 업그레이드</h2>
