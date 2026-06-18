@@ -9,7 +9,6 @@ import asyncio
 import html
 import json
 import urllib.request
-import urllib.parse
 from collections import deque
 
 import yt_dlp
@@ -5046,7 +5045,7 @@ async def build_music_panel_embed():
     return create_embed(
         "🎵 만능 봇 뮤직 패널",
         "아래 버튼으로 음악을 조작할 수 있어요.\n\n"
-        "🎶 **재생** - 노래 제목/링크 입력\n"
+        "🎶 **사클 제목/유튜브 제목** - 원하는 검색 기준으로 제목 입력\n"
         "⏸️ **일시정지** - 현재 곡 멈춤\n"
         "▶️ **다시재생** - 일시정지 해제\n"
         "⏭️ **스킵 투표** - 음성방 사람 수만큼 투표하면 다음 곡으로 이동\n"
@@ -5055,7 +5054,7 @@ async def build_music_panel_embed():
         "🔀 **셔플** - 대기열 랜덤 섞기\n"
         "🔊 **볼륨** - 볼륨 설정\n"
         "❌ **종료** - 음성 채널에서 나가기\n\n"
-        "유튜브 검색/링크, 사운드클라우드 링크, 멜론/지니뮤직 링크·검색어를 지원합니다.\n"
+        "유튜브 링크 대신 영상 제목을 그대로 붙여넣어 검색할 수 있습니다. 사운드클라우드 링크도 지원합니다.\n"
         "멜론/지니뮤직은 원곡 파일을 직접 가져오는 방식이 아니라 제목을 찾아 유튜브/사운드클라우드에서 재생합니다."
     )
 
@@ -8698,6 +8697,257 @@ async def tts_voice_list_command(interaction: discord.Interaction):
 
 
 
+
+# =========================
+# 뮤직 채팅 자동 재생
+# =========================
+# 뮤직패널 버튼을 누르지 않아도, 연결된 채팅채널에 제목을 치면 바로 재생됩니다.
+# 검색 기준은 `사클: 제목`, `유튜브: 제목`처럼 따로 선택할 수 있습니다.
+
+MUSIC_CHAT_SKIP_WORDS = {
+    "", "안녕", "하이", "ㅎㅇ", "ㅋㅋ", "ㅋㅋㅋ", "ㅠㅠ", "ㄱㄱ", "ㄴㄴ",
+    "재생", "스킵", "대기열", "볼륨", "종료", "일시정지", "다시재생",
+}
+
+
+def normalize_music_chat_name(name: str):
+    return re.sub(r"[^0-9a-zA-Z가-힣]", "", (name or "").lower())
+
+
+def parse_music_chat_request(content: str):
+    """채팅으로 입력한 재생 요청을 분석합니다.
+
+    지원 예시:
+    - 사클: 오늘 하루도 고생한 당신에게 피아노 모음
+    - 유튜브: 오늘 하루도 고생한 당신에게 피아노 모음
+    - 1번 사클: 제목
+    - 2 유튜브: 제목
+    - 제목만 입력하면 기본값은 SoundCloud 제목 검색
+    """
+    raw = (content or "").strip()
+    if not raw or raw.startswith(("!", ".", "/")):
+        return None
+    if len(raw) > 300:
+        raw = raw[:300].strip()
+
+    lowered = raw.lower().strip()
+    if normalize_music_chat_name(lowered) in {normalize_music_chat_name(w) for w in MUSIC_CHAT_SKIP_WORDS}:
+        return None
+
+    requested_slot = None
+    slot_match = re.match(r"^\s*(?:커스텀\s*)?([123])\s*(?:번)?\s*[:：\-]?\s+(.+)$", raw)
+    if slot_match:
+        requested_slot = int(slot_match.group(1))
+        raw = slot_match.group(2).strip()
+        lowered = raw.lower().strip()
+
+    # parse_music_source_prefix는 `사클:` / `유튜브:` 접두어를 처리합니다.
+    source, query = parse_music_source_prefix(raw)
+
+    if not source:
+        source_words = [
+            ("soundcloud", ["사클 ", "사클검색 ", "사운드클라우드 ", "soundcloud ", "sc "]),
+            ("youtube", ["유튜브 ", "유튜브검색 ", "youtube ", "yt "]),
+        ]
+        for source_name, prefixes in source_words:
+            for prefix in prefixes:
+                if lowered.startswith(prefix):
+                    source = source_name
+                    query = raw[len(prefix):].strip()
+                    break
+            if source:
+                break
+
+    if not source:
+        source = "soundcloud"
+        query = raw
+
+    query = (query or "").strip()
+    if not query or normalize_music_chat_name(query) in {normalize_music_chat_name(w) for w in MUSIC_CHAT_SKIP_WORDS}:
+        return None
+
+    return {"slot": requested_slot, "source": source, "query": query}
+
+
+def is_main_music_chat_channel(guild: discord.Guild, channel):
+    if guild is None or channel is None:
+        return False
+    channel_id = int(getattr(channel, "id", 0) or 0)
+
+    for column in ("music_command_channel_id", "music_now_playing_channel_id", "music_queue_channel_id"):
+        try:
+            saved_id = int(get_saved_channel_id(guild.id, column) or 0)
+        except Exception:
+            saved_id = 0
+        if saved_id and saved_id == channel_id:
+            return True
+
+    name_norm = normalize_music_chat_name(getattr(channel, "name", ""))
+    music_keywords = ["뮤직", "음악", "노래", "재생", "music", "song", "nowplaying", "현재재생"]
+    return any(keyword in name_norm for keyword in music_keywords)
+
+
+def is_channel_for_custom_music_chat(guild: discord.Guild, slot: int, channel, voice_channel):
+    if guild is None or channel is None or voice_channel is None:
+        return False
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    voice_id = int(getattr(voice_channel, "id", 0) or 0)
+
+    # 음성채널 자체의 채팅에 입력한 경우
+    if channel_id and voice_id and channel_id == voice_id:
+        return True
+
+    resolved = resolve_custom_music_text_channel(guild, voice_channel, None)
+    if resolved and int(getattr(resolved, "id", 0) or 0) == channel_id:
+        return True
+
+    # 같은 카테고리의 통방/뮤직/채팅 채널도 허용합니다.
+    if getattr(channel, "category_id", None) == getattr(voice_channel, "category_id", None):
+        name_norm = normalize_music_chat_name(getattr(channel, "name", ""))
+        if any(keyword in name_norm for keyword in ["통방", "채팅", "뮤직", "음악", "노래", "music", "chat"]):
+            return True
+    return False
+
+
+def find_custom_music_slot_for_chat(message: discord.Message, requested_slot: int | None):
+    if message.guild is None:
+        return None, None
+    author_voice = getattr(getattr(message.author, "voice", None), "channel", None)
+    if author_voice is None:
+        return None, "❌ 먼저 사용할 통방/음성채널에 들어가주세요."
+
+    candidate_slots = [requested_slot] if requested_slot else [1, 2, 3]
+    matched = []
+    for slot in candidate_slots:
+        if not slot:
+            continue
+        vc = get_custom_music_voice_client(int(slot), message.guild.id)
+        if not vc or not getattr(vc, "channel", None):
+            continue
+        if int(vc.channel.id) != int(author_voice.id):
+            continue
+        if is_channel_for_custom_music_chat(message.guild, int(slot), message.channel, vc.channel):
+            matched.append(int(slot))
+
+    if requested_slot and not matched:
+        return None, f"❌ {requested_slot}번 커스텀 봇이 지금 네가 들어간 통방에 없거나, 이 채팅채널과 연결되어 있지 않아요."
+    if len(matched) > 1:
+        return None, "❌ 같은 통방에 커스텀 봇이 여러 개 있어요. `1번 사클: 제목`처럼 번호를 붙여주세요."
+    if matched:
+        return matched[0], None
+    return None, None
+
+
+async def ensure_main_music_voice_from_message(message: discord.Message):
+    if message.guild is None:
+        return None, "❌ 서버에서만 사용할 수 있어요."
+    if not getattr(message.author, "voice", None) or not message.author.voice.channel:
+        return None, "❌ 먼저 음성 채널에 들어가주세요."
+
+    voice_channel = message.author.voice.channel
+    voice_client = message.guild.voice_client
+    try:
+        if voice_client is None:
+            return await voice_channel.connect(), None
+        if voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+        return voice_client, None
+    except (discord.Forbidden, discord.HTTPException) as e:
+        return None, f"❌ 음성 채널 입장 실패: `{e}`"
+
+
+async def play_main_music_from_chat(message: discord.Message, query: str, source: str):
+    voice_client, error = await ensure_main_music_voice_from_message(message)
+    if error:
+        await message.channel.send(error, delete_after=8)
+        return True
+
+    try:
+        track = await extract_music_info(query, source)
+    except Exception as e:
+        await message.channel.send(f"❌ 노래 정보를 가져오지 못했어요.\n`{e}`", delete_after=12)
+        return True
+
+    queue = get_music_queue(message.guild.id)
+    queue.append(track)
+
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_music_next(message.guild)
+        msg = (
+            f"🎶 채팅으로 바로 재생을 시작했어요!\n"
+            f"{track.get('service_emoji', '🎧')} **{track['title']}**\n"
+            f"서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track.get('duration'))}`"
+        )
+    else:
+        await send_music_now_playing_box(message.guild, track, queued=True)
+        msg = (
+            f"✅ 채팅으로 대기열에 추가했어요!\n"
+            f"{track.get('service_emoji', '🎧')} **{track['title']}**\n"
+            f"서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track.get('duration'))}`"
+        )
+    await message.channel.send(msg[:1900])
+    return True
+
+
+async def play_custom_music_from_chat(message: discord.Message, slot: int, query: str, source: str):
+    voice_client = get_custom_music_voice_client(slot, message.guild.id)
+    if voice_client is None:
+        await message.channel.send(f"❌ {slot}번 커스텀 봇이 아직 통방에 없어요. `/커스텀`에서 {slot}번 통방 입장을 먼저 눌러주세요.", delete_after=8)
+        return True
+
+    try:
+        track = await extract_music_info(query, source)
+    except Exception as e:
+        await message.channel.send(f"❌ {slot}번 커스텀 봇 노래 정보를 가져오지 못했어요.\n`{e}`", delete_after=12)
+        return True
+
+    queue = get_custom_music_queue(slot, message.guild.id)
+    queue.append(track)
+
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_custom_music_next(slot, message.guild.id)
+        msg = (
+            f"🎶 채팅으로 **{slot}번 커스텀 봇** 재생을 시작했어요!\n"
+            f"{track.get('service_emoji', '🎧')} **{track['title']}**\n"
+            f"서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track.get('duration'))}`"
+        )
+    else:
+        await send_custom_music_now_playing_box(slot, message.guild.id, track, queued=True)
+        msg = (
+            f"✅ 채팅으로 **{slot}번 커스텀 봇** 대기열에 추가했어요!\n"
+            f"{track.get('service_emoji', '🎧')} **{track['title']}**\n"
+            f"서비스: `{track.get('service', '검색')}` ㅣ 길이: `{format_duration(track.get('duration'))}`"
+        )
+    await message.channel.send(msg[:1900])
+    return True
+
+
+async def maybe_play_music_from_chat_message(message: discord.Message):
+    if message.guild is None or message.author.bot:
+        return False
+    parsed = parse_music_chat_request(message.content)
+    if not parsed:
+        return False
+
+    requested_slot = parsed["slot"]
+    source = parsed["source"]
+    query = parsed["query"]
+
+    # 1순위: 커스텀 봇 패널/통방 채팅채널
+    slot, slot_error = find_custom_music_slot_for_chat(message, requested_slot)
+    if slot:
+        return await play_custom_music_from_chat(message, slot, query, source)
+    if requested_slot and slot_error:
+        await message.channel.send(slot_error, delete_after=8)
+        return True
+
+    # 2순위: 메인 뮤직 채널
+    if is_main_music_chat_channel(message.guild, message.channel):
+        return await play_main_music_from_chat(message, query, source)
+
+    return False
+
+
 # =========================
 # 메시지 처리: 초대링크 / 금지어 / 도배 / 레벨
 # =========================
@@ -8723,6 +8973,11 @@ async def on_message(message: discord.Message):
                 pass
         else:
             await send_log(message.guild, f"🔊 TTS 채널 자동 재생\n유저: {message.author.mention}\n채널: {message.channel.mention}", "voice")
+        return
+
+    # 뮤직패널 채팅채널에서는 버튼을 누르지 않아도 채팅 입력만으로 재생합니다.
+    # 예: 사클: 제목 / 유튜브: 제목 / 1번 사클: 제목
+    if await maybe_play_music_from_chat_message(message):
         return
 
     user_id = message.author.id
@@ -10789,6 +11044,18 @@ def clean_music_title(title: str):
     return re.sub(r"\s+", " ", title).strip() or "제목 없음"
 
 
+def normalize_youtube_title_keyword(title: str):
+    """YouTube 영상 제목을 그대로 붙여넣어도 검색이 잘 되게 정리합니다."""
+    keyword = clean_music_title(title)
+    keyword = re.sub(r"https?://\S+", "", keyword).strip()
+    keyword = re.sub(r"\b(youtube|유튜브)\b", "", keyword, flags=re.I).strip()
+    # [Playlist], [Cover], (Official Video) 같은 앞/뒤 태그는 검색 방해가 될 수 있어 제거합니다.
+    keyword = re.sub(r"^\s*[\[【(（][^\]】)）]{1,40}[\]】)）]\s*", "", keyword).strip()
+    keyword = re.sub(r"\s*[\[【(（](official|mv|m/v|video|audio|lyrics?|cover|playlist|live|가사|자막)[^\]】)）]*[\]】)）]\s*$", "", keyword, flags=re.I).strip()
+    keyword = re.sub(r"\s+", " ", keyword).strip()
+    return keyword or clean_music_title(title)
+
+
 def fetch_page_title(url: str):
     """멜론/지니뮤직 링크처럼 직접 재생이 어려운 페이지에서 제목만 가져와 검색어로 사용합니다."""
     try:
@@ -10813,40 +11080,49 @@ def fetch_page_title(url: str):
     return None
 
 
+def parse_music_source_prefix(query: str):
+    """입력값 앞의 검색 기준을 읽습니다.
+
+    사용 예시:
+    유튜브: 영상 제목
+    yt: 영상 제목
+    사클: 음악 제목
+    sc: 음악 제목
+    """
+    raw = (query or "").strip()
+    lowered = raw.lower()
+    prefix_map = {
+        "유튜브:": "youtube",
+        "youtube:": "youtube",
+        "yt:": "youtube",
+        "사클:": "soundcloud",
+        "사운드클라우드:": "soundcloud",
+        "soundcloud:": "soundcloud",
+        "sc:": "soundcloud",
+    }
+    for prefix, source in prefix_map.items():
+        if lowered.startswith(prefix):
+            return source, raw[len(prefix):].strip()
+    return None, raw
 
 
-def fetch_youtube_oembed_title(url: str):
-    """YouTube 직접 재생이 막힐 때 링크 제목만 안전하게 가져와 SoundCloud 검색어로 사용합니다."""
-    try:
-        encoded_url = urllib.parse.quote(url, safe="")
-        oembed_url = f"https://www.youtube.com/oembed?format=json&url={encoded_url}"
-        req = urllib.request.Request(
-            oembed_url,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            raw = resp.read(100000)
-        data = json.loads(raw.decode("utf-8", errors="ignore"))
-        title = clean_music_title(data.get("title", ""))
-        return title if title and title != "제목 없음" else None
-    except Exception:
-        return None
-
-def build_music_search_query(query: str):
+def build_music_search_query(query: str, preferred_source: str = None):
     query = (query or "").strip()
+    preferred_source = (preferred_source or "").strip().lower()
+
+    prefix_source, stripped_query = parse_music_source_prefix(query)
+    if prefix_source:
+        preferred_source = prefix_source
+        query = stripped_query
+
     service, _emoji = detect_music_service(query)
     lower = query.lower()
 
-    # Render 서버에서는 YouTube 직접 음원 추출이 자주 봇 감지로 막힙니다.
-    # 그래도 사용자가 YouTube 링크를 붙여넣으면, 링크 제목만 가져와 SoundCloud에서 같은 제목을 검색해 재생합니다.
-    # 즉, 입력은 YouTube 링크로 가능하지만 실제 재생 소스는 SoundCloud가 될 수 있습니다.
+    # YouTube 직접 링크는 Render에서 계속 막힐 수 있어서 직접 재생은 차단합니다.
     if re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I):
-        youtube_title = fetch_youtube_oembed_title(query) or fetch_page_title(query)
-        if youtube_title:
-            return f"scsearch1:{youtube_title}", "YouTube 링크→SoundCloud", youtube_title
-        return "__YOUTUBE_TITLE_LOOKUP_FAILED__", "YouTube", query
+        return "__YOUTUBE_DIRECT_LINK_BLOCKED__", "YouTube", query
 
-    # SoundCloud 직접 링크는 그대로 사용합니다.
+    # SoundCloud 직접 링크는 그대로 재생합니다.
     if "soundcloud.com" in lower:
         return query, "SoundCloud", query
 
@@ -10854,15 +11130,21 @@ def build_music_search_query(query: str):
         page_title = fetch_page_title(query) if lower.startswith(("http://", "https://")) else None
         keyword = page_title or query
         keyword = re.sub(r"https?://\S+", "", keyword).strip() or query
+        # 멜론/지니는 직접 재생이 어려워 사클 기준으로 검색합니다.
         return f"scsearch1:{keyword}", service, keyword
 
-    # 일반 노래 제목 검색은 YouTube 대신 SoundCloud를 먼저 사용합니다.
-    # 이렇게 해야 Render/무료 호스팅 IP에서 YouTube 봇 감지 오류가 거의 사라집니다.
-    keyword = re.sub(r"\b(youtube|유튜브)\b", "", query, flags=re.I).strip() or query
-    return f"scsearch1:{keyword}", "SoundCloud", keyword
+    keyword = normalize_youtube_title_keyword(query)
 
+    # 검색 기준을 버튼/접두어로 완전히 분리합니다.
+    if preferred_source in {"youtube", "yt", "youtube_title"}:
+        return f"ytsearch1:{keyword}", "YouTube 제목 검색", keyword
+    if preferred_source in {"soundcloud", "sc", "soundcloud_title"}:
+        return f"scsearch1:{keyword}", "SoundCloud 제목 검색", keyword
 
-async def extract_music_info(query: str):
+    # 기본값은 Render에서 더 안정적인 SoundCloud 제목 검색입니다.
+    return f"scsearch1:{keyword}", "SoundCloud 제목 검색", keyword
+
+async def extract_music_info(query: str, preferred_source: str = None):
     loop = asyncio.get_running_loop()
 
     def _normalize_info(info, original_query, requested_service, searched_keyword):
@@ -10876,9 +11158,12 @@ async def extract_music_info(query: str):
         if requested_service in {"Melon", "Genie Music"}:
             detected_service = requested_service
             service_emoji = "🍈" if requested_service == "Melon" else "🧞"
-        elif str(requested_service).startswith("YouTube 링크"):
-            detected_service = requested_service
+        elif requested_service == "YouTube 제목 검색":
+            detected_service = "YouTube 제목 검색"
             service_emoji = "▶️"
+        elif requested_service == "SoundCloud 제목 검색":
+            detected_service = "SoundCloud 제목 검색"
+            service_emoji = "🟧"
 
         return {
             "title": clean_music_title(info.get("title", "제목 없음")),
@@ -10894,12 +11179,12 @@ async def extract_music_info(query: str):
         }
 
     def run_extract():
-        search_query, requested_service, searched_keyword = build_music_search_query(query)
-        if search_query == "__YOUTUBE_TITLE_LOOKUP_FAILED__":
+        search_query, requested_service, searched_keyword = build_music_search_query(query, preferred_source)
+        if search_query == "__YOUTUBE_DIRECT_LINK_BLOCKED__":
             raise ValueError(
-                "YouTube 링크 제목을 가져오지 못했어요. "
-                "이 링크는 YouTube에서 외부 제목 조회도 막힌 상태라서 재생할 수 없어요. "
-                "SoundCloud 링크를 사용하거나 노래 제목으로 입력해주세요."
+                "YouTube 링크는 Render/무료 호스팅에서 계속 봇 감지로 막힐 수 있어요. "
+                "링크 대신 YouTube 영상 제목을 그대로 입력하거나 SoundCloud 링크를 사용해주세요. "
+                "예: `[Playlist] 오늘 하루도 고생한 당신에게, 초 카구야 피아노 모음`"
             )
         try:
             local_ytdl = yt_dlp.YoutubeDL(build_ytdl_options())
@@ -10925,12 +11210,20 @@ async def extract_music_info(query: str):
                 cookie_hint = f"현재 쿠키 경로: {YTDLP_COOKIE_FILE or '미설정'} / 쿠키 검사: {cookie_msg}"
                 is_direct_youtube_url = re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I)
 
-                # 유튜브 직접 링크가 아니라 제목 검색이면 SoundCloud로 한 번 더 시도합니다.
+                # 검색 기준을 따로 분리했으므로, YouTube 제목 검색은 SoundCloud로 몰래 바꾸지 않습니다.
+                if requested_service == "YouTube 제목 검색":
+                    raise ValueError(
+                        "YouTube 제목 검색이 서버 봇 감지로 막혔어요. "
+                        "같은 제목을 `사클 제목` 버튼으로 검색하면 재생될 수 있어요. "
+                        f"{cookie_hint}"
+                    )
+
+                # 자동/기타 검색에서만 SoundCloud로 한 번 더 시도합니다.
                 if not is_direct_youtube_url:
                     try:
                         fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options("bestaudio/best"))
                         fallback_info = fallback_ytdl.extract_info(f"scsearch1:{query}", download=False)
-                        return _normalize_info(fallback_info, query, "SoundCloud", query)
+                        return _normalize_info(fallback_info, query, "SoundCloud 제목 검색", query)
                     except Exception:
                         pass
 
@@ -10958,13 +11251,19 @@ def build_now_playing_embed(track: dict, *, queued: bool = False):
     if service in {"Melon", "Genie Music"}:
         embed.add_field(
             name="📌 안내",
-            value="멜론/지니뮤직 링크·검색어는 제목을 기준으로 사운드클라우드에서 찾아 재생해요.",
+            value="멜론/지니뮤직 링크·검색어는 제목을 기준으로 SoundCloud에서 찾아 재생해요.",
             inline=False,
         )
-    if str(service).startswith("YouTube 링크"):
+    if service == "YouTube 제목 검색":
         embed.add_field(
             name="📌 안내",
-            value="YouTube 링크 입력은 받지만 Render에서 직접 재생이 막힐 수 있어 제목 기준으로 SoundCloud에서 찾아 재생했어요.",
+            value="입력한 제목을 기준으로 YouTube에서 찾아 재생해요. Render에서 막히면 사클 제목 검색을 사용해주세요.",
+            inline=False,
+        )
+    if service == "SoundCloud 제목 검색":
+        embed.add_field(
+            name="📌 안내",
+            value="입력한 제목을 기준으로 SoundCloud에서 찾아 재생해요.",
             inline=False,
         )
     if track.get("thumbnail"):
@@ -11039,13 +11338,20 @@ async def play_music_next(guild: discord.Guild):
     voice_client.play(source, after=after_play)
 
 
-class PlayMusicModal(discord.ui.Modal, title="🎶 음악 재생"):
-    query = discord.ui.TextInput(
-        label="노래 제목 또는 링크",
-        placeholder="예: 아이유 좋은날 / 유튜브 / 사운드클라우드 / 멜론 / 지니뮤직",
+class PlayMusicModal(discord.ui.Modal):
+    def __init__(self, source: str = "soundcloud"):
+        title = "🎶 사클 제목 검색" if source == "soundcloud" else "🎶 유튜브 제목 검색"
+        super().__init__(title=title)
+        self.source = source
+        label = "SoundCloud 제목 검색" if source == "soundcloud" else "YouTube 제목 검색"
+        placeholder = "예: 오늘 하루도 고생한 당신에게 피아노 모음"
+        self.query = discord.ui.TextInput(
+            label=label,
+            placeholder=placeholder,
         required=True,
         max_length=300,
-    )
+        )
+        self.add_item(self.query)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -11057,7 +11363,7 @@ class PlayMusicModal(discord.ui.Modal, title="🎶 음악 재생"):
         query_text = str(self.query.value).strip()
 
         try:
-            track = await extract_music_info(query_text)
+            track = await extract_music_info(query_text, self.source)
         except Exception as e:
             return await interaction.followup.send(
                 f"❌ 노래 정보를 가져오지 못했어요.\n`{e}`",
@@ -11108,9 +11414,13 @@ class MusicPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="재생", emoji="🎶", style=discord.ButtonStyle.green, custom_id="music_play")
+    @discord.ui.button(label="사클 제목", emoji="🟧", style=discord.ButtonStyle.green, custom_id="music_play_sc")
     async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PlayMusicModal())
+        await interaction.response.send_modal(PlayMusicModal("soundcloud"))
+
+    @discord.ui.button(label="유튜브 제목", emoji="▶️", style=discord.ButtonStyle.red, custom_id="music_play_yt")
+    async def play_youtube_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PlayMusicModal("youtube"))
 
     @discord.ui.button(label="일시정지", emoji="⏸️", style=discord.ButtonStyle.gray, custom_id="music_pause")
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -11383,7 +11693,7 @@ async def play_busking_mr_from_query(interaction: discord.Interaction, query_tex
         return await interaction.followup.send("❌ MR 제목이나 링크를 입력해주세요.", ephemeral=True)
 
     try:
-        track = await extract_music_info(query_text)
+        track = await extract_music_info(query_text, "soundcloud")
     except Exception as e:
         return await interaction.followup.send(
             f"❌ MR 정보를 가져오지 못했어요.\n`{e}`",
@@ -19130,7 +19440,8 @@ def build_custom_music_panel_embed(guild: discord.Guild, slot: int):
             f"**{bot_name}** 보조 봇으로 음악을 재생합니다.\n"
             "먼저 `/커스텀`에서 원하는 번호의 **통방 초대** 버튼을 누르면,\n"
             "내가 들어가 있는 통방으로 봇이 들어오고 이 채팅채널에 패널이 열립니다.\n\n"
-            "🎶 **재생** 버튼을 누르고 노래 제목이나 링크를 입력하세요.\n"
+            "🎶 **사클 제목 / 유튜브 제목** 버튼을 눌러 검색 기준을 따로 선택할 수 있어요.\n"
+            "💬 버튼을 누르지 않아도 이 채팅채널에 `사클: 제목` 또는 `유튜브: 제목`을 치면 바로 재생돼요.\n"
             "📜 **대기열** 버튼으로 현재 곡과 예약 곡을 확인할 수 있어요."
         ),
         color=0x9B7CFF,
@@ -19257,7 +19568,7 @@ async def send_custom_music_panel_to_voice_channel(guild: discord.Guild, slot: i
         return (
             f"{connect_result}\n"
             f"🎛️ {slot}번 커스텀 뮤직패널을 {panel_channel.mention}에 전송했어요.\n"
-            f"이제 그 채팅채널에서 버튼으로 재생/스킵/볼륨/종료를 사용할 수 있어요."
+            f"이제 그 채팅채널에서 버튼 또는 `사클: 제목` / `유튜브: 제목` 채팅으로 재생할 수 있어요."
         ).strip()
     except (discord.Forbidden, discord.HTTPException) as e:
         return f"{connect_result}\n❌ 패널 전송 실패: `{e}`".strip()
@@ -19393,12 +19704,15 @@ async def play_custom_music_next(slot: int, guild_id: int):
 
 
 class CustomMusicPlayModal(discord.ui.Modal):
-    def __init__(self, slot: int):
-        super().__init__(title=f"🎶 {slot}번 커스텀 봇 음악 재생")
+    def __init__(self, slot: int, source: str = "soundcloud"):
+        title = f"🎶 {slot}번 사클 제목 검색" if source == "soundcloud" else f"🎶 {slot}번 유튜브 제목 검색"
+        super().__init__(title=title)
         self.slot = int(slot)
+        self.source = source
+        label = "SoundCloud 제목 검색" if source == "soundcloud" else "YouTube 제목 검색"
         self.query = discord.ui.TextInput(
-            label="노래 제목 또는 링크",
-            placeholder="예: 아이유 좋은날 / 유튜브 링크 / 사운드클라우드 / 멜론 / 지니뮤직",
+            label=label,
+            placeholder="예: 오늘 하루도 고생한 당신에게 피아노 모음",
             required=True,
             max_length=300,
         )
@@ -19412,7 +19726,7 @@ class CustomMusicPlayModal(discord.ui.Modal):
 
         query_text = str(self.query.value).strip()
         try:
-            track = await extract_music_info(query_text)
+            track = await extract_music_info(query_text, self.source)
         except Exception as e:
             return await interaction.followup.send(f"❌ 노래 정보를 가져오지 못했어요.\n`{e}`", ephemeral=True)
 
@@ -19468,7 +19782,8 @@ class CustomMusicPanelView(discord.ui.View):
     def __init__(self, slot: int):
         super().__init__(timeout=None)
         self.slot = int(slot)
-        self._add_button("재생", "🎶", discord.ButtonStyle.green, f"custom_music_{self.slot}_play", self.play_button, row=0)
+        self._add_button("사클 제목", "🟧", discord.ButtonStyle.green, f"custom_music_{self.slot}_play_sc", self.play_button, row=0)
+        self._add_button("유튜브 제목", "▶️", discord.ButtonStyle.red, f"custom_music_{self.slot}_play_yt", self.play_youtube_button, row=0)
         self._add_button("일시정지", "⏸️", discord.ButtonStyle.gray, f"custom_music_{self.slot}_pause", self.pause_button, row=0)
         self._add_button("다시재생", "▶️", discord.ButtonStyle.blurple, f"custom_music_{self.slot}_resume", self.resume_button, row=0)
         self._add_button("스킵 투표", "⏭️", discord.ButtonStyle.red, f"custom_music_{self.slot}_skip", self.skip_button, row=0)
@@ -19484,7 +19799,10 @@ class CustomMusicPanelView(discord.ui.View):
         self.add_item(button)
 
     async def play_button(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(CustomMusicPlayModal(self.slot))
+        await interaction.response.send_modal(CustomMusicPlayModal(self.slot, "soundcloud"))
+
+    async def play_youtube_button(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CustomMusicPlayModal(self.slot, "youtube"))
 
     async def pause_button(self, interaction: discord.Interaction):
         vc = get_custom_music_voice_client(self.slot, interaction.guild.id)
