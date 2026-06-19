@@ -10912,13 +10912,22 @@ YTDLP_COOKIE_FILE = resolve_ytdlp_cookie_file()
 # YouTube 영상마다 제공 포맷이 달라서 특정 포맷만 고르면
 # "Requested format is not available" 오류가 날 수 있습니다.
 # 아래처럼 오디오 후보를 넓게 두고, 실패하면 여러 클라이언트/포맷으로 재시도합니다.
-YTDLP_SAFE_AUDIO_FORMAT = "bestaudio[acodec!=none]/best[acodec!=none]/bestaudio/best"
+YTDLP_SAFE_AUDIO_FORMAT = "bestaudio[acodec!=none]/best[acodec!=none]/best"
+# YouTube는 클라이언트별로 내려주는 포맷이 다를 수 있어서 web/mweb/ios/android를 순서대로 재시도합니다.
+# android를 첫 번째로 두면 일부 환경에서 포맷이 비어 들어오는 경우가 있어 web 계열을 먼저 사용합니다.
 YTDLP_FALLBACK_PROFILES = [
-    (YTDLP_SAFE_AUDIO_FORMAT, ["android", "ios", "web"]),
-    ("bestaudio/best", ["ios", "android", "web"]),
-    ("best[acodec!=none]/bestaudio/best", ["web", "android", "ios"]),
-    ("worstaudio[acodec!=none]/worst[acodec!=none]/best", ["android", "web", "ios"]),
-    ("best", ["ios", "android", "web"]),
+    (YTDLP_SAFE_AUDIO_FORMAT, ["web", "mweb", "ios"]),
+    ("bestaudio/best", ["web", "mweb", "ios"]),
+    ("ba/b", ["ios", "web", "mweb"]),
+    ("best[acodec!=none]/bestaudio/best", ["mweb", "web", "ios"]),
+    ("best", ["ios", "web", "android"]),
+]
+YTDLP_YOUTUBE_CLIENT_PROFILES = [
+    ["web", "mweb", "ios"],
+    ["mweb", "web"],
+    ["ios"],
+    ["web"],
+    ["android"],
 ]
 
 
@@ -10945,7 +10954,7 @@ def check_ytdlp_cookie_file(path: str):
 
 def build_ytdl_options(format_value: str = None, player_clients=None):
     """YouTube가 특정 포맷을 막아도 여러 포맷/클라이언트로 재시도할 수 있게 yt-dlp 옵션을 만듭니다."""
-    clients = player_clients or ["android", "ios", "web"]
+    clients = player_clients or ["web", "mweb", "ios"]
     options = {
         # 특정 m4a/webm/format id에 고정하지 않고, 오디오가 있는 후보를 넓게 허용합니다.
         "format": format_value or YTDLP_SAFE_AUDIO_FORMAT,
@@ -10962,7 +10971,7 @@ def build_ytdl_options(format_value: str = None, player_clients=None):
         "geo_bypass": True,
         "nocheckcertificate": True,
         # 포맷 선택이 실패해도 가능한 정보/formats를 최대한 받아서 아래 코드에서 직접 고릅니다.
-        "ignore_no_formats_error": True,
+        "ignore_no_formats_error": False,
         "retries": 8,
         "fragment_retries": 8,
         "extractor_retries": 3,
@@ -11239,12 +11248,113 @@ def build_music_search_query(query: str, preferred_source: str = None):
 async def extract_music_info(query: str, preferred_source: str = None):
     loop = asyncio.get_running_loop()
 
-    def _normalize_info(info, original_query, requested_service, searched_keyword):
-        if "entries" in info:
-            entries = [entry for entry in info["entries"] if entry]
+    def _is_youtube_service(requested_service: str):
+        return requested_service in {"YouTube", "YouTube 제목 검색"}
+
+    def _is_youtube_webpage_url(url: str):
+        url = str(url or "").lower()
+        return (
+            "youtube.com/watch" in url
+            or "youtube.com/shorts/" in url
+            or "youtu.be/" in url
+            or "music.youtube.com/watch" in url
+        )
+
+    def _youtube_url_from_info(info: dict):
+        if not isinstance(info, dict):
+            return None
+
+        for key in ("webpage_url", "original_url", "url"):
+            value = str(info.get(key) or "").strip()
+            if _is_youtube_webpage_url(value):
+                return value
+
+        video_id = str(info.get("id") or "").strip()
+        if video_id and re.fullmatch(r"[A-Za-z0-9_-]{8,}", video_id):
+            return f"https://www.youtube.com/watch?v={video_id}"
+
+        return None
+
+    def _first_entry(info: dict):
+        if isinstance(info, dict) and isinstance(info.get("entries"), list):
+            entries = [entry for entry in info.get("entries", []) if entry]
             if not entries:
                 raise ValueError("검색 결과가 없습니다.")
-            info = entries[0]
+            return entries[0]
+        return info
+
+    def _pick_audio_stream(info: dict, requested_service: str):
+        """yt-dlp 결과에서 Discord/FFmpeg가 바로 재생할 오디오 URL을 직접 고릅니다."""
+        if not isinstance(info, dict):
+            return None, info
+
+        candidates = []
+
+        # bestvideo+bestaudio 조합으로 받은 경우 오디오 쪽 requested_format을 우선 사용합니다.
+        for fmt in info.get("requested_formats") or []:
+            if not isinstance(fmt, dict) or not fmt.get("url"):
+                continue
+            acodec = str(fmt.get("acodec") or "")
+            vcodec = str(fmt.get("vcodec") or "")
+            if acodec and acodec != "none":
+                candidates.append(fmt)
+
+        # 일반 formats 목록에서 오디오 포맷을 직접 고릅니다.
+        for fmt in info.get("formats") or []:
+            if not isinstance(fmt, dict) or not fmt.get("url"):
+                continue
+
+            fmt_url = str(fmt.get("url") or "")
+            protocol = str(fmt.get("protocol") or "").lower()
+            acodec = str(fmt.get("acodec") or "")
+            vcodec = str(fmt.get("vcodec") or "")
+            format_note = str(fmt.get("format_note") or "").lower()
+            ext = str(fmt.get("ext") or "").lower()
+
+            # 이미지/스토리보드/자막류는 오디오 재생에 쓸 수 없습니다.
+            if ext in {"jpg", "png", "webp", "json", "mhtml"}:
+                continue
+            if "storyboard" in format_note or "storyboard" in fmt_url.lower():
+                continue
+
+            # 오디오가 있는 포맷을 우선 후보로 넣습니다. m3u8도 FFmpeg가 재생할 수 있어 완전히 제외하지 않습니다.
+            if acodec and acodec != "none":
+                candidates.append(fmt)
+            elif vcodec == "none" and fmt_url.startswith(("http://", "https://")):
+                candidates.append(fmt)
+            elif protocol in {"http", "https", "m3u8", "m3u8_native"} and fmt_url.startswith(("http://", "https://")):
+                candidates.append(fmt)
+
+        if candidates:
+            def score(fmt):
+                acodec = str(fmt.get("acodec") or "")
+                vcodec = str(fmt.get("vcodec") or "")
+                protocol = str(fmt.get("protocol") or "").lower()
+                ext = str(fmt.get("ext") or "").lower()
+                return (
+                    1 if acodec and acodec != "none" else 0,
+                    1 if vcodec == "none" else 0,
+                    1 if protocol in {"http", "https"} else 0,
+                    1 if ext in {"m4a", "webm", "opus", "mp3"} else 0,
+                    int(fmt.get("abr") or 0),
+                    int(fmt.get("tbr") or 0),
+                    int(fmt.get("filesize") or fmt.get("filesize_approx") or 0),
+                )
+
+            candidates.sort(key=score, reverse=True)
+            chosen = candidates[0]
+            merged = {**info, **chosen}
+            return chosen.get("url"), merged
+
+        # formats가 없어도 info.url이 실제 CDN/스트림이면 사용할 수 있습니다.
+        stream_url = str(info.get("url") or "").strip()
+        if stream_url and not _is_youtube_webpage_url(stream_url):
+            return stream_url, info
+
+        return None, info
+
+    def _normalize_info(info, original_query, requested_service, searched_keyword):
+        info = _first_entry(info)
 
         detected_service, service_emoji = detect_music_service(original_query, info)
         if requested_service in {"Melon", "Genie Music"}:
@@ -11257,27 +11367,17 @@ async def extract_music_info(query: str, preferred_source: str = None):
             detected_service = "SoundCloud 제목 검색"
             service_emoji = "🟧"
 
-        stream_url = info.get("url")
-        # yt-dlp가 포맷을 자동 선택하지 못한 경우 formats 목록에서 재생 가능한 오디오 URL을 직접 고릅니다.
-        if not stream_url and isinstance(info.get("formats"), list):
-            audio_formats = []
-            for fmt in info.get("formats", []):
-                if not fmt.get("url"):
-                    continue
-                acodec = str(fmt.get("acodec") or "")
-                protocol = str(fmt.get("protocol") or "")
-                if acodec and acodec != "none" and not protocol.startswith("m3u8"):
-                    audio_formats.append(fmt)
-            if not audio_formats:
-                audio_formats = [fmt for fmt in info.get("formats", []) if fmt.get("url")]
-            if audio_formats:
-                audio_formats.sort(key=lambda f: (int(f.get("abr") or 0), int(f.get("tbr") or 0), int(f.get("filesize") or 0)), reverse=True)
-                chosen = audio_formats[0]
-                stream_url = chosen.get("url")
-                info = {**info, **chosen}
+        stream_url, info = _pick_audio_stream(info, requested_service)
 
         if not stream_url:
-            raise ValueError("재생 가능한 오디오 포맷을 찾지 못했어요. `사클: 제목`으로 다시 검색해보세요.")
+            if _is_youtube_service(requested_service):
+                cookie_ok, cookie_msg = check_ytdlp_cookie_file(YTDLP_COOKIE_FILE)
+                raise ValueError(
+                    "YouTube에서 재생 가능한 오디오 포맷을 찾지 못했어요. "
+                    "Render/무료 서버에서는 YouTube가 봇 접속을 막는 경우가 있어서 `cookies.txt`가 필요할 수 있어요. "
+                    f"쿠키 경로: {YTDLP_COOKIE_FILE or '미설정'} / 쿠키 검사: {cookie_msg}"
+                )
+            raise ValueError("재생 가능한 오디오 포맷을 찾지 못했어요. `사클 제목`으로 다시 검색해보세요.")
 
         return {
             "title": clean_music_title(info.get("title", "제목 없음")),
@@ -11290,85 +11390,76 @@ async def extract_music_info(query: str, preferred_source: str = None):
             "requested_query": original_query,
             "searched_keyword": searched_keyword,
             "uploader": info.get("uploader") or info.get("channel") or "알 수 없음",
-            # YouTube/SoundCloud가 요구하는 User-Agent/Referer 헤더를 FFmpeg에도 넘겨야
-            # 임베드는 뜨는데 실제 소리가 안 나는 403/무음 문제를 줄일 수 있습니다.
             "http_headers": info.get("http_headers") or {},
         }
 
+    def _extract_with_options(search_query: str, requested_service: str, original_query: str, searched_keyword: str, options: dict):
+        local_ytdl = yt_dlp.YoutubeDL(options)
+        info = local_ytdl.extract_info(search_query, download=False)
+
+        # ytsearch 결과가 얕은 항목으로 들어오면 실제 영상 페이지를 한 번 더 추출합니다.
+        if _is_youtube_service(requested_service):
+            first = _first_entry(info)
+            stream_url, _ = _pick_audio_stream(first, requested_service)
+            video_url = _youtube_url_from_info(first)
+            if video_url and (not stream_url or _is_youtube_webpage_url(stream_url)):
+                info = local_ytdl.extract_info(video_url, download=False)
+
+        return _normalize_info(info, original_query, requested_service, searched_keyword)
+
     def run_extract():
         search_query, requested_service, searched_keyword = build_music_search_query(query, preferred_source)
-        if search_query == "__YOUTUBE_DIRECT_LINK_BLOCKED__":
-            raise ValueError(
-                "YouTube 링크는 Render/무료 호스팅에서 계속 봇 감지로 막힐 수 있어요. "
-                "링크 대신 YouTube 영상 제목을 그대로 입력하거나 SoundCloud 링크를 사용해주세요. "
-                "예: `[Playlist] 오늘 하루도 고생한 당신에게, 초 카구야 피아노 모음`"
-            )
-        try:
-            local_ytdl = yt_dlp.YoutubeDL(build_ytdl_options())
-            info = local_ytdl.extract_info(search_query, download=False)
-            return _normalize_info(info, query, requested_service, searched_keyword)
-        except Exception as e:
-            error_text = str(e)
-            lower_error = error_text.lower()
-            youtube_bot_blocked = "sign in to confirm" in lower_error or "not a bot" in lower_error
-            format_blocked = (
-                "requested format is not available" in lower_error
-                or "format is not available" in lower_error
-                or "requested formats are incompatible" in lower_error
-                or "no video formats found" in lower_error
-            )
 
-            if format_blocked:
-                # YouTube가 선택된 포맷을 안 줄 때 포맷/클라이언트를 여러 조합으로 다시 시도합니다.
-                last_retry_error = error_text
-                for retry_format, retry_clients in YTDLP_FALLBACK_PROFILES:
-                    try:
-                        fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options(retry_format, retry_clients))
-                        fallback_info = fallback_ytdl.extract_info(search_query, download=False)
-                        return _normalize_info(fallback_info, query, requested_service, searched_keyword)
-                    except Exception as format_retry_error:
-                        last_retry_error = str(format_retry_error)
-                        lower_retry_error = last_retry_error.lower()
-                        youtube_bot_blocked = youtube_bot_blocked or "sign in to confirm" in lower_retry_error or "not a bot" in lower_retry_error
+        is_youtube_request = _is_youtube_service(requested_service)
+        profiles = YTDLP_FALLBACK_PROFILES
+        if is_youtube_request:
+            profiles = [(YTDLP_SAFE_AUDIO_FORMAT, clients) for clients in YTDLP_YOUTUBE_CLIENT_PROFILES] + YTDLP_FALLBACK_PROFILES
 
-                # 그래도 안 되면 제목 기준으로 SoundCloud에 자동 우회합니다.
-                # 이렇게 하면 YouTube 특정 영상의 포맷이 막혀도 음악 재생 자체가 멈추는 일을 줄일 수 있습니다.
-                try:
-                    fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options(YTDLP_SAFE_AUDIO_FORMAT, ["android", "ios", "web"]))
-                    fallback_info = fallback_ytdl.extract_info(f"scsearch1:{searched_keyword or query}", download=False)
-                    return _normalize_info(fallback_info, query, "SoundCloud 제목 검색", searched_keyword or query)
-                except Exception:
-                    pass
-                error_text = last_retry_error
+        last_error = None
+        youtube_bot_blocked = False
 
+        for retry_format, retry_clients in profiles:
+            try:
+                options = build_ytdl_options(retry_format, retry_clients)
+                return _extract_with_options(search_query, requested_service, query, searched_keyword, options)
+            except Exception as e:
+                last_error = e
+                lower_error = str(e).lower()
+                if (
+                    "sign in to confirm" in lower_error
+                    or "not a bot" in lower_error
+                    or "confirm you’re not a bot" in lower_error
+                    or "confirm you're not a bot" in lower_error
+                    or "use --cookies" in lower_error
+                    or "cookies" in lower_error and "youtube" in lower_error
+                ):
+                    youtube_bot_blocked = True
+                continue
+
+        if is_youtube_request:
+            cookie_ok, cookie_msg = check_ytdlp_cookie_file(YTDLP_COOKIE_FILE)
             if youtube_bot_blocked:
-                cookie_ok, cookie_msg = check_ytdlp_cookie_file(YTDLP_COOKIE_FILE)
-                cookie_hint = f"현재 쿠키 경로: {YTDLP_COOKIE_FILE or '미설정'} / 쿠키 검사: {cookie_msg}"
-                is_direct_youtube_url = re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I)
-
-                # 검색 기준을 따로 분리했으므로, YouTube 제목 검색은 SoundCloud로 몰래 바꾸지 않습니다.
-                if requested_service == "YouTube 제목 검색":
-                    raise ValueError(
-                        "YouTube 제목 검색이 서버 봇 감지로 막혔어요. "
-                        "같은 제목을 `사클 제목` 버튼으로 검색하면 재생될 수 있어요. "
-                        f"{cookie_hint}"
-                    )
-
-                # 자동/기타 검색에서만 SoundCloud로 한 번 더 시도합니다.
-                if not is_direct_youtube_url:
-                    try:
-                        fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options("bestaudio/best"))
-                        fallback_info = fallback_ytdl.extract_info(f"scsearch1:{query}", download=False)
-                        return _normalize_info(fallback_info, query, "SoundCloud 제목 검색", query)
-                    except Exception:
-                        pass
-
                 raise ValueError(
-                    "YouTube가 서버를 봇으로 감지해서 재생을 막았어요. "
-                    "cookies.txt가 적용되지 않았거나, 쿠키가 만료됐거나, 로그인 쿠키가 빠졌을 수 있어요. "
-                    f"{cookie_hint}"
-                )
-            raise
+                    "YouTube가 서버를 봇으로 감지해서 커스텀 봇 재생을 막았어요. "
+                    "Render 환경변수나 Secret File로 YouTube `cookies.txt`를 넣어야 할 수 있어요. "
+                    f"쿠키 경로: {YTDLP_COOKIE_FILE or '미설정'} / 쿠키 검사: {cookie_msg}"
+                ) from last_error
+            raise ValueError(
+                "YouTube에서 재생 가능한 오디오 포맷을 찾지 못했어요. "
+                f"마지막 오류: {str(last_error)[:250]}"
+            ) from last_error
+
+        # 자동/기타 검색에서만 SoundCloud로 한 번 더 시도합니다.
+        try:
+            fallback_ytdl = yt_dlp.YoutubeDL(build_ytdl_options("bestaudio/best", ["web", "mweb", "ios"]))
+            fallback_info = fallback_ytdl.extract_info(f"scsearch1:{searched_keyword or query}", download=False)
+            return _normalize_info(fallback_info, query, "SoundCloud 제목 검색", searched_keyword or query)
+        except Exception:
+            pass
+
+        if last_error:
+            raise last_error
+        raise ValueError("노래 정보를 가져오지 못했어요.")
 
     return await loop.run_in_executor(None, run_extract)
 
