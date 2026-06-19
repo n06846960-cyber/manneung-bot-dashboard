@@ -10909,6 +10909,31 @@ def resolve_ytdlp_cookie_file():
 
 YTDLP_COOKIE_FILE = resolve_ytdlp_cookie_file()
 
+# yt-dlp는 여러 포맷/클라이언트를 재시도할 때 실패한 중간 과정도
+# 콘솔에 ERROR로 찍을 수 있습니다. 실제 재생은 성공해도 빨간 로그가 남아서
+# 아래 로거로 중간 재시도 로그는 숨기고, 진짜 실패는 디스코드 메시지로만 보여줍니다.
+SHOW_YTDLP_RETRY_LOGS = os.getenv("SHOW_YTDLP_RETRY_LOGS", "0").strip() == "1"
+
+
+class QuietYTDLPLogger:
+    def debug(self, msg):
+        return
+
+    def info(self, msg):
+        return
+
+    def warning(self, msg):
+        if SHOW_YTDLP_RETRY_LOGS:
+            print(f"yt-dlp warning: {msg}")
+
+    def error(self, msg):
+        if SHOW_YTDLP_RETRY_LOGS:
+            print(f"yt-dlp retry error: {msg}")
+
+
+YTDLP_QUIET_LOGGER = QuietYTDLPLogger()
+
+
 # YouTube 영상마다 제공 포맷이 달라서 특정 포맷만 고르면
 # "Requested format is not available" 오류가 날 수 있습니다.
 # 아래처럼 오디오 후보를 넓게 두고, 실패하면 여러 클라이언트/포맷으로 재시도합니다.
@@ -10970,8 +10995,10 @@ def build_ytdl_options(format_value: str = None, player_clients=None):
         "extract_flat": False,
         "geo_bypass": True,
         "nocheckcertificate": True,
-        # 포맷 선택이 실패해도 가능한 정보/formats를 최대한 받아서 아래 코드에서 직접 고릅니다.
-        "ignore_no_formats_error": False,
+        # 포맷 선택이 실패해도 콘솔 ERROR를 크게 찍지 않고,
+        # 가능한 정보/formats를 최대한 받아서 아래 코드에서 직접 고릅니다.
+        "ignore_no_formats_error": True,
+        "logger": YTDLP_QUIET_LOGGER,
         "retries": 8,
         "fragment_retries": 8,
         "extractor_retries": 3,
