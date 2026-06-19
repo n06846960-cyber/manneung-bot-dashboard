@@ -10992,9 +10992,81 @@ else:
 YTDL_OPTIONS = build_ytdl_options()
 
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    # -nostdin: Windows/Render에서 FFmpeg가 표준입력을 잡고 멈추는 문제 방지
+    # -reconnect_on_network_error: 스트림 URL이 잠깐 끊길 때 자동 재연결
+    "before_options": "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_delay_max 5",
+    # -loglevel warning: 오류는 보이되 불필요한 로그는 줄임
+    "options": "-vn -loglevel warning",
 }
+
+
+def get_ffmpeg_executable():
+    """로컬/Render 어디서든 FFmpeg 실행 파일을 안정적으로 찾습니다."""
+    env_path = os.getenv("FFMPEG_PATH", "").strip()
+    if env_path:
+        return env_path
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            candidate = os.path.join(base_dir, name)
+            if os.path.exists(candidate):
+                return candidate
+    except Exception:
+        pass
+
+    # PATH에 있을 수도 있으므로 마지막으로 이름만 넘깁니다.
+    return "ffmpeg"
+
+
+def _safe_ffmpeg_header_value(value):
+    return str(value or "").replace("\r", " ").replace("\n", " ").replace('"', "'").strip()
+
+
+def build_ffmpeg_before_options(track: dict):
+    before_options = FFMPEG_OPTIONS["before_options"]
+    headers = dict(track.get("http_headers") or {})
+
+    # yt-dlp가 헤더를 안 준 경우에도 기본 헤더를 넣어 YouTube/SoundCloud 403을 줄입니다.
+    headers.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    )
+    webpage_url = str(track.get("webpage_url") or "")
+    if "youtube.com" in webpage_url or "youtu.be" in webpage_url:
+        headers.setdefault("Referer", "https://www.youtube.com/")
+    elif "soundcloud.com" in webpage_url:
+        headers.setdefault("Referer", "https://soundcloud.com/")
+
+    if headers:
+        header_text = "".join(
+            f"{_safe_ffmpeg_header_value(k)}: {_safe_ffmpeg_header_value(v)}\r\n"
+            for k, v in headers.items()
+            if k and v
+        )
+        if header_text:
+            before_options += f' -headers "{header_text}"'
+    return before_options
+
+
+def build_discord_audio_source(track: dict, volume: float):
+    """yt-dlp에서 받은 스트림 URL을 Discord에서 실제로 들리게 FFmpeg 소스로 변환합니다."""
+    stream_url = track.get("url")
+    if not stream_url:
+        raise ValueError("재생 URL이 비어있어요.")
+
+    ffmpeg_executable = get_ffmpeg_executable()
+    source = discord.FFmpegPCMAudio(
+        stream_url,
+        executable=ffmpeg_executable,
+        before_options=build_ffmpeg_before_options(track),
+        options=FFMPEG_OPTIONS["options"],
+    )
+    return discord.PCMVolumeTransformer(source, volume=volume)
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
@@ -11218,6 +11290,9 @@ async def extract_music_info(query: str, preferred_source: str = None):
             "requested_query": original_query,
             "searched_keyword": searched_keyword,
             "uploader": info.get("uploader") or info.get("channel") or "알 수 없음",
+            # YouTube/SoundCloud가 요구하는 User-Agent/Referer 헤더를 FFmpeg에도 넘겨야
+            # 임베드는 뜨는데 실제 소리가 안 나는 403/무음 문제를 줄일 수 있습니다.
+            "http_headers": info.get("http_headers") or {},
         }
 
     def run_extract():
@@ -11343,6 +11418,33 @@ async def send_music_now_playing_box(guild: discord.Guild, track: dict, *, queue
         pass
 
 
+async def send_music_play_error_box(guild: discord.Guild, title: str, error: Exception | str):
+    channel = get_channel_by_id_or_name(
+        guild,
+        0,
+        [MUSIC_NOW_PLAYING_CHANNEL_NAME, MUSIC_COMMAND_CHANNEL_NAME, "현재재생", "뮤직명령어", "music"],
+        "text",
+    )
+    if not channel:
+        return
+    err = str(error)
+    if len(err) > 900:
+        err = err[:900] + "..."
+    embed = discord.Embed(
+        title="❌ 음악 재생 실패",
+        description=(
+            f"**{title or '제목 없음'}** 재생을 시작하지 못했어요.\n\n"
+            f"```{err}```\n"
+            "FFmpeg가 없거나, 스트림 URL이 막혔거나, YouTube/SoundCloud가 헤더를 요구하는 경우일 수 있어요."
+        ),
+        color=0xFF6B6B,
+    )
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 async def ensure_music_voice_after_defer(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.followup.send("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
@@ -11367,7 +11469,7 @@ async def ensure_music_voice_after_defer(interaction: discord.Interaction):
 async def play_music_next(guild: discord.Guild):
     voice_client = guild.voice_client
     if voice_client is None:
-        return
+        return False
 
     guild_id = guild.id
     queue = get_music_queue(guild_id)
@@ -11377,26 +11479,41 @@ async def play_music_next(guild: discord.Guild):
 
     if not queue:
         now_playing[guild_id] = None
-        return
+        return False
 
     track = queue.popleft()
     now_playing[guild_id] = track
     skip_vote_users.pop(guild_id, None)
+
+    try:
+        source = build_discord_audio_source(track, get_music_volume(guild_id))
+        voice_client.play(source, after=lambda error: asyncio.run_coroutine_threadsafe(
+            _after_main_music_play(guild, error), bot.loop
+        ))
+    except Exception as e:
+        now_playing[guild_id] = None
+        print(f"재생 시작 실패: {e}")
+        await send_music_play_error_box(guild, track.get("title", "제목 없음"), e)
+        # 다음 대기열이 있으면 멈추지 않고 이어서 시도합니다.
+        if queue:
+            await play_music_next(guild)
+        return False
+
     await send_music_now_playing_box(guild, track, queued=False)
+    return True
 
-    source = discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS)
-    source = discord.PCMVolumeTransformer(source, volume=get_music_volume(guild_id))
 
-    def after_play(error):
-        if error:
-            print(f"재생 오류: {error}")
-        future = asyncio.run_coroutine_threadsafe(play_music_next(guild), bot.loop)
+async def _after_main_music_play(guild: discord.Guild, error):
+    if error:
+        print(f"재생 오류: {error}")
         try:
-            future.result()
-        except Exception as e:
-            print(f"다음 곡 재생 오류: {e}")
-
-    voice_client.play(source, after=after_play)
+            await send_music_play_error_box(guild, (now_playing.get(guild.id) or {}).get("title", "제목 없음"), error)
+        except Exception:
+            pass
+    try:
+        await play_music_next(guild)
+    except Exception as e:
+        print(f"다음 곡 재생 오류: {e}")
 
 
 class PlayMusicModal(discord.ui.Modal):
@@ -19685,6 +19802,38 @@ async def send_custom_music_now_playing_box(slot: int, guild_id: int, track: dic
         pass
 
 
+async def send_custom_music_play_error_box(slot: int, guild_id: int, title: str, error: Exception | str):
+    client = CUSTOM_BOT_CLIENTS.get(int(slot))
+    guild = bot.get_guild(int(guild_id))
+    if guild is None and client:
+        guild = client.get_guild(int(guild_id))
+    if guild is None:
+        return
+    voice_client = get_custom_music_voice_client(slot, guild_id)
+    voice_channel = getattr(voice_client, "channel", None) if voice_client else None
+    channel = resolve_custom_music_text_channel(guild, voice_channel, None)
+    if not channel:
+        channel = get_channel_by_id_or_name(guild, 0, [MUSIC_NOW_PLAYING_CHANNEL_NAME, MUSIC_COMMAND_CHANNEL_NAME, "현재재생", "뮤직명령어", "music"], "text")
+    if not channel:
+        return
+    err = str(error)
+    if len(err) > 900:
+        err = err[:900] + "..."
+    embed = discord.Embed(
+        title=f"❌ {slot}번 커스텀 봇 재생 실패",
+        description=(
+            f"**{title or '제목 없음'}** 재생을 시작하지 못했어요.\n\n"
+            f"```{err}```\n"
+            "FFmpeg가 없거나, 스트림 URL이 막혔거나, YouTube/SoundCloud가 헤더를 요구하는 경우일 수 있어요."
+        ),
+        color=0xFF6B6B,
+    )
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 async def ensure_custom_music_voice_after_defer(interaction: discord.Interaction, slot: int):
     if interaction.guild is None:
         await interaction.followup.send("❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
@@ -19729,10 +19878,10 @@ async def ensure_custom_music_voice_after_defer(interaction: discord.Interaction
 async def play_custom_music_next(slot: int, guild_id: int):
     client = CUSTOM_BOT_CLIENTS.get(int(slot))
     if not client:
-        return
+        return False
     voice_client = get_custom_music_voice_client(slot, guild_id)
     if voice_client is None:
-        return
+        return False
 
     key = custom_music_key(slot, guild_id)
     queue = get_custom_music_queue(slot, guild_id)
@@ -19742,26 +19891,41 @@ async def play_custom_music_next(slot: int, guild_id: int):
 
     if not queue:
         CUSTOM_MUSIC_NOW_PLAYING[key] = None
-        return
+        return False
 
     track = queue.popleft()
     CUSTOM_MUSIC_NOW_PLAYING[key] = track
     CUSTOM_MUSIC_SKIP_VOTE_USERS.pop(key, None)
+
+    try:
+        source = build_discord_audio_source(track, get_custom_music_volume(slot, guild_id))
+        voice_client.play(source, after=lambda error: asyncio.run_coroutine_threadsafe(
+            _after_custom_music_play(slot, guild_id, error), client.loop
+        ))
+    except Exception as e:
+        CUSTOM_MUSIC_NOW_PLAYING[key] = None
+        print(f"커스텀 봇 {slot}번 재생 시작 실패: {e}")
+        await send_custom_music_play_error_box(slot, guild_id, track.get("title", "제목 없음"), e)
+        if queue:
+            await play_custom_music_next(slot, guild_id)
+        return False
+
     await send_custom_music_now_playing_box(slot, guild_id, track, queued=False)
+    return True
 
-    source = discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS)
-    source = discord.PCMVolumeTransformer(source, volume=get_custom_music_volume(slot, guild_id))
 
-    def after_play(error):
-        if error:
-            print(f"커스텀 봇 {slot}번 재생 오류: {error}")
-        future = asyncio.run_coroutine_threadsafe(play_custom_music_next(slot, guild_id), client.loop)
+async def _after_custom_music_play(slot: int, guild_id: int, error):
+    key = custom_music_key(slot, guild_id)
+    if error:
+        print(f"커스텀 봇 {slot}번 재생 오류: {error}")
         try:
-            future.result()
-        except Exception as e:
-            print(f"커스텀 봇 {slot}번 다음 곡 재생 오류: {e}")
-
-    voice_client.play(source, after=after_play)
+            await send_custom_music_play_error_box(slot, guild_id, (CUSTOM_MUSIC_NOW_PLAYING.get(key) or {}).get("title", "제목 없음"), error)
+        except Exception:
+            pass
+    try:
+        await play_custom_music_next(slot, guild_id)
+    except Exception as e:
+        print(f"커스텀 봇 {slot}번 다음 곡 재생 오류: {e}")
 
 
 class CustomMusicPlayModal(discord.ui.Modal):
