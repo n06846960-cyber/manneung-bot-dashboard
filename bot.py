@@ -35,6 +35,31 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # =========================
+# 로컬 .env 자동 로드
+# =========================
+# python-dotenv가 없어도 bot.py와 같은 폴더의 .env를 자동으로 읽습니다.
+# .env / cookies.txt는 절대 GitHub에 올리지 마세요.
+def load_local_env_file(filename: str = ".env"):
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as fp:
+            for raw_line in fp:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and (key not in os.environ or not os.environ.get(key, "")):
+                    os.environ[key] = value
+    except Exception as e:
+        print(f"⚠️ .env 로드 실패: {e}")
+
+load_local_env_file()
+
+# =========================
 # 기본 설정
 # =========================
 # 토큰 설정
@@ -641,6 +666,23 @@ CREATE TABLE IF NOT EXISTS censor_category_settings (
 """)
 conn.commit()
 
+# 생일 등록/수정 시스템입니다. /생일 명령어로 유저가 직접 등록하고,
+# 🎁-생일기록 채널에 자동으로 정리됩니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS birthday_records (
+    guild_id INTEGER,
+    user_id INTEGER,
+    month INTEGER,
+    day INTEGER,
+    birth_year INTEGER DEFAULT 0,
+    age_visible INTEGER DEFAULT 0,
+    note TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+conn.commit()
+
 
 def migrate_security_settings_table():
     """예전 database.db도 새 보안패널 옵션을 바로 쓸 수 있게 컬럼을 자동 추가합니다."""
@@ -1204,6 +1246,7 @@ FRIEND_ROLE_NAMES = [
     "VIP", "VVIP", "귀빈", "우수회원", "단골", "서버부스터", "후원자",
     "스트리머", "유튜버", "디자이너", "개발자",
     "남성", "여성",
+    "친구구해요", "우프구해요", "게임친구구해요", "수다친구구해요",
     "롤", "발로란트", "배틀그라운드", "이터널리턴", "마인크래프트", "로블록스",
     "오버워치", "서든어택", "피파", "스타크래프트", "종합게임",
     "20대", "10대",
@@ -1216,6 +1259,7 @@ DIVIDER_ROLE_NAMES = [
     "˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚",
     "˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚",
     "˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚",
+    "˚₊‧꒰ა 🤝 친구구하기 ໒꒱ ‧₊˚",
     "˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚",
 ]
 
@@ -2327,6 +2371,7 @@ async def register_server(interaction: discord.Interaction):
 # =========================
 
 PROFILE_ROLE_NAMES = ["남성", "여성", "20대", "10대"]
+FRIEND_WANTED_ROLE_NAMES = ["친구구해요", "우프구해요", "게임친구구해요", "수다친구구해요"]
 
 
 class ProfileRoleSelect(discord.ui.Select):
@@ -2435,6 +2480,58 @@ class CreatorRoleSelectView(discord.ui.View):
         self.add_item(CreatorRoleSelect())
 
 
+class FriendWantedRoleSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, description=f"{name} 역할을 선택/해제합니다.")
+            for name in FRIEND_WANTED_ROLE_NAMES
+        ]
+        super().__init__(
+            placeholder="친구구하기 역할을 선택해주세요",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            custom_id="friend_wanted_role_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        member = interaction.user
+        selected_names = set(self.values)
+        add_roles = []
+        remove_roles = []
+        for role_name in FRIEND_WANTED_ROLE_NAMES:
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if role is None:
+                continue
+            if role_name in selected_names and role not in member.roles:
+                add_roles.append(role)
+            elif role_name not in selected_names and role in member.roles:
+                remove_roles.append(role)
+        try:
+            if add_roles:
+                await member.add_roles(*add_roles, reason="친구구하기 역할 선택")
+            if remove_roles:
+                await member.remove_roles(*remove_roles, reason="친구구하기 역할 선택 해제")
+        except discord.Forbidden:
+            return await interaction.response.send_message("❌ 봇 역할 위치가 낮아서 역할을 지급/해제할 수 없습니다.", ephemeral=True)
+        except discord.HTTPException:
+            return await interaction.response.send_message("❌ 역할 처리 중 오류가 발생했습니다.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ 친구구하기 역할이 적용되었습니다.\n"
+            f"추가: {', '.join(role.name for role in add_roles) if add_roles else '없음'}\n"
+            f"해제: {', '.join(role.name for role in remove_roles) if remove_roles else '없음'}",
+            ephemeral=True
+        )
+
+
+class FriendWantedRoleSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(FriendWantedRoleSelect())
+
+
 class ProfileRoleSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -2500,6 +2597,13 @@ async def create_profile_role_panel(interaction: discord.Interaction):
         color=BOT_COLOR
     )
     await channel.send(embed=creator_embed, view=CreatorRoleSelectView())
+
+    friend_embed = discord.Embed(
+        title="🤝 친구구하기 역할 선택",
+        description="친구구해요, 우프구해요, 게임친구구해요, 수다친구구해요 역할을 선택할 수 있습니다.",
+        color=BOT_COLOR
+    )
+    await channel.send(embed=friend_embed, view=FriendWantedRoleSelectView())
 
     await interaction.followup.send(
         f"✅ 역할 선택 패널을 {channel.mention} 에 생성했습니다.",
@@ -5116,12 +5220,21 @@ async def get_or_create_text_channel(guild: discord.Guild, name: str, category: 
     return channel
 
 
-async def get_or_create_voice_channel(guild: discord.Guild, name: str, category: discord.CategoryChannel):
+async def get_or_create_voice_channel(guild: discord.Guild, name: str, category: discord.CategoryChannel, user_limit: int = None):
     channel = discord.utils.get(guild.voice_channels, name=name)
     if channel is None:
-        channel = await guild.create_voice_channel(name, category=category)
-    elif channel.category != category:
-        await channel.edit(category=category)
+        kwargs = {"category": category}
+        if user_limit is not None:
+            kwargs["user_limit"] = int(user_limit or 0)
+        channel = await guild.create_voice_channel(name, **kwargs)
+    else:
+        edit_kwargs = {}
+        if channel.category != category:
+            edit_kwargs["category"] = category
+        if user_limit is not None and channel.user_limit != int(user_limit or 0):
+            edit_kwargs["user_limit"] = int(user_limit or 0)
+        if edit_kwargs:
+            await channel.edit(**edit_kwargs)
     return channel
 
 
@@ -5225,6 +5338,297 @@ async def apply_member_category_permissions(guild: discord.Guild, category: disc
 
 
 
+# =========================
+# 친목섭 확장 레이아웃 / 생일 / 임시 음성방
+# =========================
+FRIEND_RESET_CATEGORY_NAMES = [
+    DEFAULT_SERVER_CATEGORY_NAME,
+    "📌 필독",
+    "💬 채팅방",
+    "🔊 음성방",
+    "🎮 게임방",
+    BOT_COMMAND_CATEGORY_NAME,
+    SHOP_CATEGORY_NAME,
+    MUSIC_CATEGORY_NAME,
+    TTS_CATEGORY_NAME,
+    "⚔️ 내전방",
+    "🎤 버스킹",
+    "🔞 수위방",
+    TEMP_VOICE_CATEGORY_NAME,
+    "🎉 이벤트",
+    "💕 2인실",
+    "🏠 개인방",
+    "🎂 생일방",
+]
+
+MUSIC_RECOMMEND_CHANNEL_NAMES = {"🎧-음악추천", "음악추천", "노래추천", "music-recommend"}
+
+
+def is_music_recommendation_channel(channel) -> bool:
+    name = getattr(channel, "name", "") or ""
+    return name in MUSIC_RECOMMEND_CHANNEL_NAMES or "음악추천" in name or "노래추천" in name
+
+
+def is_official_support_guild(guild: discord.Guild) -> bool:
+    """개발로그는 공식 지원 서버에서만 생성/표시합니다.
+
+    Render/로컬 환경변수 중 하나에 공식 지원 서버 ID를 넣으면 그 서버에서만 개발로그가 생성됩니다.
+    OFFICIAL_SUPPORT_GUILD_ID, SUPPORT_GUILD_ID, DEVLOG_GUILD_ID 중 하나를 사용할 수 있습니다.
+    """
+    if guild is None:
+        return False
+    raw = (
+        os.getenv("OFFICIAL_SUPPORT_GUILD_ID", "").strip()
+        or os.getenv("SUPPORT_GUILD_ID", "").strip()
+        or os.getenv("DEVLOG_GUILD_ID", "").strip()
+    )
+    if not raw:
+        return False
+    allowed_ids = {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
+    return int(guild.id) in allowed_ids
+
+
+async def reset_friend_setup_categories(guild: discord.Guild):
+    """/서버시작 친목섭 서버세팅 전용: 자동 세팅 카테고리를 정리하고 다시 만들 준비를 합니다.
+
+    로그/티켓/서버스탯은 기록 보존을 위해 삭제하지 않습니다.
+    사람이 들어있는 음성방은 삭제하지 않고 건너뜁니다.
+    """
+    deleted_channels = 0
+    deleted_categories = 0
+    skipped_channels = 0
+    for name in FRIEND_RESET_CATEGORY_NAMES:
+        category = discord.utils.get(guild.categories, name=name)
+        if category is None:
+            continue
+        for channel in list(category.channels):
+            if isinstance(channel, discord.VoiceChannel) and any(not m.bot for m in channel.members):
+                skipped_channels += 1
+                continue
+            try:
+                await channel.delete(reason="친목섭 서버세팅 재생성 정리")
+                deleted_channels += 1
+                await asyncio.sleep(0.15)
+            except (discord.Forbidden, discord.HTTPException):
+                skipped_channels += 1
+        try:
+            if not category.channels:
+                await category.delete(reason="친목섭 서버세팅 재생성 정리")
+                deleted_categories += 1
+                await asyncio.sleep(0.15)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    return {"deleted_channels": deleted_channels, "deleted_categories": deleted_categories, "skipped_channels": skipped_channels}
+
+
+async def send_channel_guide_once(channel: discord.TextChannel, title: str, description: str, *, color: int = BOT_COLOR):
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                if (msg.embeds[0].title or "") == title:
+                    return False
+    except discord.HTTPException:
+        pass
+    embed = discord.Embed(title=title, description=description, color=color)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="만능 봇 | 친목섭 서버세팅")
+    try:
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def create_chat_extra_channels(guild: discord.Guild, chat_category: discord.CategoryChannel):
+    """채팅방 카테고리에 요청한 채널을 보기 좋게 추가합니다."""
+    await apply_member_category_permissions(guild, chat_category)
+    channel_map = {}
+    for channel_name in [
+        "💬-자유채팅",
+        "📷-사진",
+        "🙋‍♂️-남자얼공방",
+        "🙋‍♀️-여자얼공방",
+        "💖-반응요청방",
+        "🎧-음악추천",
+        "🏷️-별명변경방",
+        "🤝-친구구하기",
+    ]:
+        channel_map[channel_name] = await get_or_create_text_channel(guild, channel_name, chat_category)
+        await asyncio.sleep(0.05)
+
+    await send_channel_guide_once(
+        channel_map["🎧-음악추천"],
+        "🎧 음악추천 채널 안내",
+        "이 채널은 음악 추천을 위한 공간이라 일반 사이트 링크를 허용합니다.\n"
+        "유튜브, 사클, 음원 사이트 링크나 제목을 자유롭게 추천해도 돼요.\n"
+        "단, 디스코드 초대링크/위험 파일/토큰 의심 문자열은 계속 보호됩니다.",
+    )
+    await send_channel_guide_once(
+        channel_map["🏷️-별명변경방"],
+        "🏷️ 별명변경방 안내",
+        "바꾸고 싶은 별명/호칭을 적어주세요. 관리자가 확인하고 정리할 수 있어요.",
+    )
+    await send_channel_guide_once(
+        channel_map["🤝-친구구하기"],
+        "🤝 친구구하기 안내",
+        "친구구해요, 우프구해요, 게임친구구해요 같은 역할을 받고 편하게 사람을 찾아보세요.\n"
+        "역할은 `🎭-역할선택` 채널의 선택 박스에서 받을 수 있어요.",
+    )
+    return channel_map
+
+
+async def create_requested_voice_layout(guild: discord.Guild):
+    """요청한 음성/내전/버스킹/수위/이벤트/2인실/개인방 레이아웃을 생성합니다."""
+    created = {}
+
+    voice_category = await get_or_create_category(guild, "🔊 음성방")
+    await apply_member_category_permissions(guild, voice_category)
+    for idx in range(1, 3):
+        await get_or_create_voice_channel(guild, f"🌱 뉴페 적응방 {idx}", voice_category, user_limit=7)
+    for idx in range(1, 4):
+        await get_or_create_voice_channel(guild, f"🌸 뉴페 통화방 {idx}", voice_category, user_limit=10)
+    for idx in range(1, 3):
+        await get_or_create_voice_channel(guild, f"🌿 서버 적응방 {idx}", voice_category, user_limit=10)
+    for idx in range(3, 5):
+        await get_or_create_voice_channel(guild, f"🌳 서버 적응방 {idx}", voice_category, user_limit=15)
+    created["voice_category"] = voice_category
+
+    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
+    await apply_member_category_permissions(guild, scrim_category)
+    await get_or_create_text_channel(guild, "⚔️-내전", scrim_category)
+    await get_or_create_voice_channel(guild, "⚔️ 내전 대기실", scrim_category, user_limit=11)
+    await get_or_create_voice_channel(guild, "🔴 내전팀 (1)", scrim_category, user_limit=6)
+    await get_or_create_voice_channel(guild, "🔵 내전팀 (2)", scrim_category, user_limit=6)
+    created["scrim_category"] = scrim_category
+
+    busking_category = await get_or_create_category(guild, "🎤 버스킹")
+    await apply_member_category_permissions(guild, busking_category)
+    await get_or_create_text_channel(guild, "🎤-버스킹채팅", busking_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, busking_category)
+    created["busking_category"] = busking_category
+
+    adult_category = await get_or_create_category(guild, "🔞 수위방")
+    await apply_member_category_permissions(guild, adult_category)
+    await get_or_create_text_channel(guild, "🔞-수위채팅", adult_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, adult_category)
+    created["adult_category"] = adult_category
+
+    event_category = await get_or_create_category(guild, "🎉 이벤트")
+    await apply_member_category_permissions(guild, event_category)
+    await get_or_create_text_channel(guild, "🎉-이벤트공지", event_category)
+    await get_or_create_text_channel(guild, "📋-이벤트목록", event_category)
+    await get_or_create_voice_channel(guild, "🎉 이벤트 통화방", event_category)
+    created["event_category"] = event_category
+
+    two_category = await get_or_create_category(guild, "💕 2인실")
+    await apply_member_category_permissions(guild, two_category)
+    await get_or_create_voice_channel(guild, "➕ 음성방 생성", two_category, user_limit=2)
+    for idx in range(1, 6):
+        await get_or_create_voice_channel(guild, f"💕 2인실 {idx}", two_category, user_limit=2)
+    created["two_person_category"] = two_category
+
+    private_category = await get_or_create_category(guild, "🏠 개인방")
+    await apply_member_category_permissions(guild, private_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, private_category)
+    await get_or_create_voice_channel(guild, "🏠 개인방 1", private_category)
+    await get_or_create_voice_channel(guild, "🏠 개인방 2", private_category)
+    created["private_category"] = private_category
+
+    afk_category = await get_or_create_category(guild, TEMP_VOICE_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, afk_category)
+    await get_or_create_voice_channel(guild, "😴 잠수방", afk_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, afk_category)
+    created["afk_category"] = afk_category
+
+    return created
+
+
+async def create_birthday_channels(guild: discord.Guild):
+    category = await get_or_create_category(guild, "🎂 생일방")
+    await apply_member_category_permissions(guild, category)
+    register_channel = await get_or_create_text_channel(guild, "🎂-생일등록", category)
+    record_channel = await get_or_create_text_channel(guild, "🎁-생일기록", category)
+    await send_channel_guide_once(
+        register_channel,
+        "🎂 생일등록 안내",
+        "이 채널에서 `/생일 작업:등록 날짜:MM-DD 나이공개:True/False` 형식으로 생일을 등록할 수 있어요.\n\n"
+        "예시\n"
+        "`/생일 작업:등록 날짜:03-14 나이공개:False`\n"
+        "`/생일 작업:수정 날짜:2009-03-14 나이공개:True`\n\n"
+        "나이 공개를 끄면 생일기록에는 월/일만 표시됩니다.",
+    )
+    await sync_birthday_record_channel(guild)
+    return category, register_channel, record_channel
+
+
+def parse_birthday_date(text: str):
+    value = (text or "").strip().replace("/", "-").replace(".", "-")
+    match = re.fullmatch(r"(?:(\d{4})-)?(\d{1,2})-(\d{1,2})", value)
+    if not match:
+        return None
+    year = int(match.group(1) or 0)
+    month = int(match.group(2))
+    day = int(match.group(3))
+    try:
+        datetime.date(year or 2000, month, day)
+    except ValueError:
+        return None
+    return year, month, day
+
+
+def format_birthday_record(guild: discord.Guild, row):
+    user_id, month, day, birth_year, age_visible, note = row
+    age_text = ""
+    if age_visible and birth_year:
+        today = datetime.date.today()
+        age = today.year - int(birth_year) - ((today.month, today.day) < (int(month), int(day)))
+        if age >= 0:
+            age_text = f" · {age}살"
+    note_text = f" · {note}" if note else ""
+    return f"🎂 <@{int(user_id)}> — **{int(month):02d}/{int(day):02d}**{age_text}{note_text}"
+
+
+async def sync_birthday_record_channel(guild: discord.Guild):
+    channel = get_channel_by_id_or_name(guild, 0, ["🎁-생일기록", "생일기록"], "text")
+    if not channel:
+        return False
+    try:
+        c.execute(
+            "SELECT user_id, month, day, birth_year, age_visible, note FROM birthday_records WHERE guild_id=? ORDER BY month ASC, day ASC, user_id ASC",
+            (guild.id,)
+        )
+        rows = c.fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    embed = discord.Embed(
+        title="🎁 생일기록",
+        description="등록된 생일을 월/일 순서로 정리했어요. `/생일` 명령어로 직접 등록/수정할 수 있습니다.",
+        color=0xFFB6C1,
+    )
+    if rows:
+        chunks = []
+        for row in rows[:80]:
+            chunks.append(format_birthday_record(guild, row))
+        embed.add_field(name=f"등록된 생일 {len(rows)}명", value="\n".join(chunks)[:1024], inline=False)
+        if len(rows) > 80:
+            embed.add_field(name="안내", value=f"외 {len(rows)-80}명은 DB에 저장되어 있어요.", inline=False)
+    else:
+        embed.add_field(name="아직 기록 없음", value="`/생일 작업:등록 날짜:MM-DD` 로 첫 생일을 등록해보세요.", inline=False)
+    embed.set_footer(text="만능 봇 | 생일기록 자동 업데이트")
+
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds and (msg.embeds[0].title or "") == "🎁 생일기록":
+                await msg.edit(embed=embed)
+                return True
+        await channel.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
 async def build_music_panel_embed():
     """뮤직 패널 임베드를 만듭니다."""
     return create_embed(
@@ -5309,6 +5713,7 @@ async def create_music_category_channels(guild: discord.Guild, *, send_panel: bo
     now_playing_channel = await get_or_create_text_channel(guild, MUSIC_NOW_PLAYING_CHANNEL_NAME, music_category)
     queue_channel = await get_or_create_text_channel(guild, MUSIC_QUEUE_CHANNEL_NAME, music_category)
     music_voice_channel = await get_or_create_voice_channel(guild, MUSIC_VOICE_CHANNEL_NAME, music_category)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, music_category)
 
     panel_sent = False
     now_guide_sent = False
@@ -5727,6 +6132,7 @@ async def create_tts_category_channels(guild: discord.Guild):
         voice_channel = await get_or_create_voice_channel(guild, voice_name, tts_category)
         tts_voice_channels.append(voice_channel)
         await asyncio.sleep(0.1)
+    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, tts_category)
 
     guide_sent = await send_tts_guide_to_channel(tts_text_channel)
     first_voice_channel = tts_voice_channels[0] if tts_voice_channels else None
@@ -5875,6 +6281,9 @@ async def create_friend_roles(guild: discord.Guild):
         ("˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚", [
             "남성", "여성", "20대", "10대",
         ]),
+        ("˚₊‧꒰ა 🤝 친구구하기 ໒꒱ ‧₊˚", [
+            "친구구해요", "우프구해요", "게임친구구해요", "수다친구구해요",
+        ]),
         ("˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚", [
             "롤", "발로란트", "배틀그라운드", "이터널리턴", "마인크래프트", "로블록스",
             "오버워치", "서든어택", "피파", "스타크래프트", "종합게임",
@@ -5931,6 +6340,7 @@ async def create_friend_roles(guild: discord.Guild):
         "˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚": discord.Color.from_rgb(180, 130, 255),
         "˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚": discord.Color.from_rgb(72, 210, 255),
         "˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 128, 170),
+        "˚₊‧꒰ა 🤝 친구구하기 ໒꒱ ‧₊˚": discord.Color.from_rgb(120, 255, 190),
         "˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 210, 92),
         "˚₊‧꒰ა ⭐ 멤버등급 ໒꒱ ‧₊˚": discord.Color.from_rgb(255, 154, 202),
 
@@ -5977,6 +6387,10 @@ async def create_friend_roles(guild: discord.Guild):
         "여성": discord.Color.from_rgb(255, 84, 167),
         "10대": discord.Color.from_rgb(100, 230, 145),
         "20대": discord.Color.from_rgb(50, 190, 120),
+        "친구구해요": discord.Color.from_rgb(120, 255, 190),
+        "우프구해요": discord.Color.from_rgb(255, 185, 120),
+        "게임친구구해요": discord.Color.from_rgb(120, 200, 255),
+        "수다친구구해요": discord.Color.from_rgb(255, 150, 210),
 
         # 게임역할
         "롤": discord.Color.from_rgb(120, 170, 210),
@@ -6179,14 +6593,10 @@ async def create_friend_server_layout(guild: discord.Guild):
     rule_category, rule_channel, rules_channel, rules_message_sent = await create_rule_category_channels(guild)
 
     chat_category = await get_or_create_category(guild, "💬 채팅방")
-    await apply_member_category_permissions(guild, chat_category)
-    await get_or_create_text_channel(guild, "💬-자유채팅", chat_category)
-    await get_or_create_text_channel(guild, "📷-사진", chat_category)
+    chat_channels = await create_chat_extra_channels(guild, chat_category)
 
-    voice_category = await get_or_create_category(guild, "🔊 음성방")
-    await apply_member_category_permissions(guild, voice_category)
-    await get_or_create_voice_channel(guild, "🔊 음성방 1", voice_category)
-    await get_or_create_voice_channel(guild, "🔊 음성방 2", voice_category)
+    requested_voice_layout = await create_requested_voice_layout(guild)
+    voice_category = requested_voice_layout.get("voice_category")
 
     game_category = await get_or_create_category(guild, "🎮 게임방")
     await apply_member_category_permissions(guild, game_category)
@@ -6208,25 +6618,8 @@ async def create_friend_server_layout(guild: discord.Guild):
 
     tts_category, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
 
-    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
-    await apply_member_category_permissions(guild, scrim_category)
-    await get_or_create_text_channel(guild, "⚔️-내전", scrim_category)
-    await get_or_create_voice_channel(guild, "⚔️ 내전 대기방", scrim_category)
-
-    busking_category = await get_or_create_category(guild, "🎤 버스킹")
-    await apply_member_category_permissions(guild, busking_category)
-    await get_or_create_text_channel(guild, "🎤-버스킹채팅", busking_category)
-    await get_or_create_voice_channel(guild, "🎤 버스킹 무대", busking_category)
-
-    adult_category = await get_or_create_category(guild, "🔞 수위방")
-    await apply_member_category_permissions(guild, adult_category)
-    await get_or_create_text_channel(guild, "🔞-수위채팅", adult_category)
-    await get_or_create_voice_channel(guild, "🔞 수위 음성", adult_category)
-
-    afk_category = await get_or_create_category(guild, TEMP_VOICE_CATEGORY_NAME)
-    await apply_member_category_permissions(guild, afk_category)
-    await get_or_create_voice_channel(guild, "😴 잠수방", afk_category)
-    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, afk_category)
+    # 요청한 내전방/버스킹/수위방/이벤트/2인실/개인방/잠수방은 create_requested_voice_layout에서 생성됩니다.
+    birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
 
     welcome_channel = get_channel_by_id_or_name(guild, WELCOME_CHANNEL_ID, ["👋︱인사-퇴장", "👋ㅣ인사-퇴장", "👋-인사-퇴장", "인사-퇴장", "환영", "welcome"], "text")
     goodbye_channel = get_channel_by_id_or_name(guild, GOODBYE_CHANNEL_ID, ["👋︱인사-퇴장", "👋ㅣ인사-퇴장", "👋-인사-퇴장", "인사-퇴장", "퇴장", "goodbye"], "text")
@@ -6274,6 +6667,9 @@ async def create_friend_server_layout(guild: discord.Guild):
         "point_guide_sent": bot_command_layout.get("point_guide_sent"),
         "shop_guide_sent": bot_command_layout.get("shop_guide_sent"),
         "level_guide_sent": bot_command_layout.get("level_guide_sent"),
+        "birthday_category": birthday_category,
+        "birthday_register_channel": birthday_register_channel,
+        "birthday_record_channel": birthday_record_channel,
         "tts_text_channel": tts_text_channel,
         "tts_voice_channel": tts_voice_channel,
         "tts_guide_sent": tts_guide_sent,
@@ -6944,7 +7340,7 @@ async def security_panel_command(interaction: discord.Interaction):
 @bot.tree.command(name="서버시작", description="서버 초기 세팅 방식을 선택해서 자동으로 시작합니다.")
 @app_commands.describe(방식="서버를 어떤 형태로 초기 세팅할지 선택하세요.")
 @app_commands.choices(방식=[
-    app_commands.Choice(name="친목섭 전체세팅", value="friend"),
+    app_commands.Choice(name="친목섭 서버세팅", value="friend"),
     app_commands.Choice(name="기본채널만 생성", value="basic"),
     app_commands.Choice(name="보안설정만 켜기", value="security"),
 ])
@@ -6960,11 +7356,12 @@ async def server_start_command(interaction: discord.Interaction, 방식: app_com
     guild = interaction.guild
 
     if 방식.value == "friend":
+        reset_result = await reset_friend_setup_categories(guild)
         created_roles, deleted_roles, skipped_delete_roles, updated_roles = await create_friend_roles(guild)
         _, created_log_channels = await ensure_log_category_channels(guild)
         layout = await create_friend_server_layout(guild)
         stats_category, created_stats_channels = await ensure_server_stats_channels(guild)
-        devlog_result = await ensure_development_log_channels(guild)
+        devlog_result = await ensure_development_log_channels(guild) if is_official_support_guild(guild) else {"created": [], "updated": [], "channels": {}}
         set_security_setting(guild.id, "auto_filter", True)
         set_security_setting(guild.id, "malicious_user_detection", True)
         set_security_setting(guild.id, "raid_detection", True)
@@ -6973,22 +7370,23 @@ async def server_start_command(interaction: discord.Interaction, 방식: app_com
         set_security_setting(guild.id, "new_account_guard", True)
         set_security_setting(guild.id, "security_log_enabled", True)
         text = (
-            "🌸 **친목섭 전체세팅 완료**\n"
+            "🌸 **친목섭 서버세팅 완료**\n"
+            f"🧹 기존 자동세팅 정리: 카테고리 `{reset_result.get('deleted_categories', 0)}`개 / 채널 `{reset_result.get('deleted_channels', 0)}`개 / 건너뜀 `{reset_result.get('skipped_channels', 0)}`개\n"
             f"🎭 역할: 새로 생성 `{len(created_roles)}`개 / 삭제 못함 `{len(skipped_delete_roles)}`개\n"
             f"📁 로그 채널: 새로 생성 `{len(created_log_channels)}`개\n"
             f"📊 서버스텟: 새로 생성 `{created_stats_channels}`개\n"
-            f"📈 개발로그: 새로 생성 `{len(devlog_result.get('created', []))}`개 / 알림패널 준비\n"
+            f"📈 개발로그: {'공식 지원 서버라 생성됨' if is_official_support_guild(guild) else '공식 지원 서버에서만 생성'} / 새로 생성 `{len(devlog_result.get('created', []))}`개\n"
             f"🎵 뮤직패널: {'새로 전송됨' if layout.get('music_panel_sent') else '이미 있음'}\n"
             "🛡️ 자동검열/악성유저감지/테러감지/도배보호/멘션테러/새계정보호: 켜짐"
         )
     elif 방식.value == "basic":
         _, created_log_channels = await ensure_log_category_channels(guild)
         layout = await create_friend_server_layout(guild)
-        devlog_result = await ensure_development_log_channels(guild)
+        devlog_result = await ensure_development_log_channels(guild) if is_official_support_guild(guild) else {"created": [], "updated": [], "channels": {}}
         text = (
             "📦 **기본채널 세팅 완료**\n"
             f"📁 로그 채널: 새로 생성 `{len(created_log_channels)}`개\n"
-            f"📈 개발로그: 새로 생성 `{len(devlog_result.get('created', []))}`개 / 알림패널 준비\n"
+            f"📈 개발로그: {'공식 지원 서버라 생성됨' if is_official_support_guild(guild) else '공식 지원 서버에서만 생성'} / 새로 생성 `{len(devlog_result.get('created', []))}`개\n"
             f"✅ 인증채널: {layout.get('verify_channel').mention if layout.get('verify_channel') else '미설정'}\n"
             f"🎵 뮤직명령어방: {layout.get('music_command_channel').mention if layout.get('music_command_channel') else '미설정'}"
         )
@@ -7113,9 +7511,12 @@ async def create_friend_server(interaction: discord.Interaction, 생성범위: a
             _, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
             result_lines.append(f"🔊 TTS: {tts_text_channel.mention if tts_text_channel else '미설정'} / 음성 {tts_voice_channel.mention if tts_voice_channel else '미설정'} / 안내 {'새로 전송됨' if tts_guide_sent else '이미 있음'}")
         elif scope == "devlog":
-            devlog_result = await ensure_development_log_channels(guild)
-            await send_development_log_intro_embeds(guild)
-            result_lines.append(f"📈 개발로그: 새로 생성 `{len(devlog_result.get('created', []))}`개 / 안내패널 준비")
+            if is_official_support_guild(guild):
+                devlog_result = await ensure_development_log_channels(guild)
+                await send_development_log_intro_embeds(guild)
+                result_lines.append(f"📈 개발로그: 공식 지원 서버 확인 / 새로 생성 `{len(devlog_result.get('created', []))}`개 / 안내패널 준비")
+            else:
+                result_lines.append("📈 개발로그: 공식 지원 서버에서만 생성됩니다. `OFFICIAL_SUPPORT_GUILD_ID`를 공식 지원 서버 ID로 설정해주세요.")
         else:
             layout = await create_friend_server_layout(guild)
             result_lines.append(
@@ -7209,15 +7610,11 @@ async def create_default_server_categories(interaction: discord.Interaction):
     rule_category, rule_channel, rules_channel, rules_message_sent = await create_rule_category_channels(guild)
 
     chat_category = await get_or_create_category(guild, "💬 채팅방")
-    await apply_member_category_permissions(guild, chat_category)
-    await get_or_create_text_channel(guild, "💬-자유채팅", chat_category)
-    await get_or_create_text_channel(guild, "📷-사진", chat_category)
+    chat_channels = await create_chat_extra_channels(guild, chat_category)
     await get_or_create_text_channel(guild, "🤖-봇명령어", chat_category)
 
-    voice_category = await get_or_create_category(guild, "🔊 음성방")
-    await apply_member_category_permissions(guild, voice_category)
-    await get_or_create_voice_channel(guild, "🔊 음성방 1", voice_category)
-    await get_or_create_voice_channel(guild, "🔊 음성방 2", voice_category)
+    requested_voice_layout = await create_requested_voice_layout(guild)
+    voice_category = requested_voice_layout.get("voice_category")
 
     game_category = await get_or_create_category(guild, "🎮 게임방")
     await apply_member_category_permissions(guild, game_category)
@@ -7239,25 +7636,8 @@ async def create_default_server_categories(interaction: discord.Interaction):
 
     tts_category, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
 
-    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
-    await apply_member_category_permissions(guild, scrim_category)
-    await get_or_create_text_channel(guild, "⚔️-내전", scrim_category)
-    await get_or_create_voice_channel(guild, "⚔️ 내전 대기방", scrim_category)
-
-    busking_category = await get_or_create_category(guild, "🎤 버스킹")
-    await apply_member_category_permissions(guild, busking_category)
-    await get_or_create_text_channel(guild, "🎤-버스킹채팅", busking_category)
-    await get_or_create_voice_channel(guild, "🎤 버스킹 무대", busking_category)
-
-    adult_category = await get_or_create_category(guild, "🔞 수위방")
-    await apply_member_category_permissions(guild, adult_category)
-    await get_or_create_text_channel(guild, "🔞-수위채팅", adult_category)
-    await get_or_create_voice_channel(guild, "🔞 수위 음성", adult_category)
-
-    afk_category = await get_or_create_category(guild, TEMP_VOICE_CATEGORY_NAME)
-    await apply_member_category_permissions(guild, afk_category)
-    await get_or_create_voice_channel(guild, "😴 잠수방", afk_category)
-    await get_or_create_voice_channel(guild, TEMP_VOICE_CREATE_CHANNEL_NAME, afk_category)
+    # 요청한 내전방/버스킹/수위방/이벤트/2인실/개인방/잠수방은 create_requested_voice_layout에서 생성됩니다.
+    birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
 
     welcome_channel = get_channel_by_id_or_name(guild, WELCOME_CHANNEL_ID, ["👋︱인사-퇴장", "👋ㅣ인사-퇴장", "👋-인사-퇴장", "인사-퇴장", "환영", "welcome"], "text")
     goodbye_channel = get_channel_by_id_or_name(guild, GOODBYE_CHANNEL_ID, ["👋︱인사-퇴장", "👋ㅣ인사-퇴장", "👋-인사-퇴장", "인사-퇴장", "퇴장", "goodbye"], "text")
@@ -7285,6 +7665,90 @@ async def create_default_server_categories(interaction: discord.Interaction):
         ephemeral=True
     )
     await send_log(guild, f"📦 기본 카테고리 생성/확인\n관리자: {interaction.user.mention}", "general")
+
+
+@bot.tree.command(name="생일", description="생일을 등록/수정/삭제/확인합니다.")
+@app_commands.describe(
+    작업="등록, 수정, 삭제, 확인, 목록 중 선택하세요.",
+    날짜="MM-DD 또는 YYYY-MM-DD 형식입니다. 예: 03-14 / 2009-03-14",
+    나이공개="True면 생일기록에 나이를 표시합니다. 생년이 없으면 월/일만 표시됩니다.",
+    메모="선택 메모입니다. 예: 케이크 좋아함"
+)
+@app_commands.choices(작업=[
+    app_commands.Choice(name="등록", value="register"),
+    app_commands.Choice(name="수정", value="edit"),
+    app_commands.Choice(name="삭제", value="delete"),
+    app_commands.Choice(name="확인", value="check"),
+    app_commands.Choice(name="목록", value="list"),
+])
+async def birthday_command(
+    interaction: discord.Interaction,
+    작업: app_commands.Choice[str],
+    날짜: str = None,
+    나이공개: bool = False,
+    메모: str = None,
+):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+    await create_birthday_channels(guild)
+
+    action = 작업.value
+    if action in {"register", "edit"}:
+        parsed = parse_birthday_date(날짜 or "")
+        if not parsed:
+            return await interaction.followup.send("❌ 날짜 형식이 올바르지 않습니다. `03-14` 또는 `2009-03-14` 처럼 입력해주세요.", ephemeral=True)
+        year, month, day = parsed
+        now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            c.execute(
+                """
+                INSERT INTO birthday_records(guild_id, user_id, month, day, birth_year, age_visible, note, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    month=excluded.month,
+                    day=excluded.day,
+                    birth_year=excluded.birth_year,
+                    age_visible=excluded.age_visible,
+                    note=excluded.note,
+                    updated_at=excluded.updated_at
+                """,
+                (guild.id, interaction.user.id, month, day, year, 1 if 나이공개 else 0, (메모 or "")[:80], now_text)
+            )
+            conn.commit()
+        except sqlite3.Error as e:
+            return await interaction.followup.send(f"❌ 생일 저장 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+        await sync_birthday_record_channel(guild)
+        return await interaction.followup.send(
+            f"✅ 생일이 {'수정' if action == 'edit' else '등록'}됐어요.\n"
+            f"생일: **{month:02d}/{day:02d}**\n"
+            f"나이 공개: **{'공개' if 나이공개 else '비공개'}**",
+            ephemeral=True
+        )
+
+    if action == "delete":
+        c.execute("DELETE FROM birthday_records WHERE guild_id=? AND user_id=?", (guild.id, interaction.user.id))
+        changed = c.rowcount
+        conn.commit()
+        await sync_birthday_record_channel(guild)
+        return await interaction.followup.send("✅ 생일 기록을 삭제했어요." if changed else "ℹ️ 삭제할 생일 기록이 없어요.", ephemeral=True)
+
+    if action == "check":
+        c.execute("SELECT user_id, month, day, birth_year, age_visible, note FROM birthday_records WHERE guild_id=? AND user_id=?", (guild.id, interaction.user.id))
+        row = c.fetchone()
+        if not row:
+            return await interaction.followup.send("ℹ️ 아직 생일을 등록하지 않았어요. `/생일 작업:등록 날짜:MM-DD` 로 등록해보세요.", ephemeral=True)
+        return await interaction.followup.send("🎂 내 생일 기록\n" + format_birthday_record(guild, row), ephemeral=True)
+
+    c.execute("SELECT user_id, month, day, birth_year, age_visible, note FROM birthday_records WHERE guild_id=? ORDER BY month ASC, day ASC LIMIT 30", (guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await interaction.followup.send("ℹ️ 아직 등록된 생일이 없어요.", ephemeral=True)
+    text = "\n".join(format_birthday_record(guild, row) for row in rows)
+    await sync_birthday_record_channel(guild)
+    return await interaction.followup.send("🎁 생일 목록\n" + text, ephemeral=True)
 
 
 def get_or_create_user(guild_id: int, user_id: int = None):
@@ -7768,6 +8232,9 @@ async def on_ready():
     bot.add_view(UnifiedTicketView())
     bot.add_view(CloseTicketView())
     bot.add_view(GameRoleView())
+    bot.add_view(ProfileRoleSelectView())
+    bot.add_view(CreatorRoleSelectView())
+    bot.add_view(FriendWantedRoleSelectView())
     bot.add_view(VerifyView())
     bot.add_view(MusicPanelView())
     for _custom_music_slot in (1, 2, 3):
@@ -7819,6 +8286,8 @@ async def on_ready():
 
     if not auto_disconnect_empty_voice_clients.is_running():
         auto_disconnect_empty_voice_clients.start()
+    if not auto_disconnect_empty_custom_voice_clients.is_running():
+        auto_disconnect_empty_custom_voice_clients.start()
 
     if not scheduled_event_sender.is_running():
         scheduled_event_sender.start()
@@ -8047,6 +8516,12 @@ async def auto_disconnect_empty_voice_clients():
             await disconnect_if_voice_empty(voice_client.guild)
         except Exception as e:
             print(f"❌ 자동 퇴장 검사 실패: {e}")
+    if TTS_BOT_TOKEN and tts_sub_bot.is_ready():
+        for guild in list(bot.guilds):
+            try:
+                await disconnect_empty_tts_subbot_for_guild(guild)
+            except Exception as e:
+                print(f"❌ TTS 서브봇 자동 퇴장 검사 실패: {e}")
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -8105,8 +8580,17 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         elif before.channel is not None and after.channel is not None:
             await send_log(member.guild, f"🔁 음성 이동\n유저: {member.mention}\n이전: {before.channel.mention}\n이후: {after.channel.mention}", "voice")
 
-        # 음악/TTS 자동 퇴장: 마지막 유저가 나가면 봇도 자동으로 나갑니다.
+        # TTS 통방 자동 입장: 유저가 TTS 통방에 들어오면 TTS 서브봇을 조용히 입장시킵니다.
+        if not member.bot and after.channel and after.channel.name in TTS_VOICE_CHANNEL_NAMES:
+            try:
+                await ensure_tts_subbot_join_voice(member.guild, after.channel)
+            except Exception as e:
+                print(f"⚠️ TTS 서브봇 자동 입장 실패: {e}")
+
+        # 음악/TTS/커스텀 보조 봇 자동 퇴장: 마지막 유저가 나가면 봇도 자동으로 나갑니다.
         await disconnect_if_voice_empty(member.guild)
+        await disconnect_empty_custom_voice_clients_for_guild(member.guild)
+        await disconnect_empty_tts_subbot_for_guild(member.guild)
 
 @bot.tree.command(name="환영테스트", description="저장된 서버 설정 기준으로 환영 메시지를 테스트합니다.")
 async def welcome_test(interaction: discord.Interaction):
@@ -8601,11 +9085,11 @@ async def speak_tts_in_voice(member: discord.Member, text: str, text_channel: di
     if len(text) > 120:
         return False, "❌ TTS는 120자 이하만 사용할 수 있습니다."
 
-    voice_client = member.guild.voice_client
+    voice_client, connect_error = await connect_tts_voice_client(member.guild, voice_channel)
+    if connect_error:
+        return False, connect_error
     if voice_client is None:
-        voice_client = await voice_channel.connect()
-    elif voice_client.channel != voice_channel:
-        await voice_client.move_to(voice_channel)
+        return False, "❌ TTS 음성 연결에 실패했습니다."
 
     if voice_client.is_playing() or voice_client.is_paused():
         return False, "❌ 현재 다른 음성이 재생 중입니다. 잠시 후 다시 시도해주세요."
@@ -8959,15 +9443,14 @@ async def tts_join_command(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ 먼저 음성 채널에 들어가주세요.", ephemeral=True)
 
     voice_channel = member.voice.channel
-    voice_client = interaction.guild.voice_client
 
     try:
-        if voice_client is None:
-            await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
-        await interaction.response.send_message(f"✅ {voice_channel.mention} 채널에 입장했습니다.", ephemeral=True)
-        await send_log(interaction.guild, f"🔊 TTS 입장\n유저: {interaction.user.mention}\n채널: {voice_channel.mention}", "voice")
+        voice_client, connect_error = await connect_tts_voice_client(interaction.guild, voice_channel)
+        if connect_error:
+            return await interaction.response.send_message(connect_error, ephemeral=True)
+        bot_label = "TTS 서브봇" if TTS_BOT_TOKEN else "메인 봇"
+        await interaction.response.send_message(f"✅ {bot_label}이 {voice_channel.mention} 채널에 입장했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"🔊 TTS 입장\n봇: {bot_label}\n유저: {interaction.user.mention}\n채널: {voice_channel.mention}", "voice")
     except Exception as e:
         await interaction.response.send_message(f"❌ 입장 실패: `{e}`", ephemeral=True)
 
@@ -8977,15 +9460,24 @@ async def tts_leave_command(interaction: discord.Interaction):
     if interaction.guild is None:
         return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
 
-    voice_client = interaction.guild.voice_client
-    if voice_client is None:
-        return await interaction.response.send_message("❌ 봇이 음성 채널에 들어가 있지 않습니다.", ephemeral=True)
-
     try:
+        voice_client = None
+        bot_label = "메인 봇"
+        if TTS_BOT_TOKEN and tts_sub_bot.is_ready():
+            sub_guild = tts_sub_bot.get_guild(interaction.guild.id)
+            if sub_guild:
+                voice_client = discord.utils.get(tts_sub_bot.voice_clients, guild=sub_guild)
+                bot_label = "TTS 서브봇"
+        if voice_client is None:
+            voice_client = interaction.guild.voice_client
+            bot_label = "메인 봇"
+        if voice_client is None:
+            return await interaction.response.send_message("❌ 봇이 음성 채널에 들어가 있지 않습니다.", ephemeral=True)
+
         channel_name = voice_client.channel.name if voice_client.channel else "알 수 없음"
         await voice_client.disconnect(force=True)
-        await interaction.response.send_message("✅ 음성 채널에서 퇴장했습니다.", ephemeral=True)
-        await send_log(interaction.guild, f"👋 TTS 퇴장\n유저: {interaction.user.mention}\n채널: `{channel_name}`", "voice")
+        await interaction.response.send_message(f"✅ {bot_label}이 음성 채널에서 퇴장했습니다.", ephemeral=True)
+        await send_log(interaction.guild, f"👋 TTS 퇴장\n봇: {bot_label}\n유저: {interaction.user.mention}\n채널: `{channel_name}`", "voice")
     except Exception as e:
         await interaction.response.send_message(f"❌ 퇴장 실패: `{e}`", ephemeral=True)
 
@@ -9476,7 +9968,7 @@ async def on_message(message: discord.Message):
         elif censor_settings.get("invite_links", True) and any(word in content_lower for word in AUTO_FILTER_INVITE_WORDS):
             filter_reason = "초대 링크 게시"
             filter_log_title = "🚫 초대 링크 차단"
-        elif censor_settings.get("url_links", False) and URL_BLOCK_REGEX.search(message.content or ""):
+        elif censor_settings.get("url_links", False) and not is_music_recommendation_channel(message.channel) and URL_BLOCK_REGEX.search(message.content or ""):
             filter_reason = "외부 링크 게시"
             filter_log_title = "🔗 일반 링크 차단"
         else:
@@ -19101,6 +19593,8 @@ class DevAlertRoleView(discord.ui.View):
 
 async def send_development_log_intro_embeds(guild: discord.Guild):
     """개발로그 채널별 안내 임베드와 알림 역할 버튼을 중복 없이 전송합니다."""
+    if not is_official_support_guild(guild):
+        return
     for config in DEVELOPMENT_LOG_CHANNELS:
         channel = get_development_log_channel(guild, config["key"])
         if not channel:
@@ -19137,7 +19631,12 @@ async def send_development_log_intro_embeds(guild: discord.Guild):
 
 
 async def ensure_development_log_channels(guild: discord.Guild, *, send_intro: bool = True):
-    """이미지에 나온 개발로그 카테고리와 4개 채널을 생성/정리합니다."""
+    """이미지에 나온 개발로그 카테고리와 4개 채널을 생성/정리합니다.
+
+    개발로그는 공식 지원 서버에서만 생성됩니다.
+    """
+    if not is_official_support_guild(guild):
+        return {"category": None, "created": [], "updated": [], "channels": {}, "alert_role": None}
     alert_role = await get_or_create_development_alert_role(guild)
     overwrites = build_development_log_overwrites(guild, alert_role)
     created = []
@@ -19892,8 +20391,118 @@ CUSTOM_BOT_TOKENS = {
     2: os.getenv("CUSTOM_BOT_TOKEN_2", "").strip(),
     3: os.getenv("CUSTOM_BOT_TOKEN_3", "").strip(),
 }
-CUSTOM_BOT_CLIENTS = {}
 
+TTS_BOT_TOKEN = os.getenv("TTS_BOT_TOKEN", "").strip()
+
+
+class TTSSubBotClient(discord.Client):
+    """TTS 전용 서브봇입니다. 메인봇은 명령어/채팅 감지를 담당하고, 이 봇은 음성 입장과 TTS 재생을 담당합니다."""
+
+    def __init__(self):
+        tts_intents = discord.Intents.default()
+        tts_intents.guilds = True
+        tts_intents.voice_states = True
+        super().__init__(intents=tts_intents)
+
+    async def on_ready(self):
+        print(f"✅ TTS 서브봇 로그인 완료: {self.user}")
+
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        # TTS 서브봇 자신이 음성방을 이동하면 별도 안내 없이 조용히 유지합니다.
+        return
+
+
+tts_sub_bot = TTSSubBotClient()
+
+
+def is_tts_subbot_enabled() -> bool:
+    return bool(TTS_BOT_TOKEN and tts_sub_bot and tts_sub_bot.is_ready())
+
+
+def get_tts_subbot_guild(guild_id: int):
+    if not is_tts_subbot_enabled():
+        return None
+    try:
+        return tts_sub_bot.get_guild(int(guild_id))
+    except Exception:
+        return None
+
+
+async def connect_tts_voice_client(guild: discord.Guild, voice_channel: discord.VoiceChannel):
+    """TTS_BOT_TOKEN이 있으면 TTS 서브봇을, 없으면 메인봇을 음성방에 연결합니다."""
+    if guild is None or voice_channel is None:
+        return None, "❌ TTS 통방을 찾지 못했습니다."
+
+    # TTS 서브봇 토큰이 있으면 서브봇으로 재생합니다.
+    if TTS_BOT_TOKEN:
+        if not tts_sub_bot.is_ready():
+            return None, "❌ TTS 서브봇이 아직 로그인 중입니다. 잠시 후 다시 시도해주세요."
+        sub_guild = tts_sub_bot.get_guild(guild.id)
+        if sub_guild is None:
+            return None, "❌ TTS 서브봇이 이 서버에 초대되어 있지 않습니다. TTS 서브봇을 서버에 초대해주세요."
+        sub_channel = sub_guild.get_channel(voice_channel.id)
+        if not isinstance(sub_channel, discord.VoiceChannel):
+            return None, "❌ TTS 서브봇이 이 음성 채널을 찾지 못했습니다. 권한을 확인해주세요."
+
+        existing = discord.utils.get(tts_sub_bot.voice_clients, guild=sub_guild)
+        if existing is None:
+            return await sub_channel.connect(), None
+        if existing.channel and existing.channel.id != sub_channel.id:
+            await existing.move_to(sub_channel)
+        return existing, None
+
+    # TTS 서브봇 토큰이 없으면 기존처럼 메인봇이 재생합니다.
+    existing = guild.voice_client
+    if existing is None:
+        return await voice_channel.connect(), None
+    if existing.channel != voice_channel:
+        await existing.move_to(voice_channel)
+    return existing, None
+
+
+async def ensure_tts_subbot_join_voice(guild: discord.Guild, voice_channel: discord.VoiceChannel):
+    """유저가 TTS 통방에 들어오면 TTS 서브봇을 자동 입장시킵니다."""
+    if not TTS_BOT_TOKEN or not tts_sub_bot.is_ready():
+        return False
+    if guild is None or voice_channel is None:
+        return False
+    if voice_channel.name not in TTS_VOICE_CHANNEL_NAMES:
+        return False
+    voice_client, error = await connect_tts_voice_client(guild, voice_channel)
+    if error:
+        return False
+    return voice_client is not None
+
+
+async def disconnect_empty_tts_subbot_for_guild(guild: discord.Guild):
+    """TTS 서브봇이 있는 통방에 사람이 없으면 자동 퇴장합니다."""
+    if not TTS_BOT_TOKEN or not tts_sub_bot.is_ready() or guild is None:
+        return False
+    sub_guild = tts_sub_bot.get_guild(guild.id)
+    if sub_guild is None:
+        return False
+    changed = False
+    for vc in list(tts_sub_bot.voice_clients):
+        try:
+            if vc.guild.id != sub_guild.id or vc.channel is None:
+                continue
+            humans = [m for m in vc.channel.members if not m.bot]
+            if humans:
+                continue
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            channel_name = vc.channel.name
+            await vc.disconnect(force=True)
+            changed = True
+            try:
+                await send_log(guild, f"👋 TTS 서브봇 자동 퇴장\n사유: 음성 채널에 유저가 없어 자동 퇴장했습니다.\n채널: `{channel_name}`", "voice")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"❌ TTS 서브봇 자동 퇴장 실패: {e}")
+    return changed
+
+CUSTOM_BOT_CLIENTS = {}
 
 def ensure_custom_bot_tables():
     c.execute("""
@@ -20071,6 +20680,50 @@ async def custom_bot_disconnect_slot(slot: int, guild_id: int):
     return f"✅ {slot}번 커스텀 봇을 퇴장시켰어요." if disconnected else f"ℹ️ {slot}번 커스텀 봇은 이 서버 음성방에 없어요."
 
 
+async def disconnect_empty_custom_voice_clients_for_guild(guild: discord.Guild):
+    """커스텀 보조 봇도 통방에 유저가 없으면 자동 퇴장합니다."""
+    if guild is None:
+        return 0
+    disconnected = 0
+    for slot, client in list(CUSTOM_BOT_CLIENTS.items()):
+        if not client:
+            continue
+        for vc in list(getattr(client, "voice_clients", [])):
+            try:
+                if not vc.guild or vc.guild.id != guild.id or vc.channel is None:
+                    continue
+                humans = [member for member in vc.channel.members if not member.bot]
+                if humans:
+                    continue
+                channel_name = vc.channel.name
+                try:
+                    if vc.is_playing() or vc.is_paused():
+                        vc.stop()
+                except Exception:
+                    pass
+                key = custom_music_key(int(slot), int(guild.id)) if "custom_music_key" in globals() else (int(slot), int(guild.id))
+                if "CUSTOM_MUSIC_QUEUES" in globals():
+                    CUSTOM_MUSIC_QUEUES.pop(key, None)
+                    CUSTOM_MUSIC_NOW_PLAYING.pop(key, None)
+                    CUSTOM_MUSIC_LOOP_ENABLED.pop(key, None)
+                    CUSTOM_MUSIC_SKIP_VOTE_USERS.pop(key, None)
+                await vc.disconnect(force=True)
+                disconnected += 1
+                await send_log(guild, f"👋 커스텀 봇 자동 퇴장\n{slot}번 보조 봇이 유저가 없는 통방에서 자동으로 나갔습니다.\n채널: `{channel_name}`", "voice")
+            except Exception as e:
+                print(f"⚠️ 커스텀 봇 {slot}번 자동 퇴장 실패: {e}")
+    return disconnected
+
+
+@tasks.loop(seconds=30)
+async def auto_disconnect_empty_custom_voice_clients():
+    for guild in list(bot.guilds):
+        try:
+            await disconnect_empty_custom_voice_clients_for_guild(guild)
+        except Exception as e:
+            print(f"⚠️ 커스텀 봇 자동 퇴장 검사 실패: {e}")
+
+
 def build_custom_bot_panel_embed(guild: discord.Guild):
     embed = discord.Embed(
         title="🤖 커스텀 보조 봇 통방 입장",
@@ -20123,6 +20776,7 @@ CUSTOM_MUSIC_LOOP_ENABLED = {}
 CUSTOM_MUSIC_VOLUME_LEVELS = {}
 CUSTOM_MUSIC_SKIP_VOTE_USERS = {}
 CUSTOM_MUSIC_PANEL_LAST_SENT = {}
+CUSTOM_MUSIC_PANEL_MESSAGES = {}
 
 
 def custom_music_key(slot: int, guild_id: int):
@@ -20187,7 +20841,10 @@ def build_custom_music_panel_embed(guild: discord.Guild, slot: int):
         value="`재생` `일시정지` `다시재생` `스킵 투표` `대기열` `반복` `셔플` `볼륨` `종료`",
         inline=False,
     )
-    if bot.user:
+    custom_client = CUSTOM_BOT_CLIENTS.get(int(slot)) if "CUSTOM_BOT_CLIENTS" in globals() else None
+    if custom_client and getattr(custom_client, "user", None):
+        embed.set_thumbnail(url=custom_client.user.display_avatar.url)
+    elif bot.user:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
     embed.set_footer(text="만능 봇 | 커스텀 보조 봇 뮤직 패널")
     return embed
@@ -20268,7 +20925,7 @@ def get_custom_music_saved_voice_channel(guild: discord.Guild, slot: int):
 
 
 async def send_custom_music_panel_to_voice_channel(guild: discord.Guild, slot: int, voice_channel: discord.VoiceChannel, fallback_channel=None, *, connect: bool = True):
-    """선택한 보조 봇을 지정 통방에 초대하고, 그 통방의 채팅채널에 뮤직패널을 보냅니다."""
+    """선택한 보조 봇을 지정 통방에 초대하고, 그 통방의 채팅채널에 뮤직패널을 1개만 유지합니다."""
     if guild is None:
         return "❌ 서버에서만 사용할 수 있어요."
     if not isinstance(voice_channel, discord.VoiceChannel):
@@ -20282,22 +20939,47 @@ async def send_custom_music_panel_to_voice_channel(guild: discord.Guild, slot: i
     if panel_channel is None:
         return f"{connect_result}\n⚠️ 뮤직패널을 보낼 채팅채널을 찾지 못했어요.".strip()
 
-    # 봇 입장/이동 이벤트와 버튼 클릭이 동시에 들어와도 같은 채널에 패널을 너무 많이 보내지 않게 막습니다.
-    now_ts = datetime.datetime.now().timestamp()
-    panel_key = (int(slot), int(guild.id), int(getattr(panel_channel, "id", 0) or 0))
-    last_ts = CUSTOM_MUSIC_PANEL_LAST_SENT.get(panel_key, 0)
-    if now_ts - last_ts < 10:
-        return (
-            f"{connect_result}\n"
-            f"ℹ️ {slot}번 커스텀 뮤직패널은 방금 {getattr(panel_channel, 'mention', '채팅채널')}에 전송됐어요."
-        ).strip()
+    panel_identity_key = (int(slot), int(guild.id))
+    old_info = CUSTOM_MUSIC_PANEL_MESSAGES.get(panel_identity_key)
+    embed = build_custom_music_panel_embed(guild, int(slot))
+    view = CustomMusicPanelView(int(slot))
+
+    # 이전 패널이 있으면 같은 채널에서는 수정하고, 다른 채널이면 삭제해서 1개만 남깁니다.
+    if old_info:
+        old_channel_id, old_message_id = old_info
+        old_channel = guild.get_channel(int(old_channel_id or 0))
+        if old_channel and callable(getattr(old_channel, "fetch_message", None)):
+            try:
+                old_message = await old_channel.fetch_message(int(old_message_id))
+                if old_channel.id == getattr(panel_channel, "id", 0):
+                    await old_message.edit(embed=embed, view=view)
+                    CUSTOM_MUSIC_PANEL_MESSAGES[panel_identity_key] = (panel_channel.id, old_message.id)
+                    return (
+                        f"{connect_result}\n"
+                        f"🎛️ {slot}번 커스텀 뮤직패널을 {panel_channel.mention}에서 새로고침했어요.\n"
+                        "같은 보조 봇 패널은 이제 1개만 유지됩니다."
+                    ).strip()
+                await old_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    # 혹시 재시작 후 메모리가 사라져도 최근 중복 패널은 최대한 정리합니다.
+    try:
+        async for msg in panel_channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if title.startswith(f"🎵 {int(slot)}번 커스텀 뮤직 패널"):
+                    try:
+                        await msg.delete()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
     try:
-        await panel_channel.send(
-            embed=build_custom_music_panel_embed(guild, int(slot)),
-            view=CustomMusicPanelView(int(slot)),
-        )
-        CUSTOM_MUSIC_PANEL_LAST_SENT[panel_key] = now_ts
+        message = await panel_channel.send(embed=embed, view=view)
+        CUSTOM_MUSIC_PANEL_MESSAGES[panel_identity_key] = (panel_channel.id, message.id)
+        CUSTOM_MUSIC_PANEL_LAST_SENT[(int(slot), int(guild.id), int(getattr(panel_channel, "id", 0) or 0))] = datetime.datetime.now().timestamp()
         return (
             f"{connect_result}\n"
             f"🎛️ {slot}번 커스텀 뮤직패널을 {panel_channel.mention}에 전송했어요.\n"
@@ -20749,11 +21431,16 @@ async def custom_bot_panel(interaction: discord.Interaction):
 
 async def start_all_discord_clients():
     tasks = []
+
     for slot, token in CUSTOM_BOT_TOKENS.items():
         if token:
             client = CustomVoiceBotClient(slot)
             CUSTOM_BOT_CLIENTS[slot] = client
             tasks.append(asyncio.create_task(client.start(token)))
+
+    if TTS_BOT_TOKEN:
+        tasks.append(asyncio.create_task(tts_sub_bot.start(TTS_BOT_TOKEN)))
+
     tasks.append(asyncio.create_task(bot.start(TOKEN)))
     await asyncio.gather(*tasks)
 
@@ -20773,7 +21460,7 @@ if not TOKEN:
 if not TOKEN:
     print("❌ 봇 토큰이 비어있습니다. Render Environment에 DISCORD_TOKEN 또는 DISCORD_BOT_TOKEN을 넣어주세요.")
 else:
-    if any(CUSTOM_BOT_TOKENS.values()):
+    if any(CUSTOM_BOT_TOKENS.values()) or TTS_BOT_TOKEN:
         asyncio.run(start_all_discord_clients())
     else:
         bot.run(TOKEN)
