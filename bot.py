@@ -94,6 +94,9 @@ SPAM_TIME = 7
 
 exp_cooldowns = {}
 spam_tracker = {}
+# /검열켜기 스팸 세부 기능에서 사용하는 추적기입니다.
+repeat_message_tracker = {}
+attachment_spam_tracker = {}
 voice_join_times = {}
 VOICE_EXP_PER_MINUTE = 5
 INVITE_CACHE = {}
@@ -623,6 +626,17 @@ CREATE TABLE IF NOT EXISTS security_logs (
     reason TEXT,
     channel_id INTEGER DEFAULT 0,
     created_at TEXT
+)
+""")
+
+# /검열켜기 패널에서 카테고리별로 자동검열을 켜고 끌 때 사용하는 서버별 설정입니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS censor_category_settings (
+    guild_id INTEGER,
+    category_key TEXT,
+    enabled INTEGER DEFAULT 1,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, category_key)
 )
 """)
 conn.commit()
@@ -1209,6 +1223,20 @@ IP_BLOCK_REGEX = re.compile(
     r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\d)"
 )
 
+# /검열켜기 업그레이드용 URL/스팸 감지 설정입니다.
+URL_BLOCK_REGEX = re.compile(r"(?:https?://|www\.|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/|\b))", re.I)
+CUSTOM_EMOJI_REGEX = re.compile(r"<a?:[A-Za-z0-9_]+:[0-9]+>")
+CENSOR_REPEAT_WINDOW = 25
+CENSOR_REPEAT_LIMIT = 3
+CENSOR_LONG_TEXT_LIMIT = 900
+CENSOR_NEWLINE_LIMIT = 8
+CENSOR_CAPS_MIN_LETTERS = 12
+CENSOR_CAPS_RATIO = 0.75
+CENSOR_EMOJI_LIMIT = 12
+CENSOR_ATTACHMENT_SINGLE_LIMIT = 5
+CENSOR_ATTACHMENT_WINDOW = 30
+CENSOR_ATTACHMENT_LIMIT = 8
+
 
 
 # 만능봇 스타일 보안 감지 설정값입니다.
@@ -1396,6 +1424,163 @@ def get_custom_filter_words(guild_id: int):
 
 def get_all_filter_words(guild_id: int):
     return list(dict.fromkeys(AUTO_FILTER_BAD_WORDS + get_custom_filter_words(guild_id)))
+
+
+CENSOR_CATEGORY_ORDER = [
+    "bad_words",
+    "custom_words",
+    "invite_links",
+    "ip_block",
+    "url_links",
+    "fast_spam",
+    "repeat_spam",
+    "long_text_spam",
+    "newline_spam",
+    "caps_spam",
+    "emoji_spam",
+    "attachment_spam",
+]
+CENSOR_CATEGORY_LABELS = {
+    "bad_words": {"emoji": "🤬", "label": "욕설/비속어", "desc": "기본 욕설·비속어 메시지 삭제", "default": True, "group": "message"},
+    "custom_words": {"emoji": "🧾", "label": "서버 차단단어", "desc": "/설정 차단단어추가로 등록한 단어 삭제", "default": True, "group": "message"},
+    "invite_links": {"emoji": "🚫", "label": "초대링크", "desc": "디스코드 초대링크 삭제", "default": True, "group": "message"},
+    "ip_block": {"emoji": "🛡️", "label": "IP 주소", "desc": "IP 주소 형태 메시지 삭제", "default": True, "group": "message"},
+    "url_links": {"emoji": "🔗", "label": "일반 링크", "desc": "외부 URL/도메인 링크 삭제", "default": False, "group": "message"},
+    "fast_spam": {"emoji": "⚡", "label": "빠른 채팅 도배", "desc": f"{SPAM_TIME}초 안에 {SPAM_LIMIT}회 이상 채팅 감지", "default": True, "group": "spam"},
+    "repeat_spam": {"emoji": "🔁", "label": "반복 문장 도배", "desc": f"같은 문장을 {CENSOR_REPEAT_WINDOW}초 안에 {CENSOR_REPEAT_LIMIT}회 반복하면 삭제", "default": True, "group": "spam"},
+    "long_text_spam": {"emoji": "📜", "label": "긴 글 도배", "desc": f"{CENSOR_LONG_TEXT_LIMIT}자 이상 과도하게 긴 메시지 삭제", "default": False, "group": "spam"},
+    "newline_spam": {"emoji": "↕️", "label": "줄바꿈 도배", "desc": f"줄바꿈 {CENSOR_NEWLINE_LIMIT}개 이상 메시지 삭제", "default": False, "group": "spam"},
+    "caps_spam": {"emoji": "🔠", "label": "대문자 도배", "desc": "영문 대문자 비율이 너무 높은 메시지 삭제", "default": False, "group": "spam"},
+    "emoji_spam": {"emoji": "😂", "label": "이모지 도배", "desc": f"이모지 {CENSOR_EMOJI_LIMIT}개 이상 메시지 삭제", "default": False, "group": "spam"},
+    "attachment_spam": {"emoji": "🖼️", "label": "첨부파일 도배", "desc": "짧은 시간에 첨부파일을 많이 올리면 삭제", "default": True, "group": "spam"},
+}
+
+
+def default_censor_category_state(category_key: str) -> bool:
+    return bool(CENSOR_CATEGORY_LABELS.get(category_key, {}).get("default", True))
+
+
+def ensure_censor_category_settings(guild_id: int):
+    """카테고리별 검열 설정을 서버별 기본값으로 준비합니다."""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        for key in CENSOR_CATEGORY_ORDER:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO censor_category_settings(guild_id, category_key, enabled, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (guild_id, key, 1 if default_censor_category_state(key) else 0, now)
+            )
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def get_censor_category_settings(guild_id: int):
+    ensure_censor_category_settings(guild_id)
+    defaults = {key: default_censor_category_state(key) for key in CENSOR_CATEGORY_ORDER}
+    try:
+        c.execute(
+            "SELECT category_key, enabled FROM censor_category_settings WHERE guild_id=?",
+            (guild_id,)
+        )
+        for key, enabled in c.fetchall():
+            if key in defaults:
+                defaults[key] = bool(enabled)
+    except sqlite3.Error:
+        pass
+    return defaults
+
+
+def set_censor_category_setting(guild_id: int, category_key: str, enabled: bool):
+    if category_key not in CENSOR_CATEGORY_LABELS:
+        return
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        c.execute(
+            """
+            INSERT INTO censor_category_settings(guild_id, category_key, enabled, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, category_key) DO UPDATE SET
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (guild_id, category_key, 1 if enabled else 0, now)
+        )
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def set_all_censor_category_settings(guild_id: int, enabled: bool):
+    for key in CENSOR_CATEGORY_ORDER:
+        set_censor_category_setting(guild_id, key, enabled)
+
+
+def build_censor_panel_embed(guild: discord.Guild):
+    settings = get_security_settings(guild.id)
+    censor_settings = get_censor_category_settings(guild.id)
+    custom_word_count = len(get_custom_filter_words(guild.id))
+    recent_logs = count_security_logs(guild.id, 24)
+
+    embed = create_embed(
+        "🧹 검열켜기 통합 패널",
+        "버튼을 누르면 해당 검열/스팸 보호가 바로 켜집니다.\n"
+        "이 패널과 버튼은 **관리자만 사용**할 수 있고, 관리자 메시지는 검열하지 않습니다.\n\n"
+        f"🧹 자동검열 마스터: **{security_state_text(settings['auto_filter'])}**\n"
+        f"⚠️ 스팸보호 마스터: **{security_state_text(settings['spam_protection'])}**\n"
+        f"📑 보안로그 저장: **{security_state_text(settings['security_log_enabled'])}**\n"
+        f"최근 24시간 검열/보안 기록: `{recent_logs}`건"
+    )
+
+    message_text = []
+    spam_text = []
+    for key in CENSOR_CATEGORY_ORDER:
+        info = CENSOR_CATEGORY_LABELS[key]
+        line = (
+            f"{info['emoji']} **{info['label']}**: {security_state_text(censor_settings.get(key, default_censor_category_state(key)))}\n"
+            f"└ {info['desc']}"
+        )
+        if info.get("group") == "spam":
+            spam_text.append(line)
+        else:
+            message_text.append(line)
+
+    embed.add_field(
+        name="📂 메시지 검열 카테고리",
+        value="\n".join(message_text),
+        inline=False
+    )
+    embed.add_field(
+        name="🚨 스팸/도배 검열 카테고리",
+        value="\n".join(spam_text),
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ 추가 보호 기능",
+        value=(
+            f"📣 멘션검열: **{security_state_text(settings['mention_spam_detection'])}**\n"
+            f"📎 위험파일검열: **{security_state_text(settings['dangerous_file_block'])}**\n"
+            f"🔐 토큰보호: **{security_state_text(settings['token_leak_guard'])}**\n"
+            f"👶 새계정보호: **{security_state_text(settings['new_account_guard'])}**\n"
+            f"🚨 테러감지: **{security_state_text(settings['raid_detection'])}**\n"
+            f"🛡️ 권한보호: **{security_state_text(settings['permission_guard'])}**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🧾 차단단어 관리",
+        value=(
+            f"서버 추가 차단단어: `{custom_word_count}`개\n"
+            "단어 추가: `/설정 차단단어추가`\n"
+            "단어 삭제: `/설정 차단단어삭제`\n"
+            "단어 확인: `/설정 차단단어목록`"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="만능 봇 | /검열켜기 | 관리자 전용")
+    return embed
 
 
 def add_security_log(guild_id: int, user_id: int, action: str, reason: str, channel_id: int = 0):
@@ -6445,6 +6630,174 @@ async def setting_security_check(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class CensorEnablePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def _enable_censor_category(self, interaction: discord.Interaction, category_key: str):
+        if not await require_admin_interaction(interaction):
+            return
+        info = CENSOR_CATEGORY_LABELS.get(category_key, {"label": category_key})
+        set_security_setting(interaction.guild.id, "auto_filter", True)
+        set_security_setting(interaction.guild.id, "security_log_enabled", True)
+        set_censor_category_setting(interaction.guild.id, category_key, True)
+        await interaction.response.edit_message(embed=build_censor_panel_embed(interaction.guild), view=CensorEnablePanelView())
+        await send_log(
+            interaction.guild,
+            f"🧹 검열켜기 패널\n카테고리: `{info.get('label', category_key)}`\n상태: 켜짐 ✅\n관리자: {interaction.user.mention}",
+            "general"
+        )
+
+    async def _enable_spam_category(self, interaction: discord.Interaction, category_key: str):
+        if not await require_admin_interaction(interaction):
+            return
+        info = CENSOR_CATEGORY_LABELS.get(category_key, {"label": category_key})
+        set_security_setting(interaction.guild.id, "spam_protection", True)
+        set_security_setting(interaction.guild.id, "security_log_enabled", True)
+        set_censor_category_setting(interaction.guild.id, category_key, True)
+        await interaction.response.edit_message(embed=build_censor_panel_embed(interaction.guild), view=CensorEnablePanelView())
+        await send_log(
+            interaction.guild,
+            f"⚠️ 스팸검열 패널\n카테고리: `{info.get('label', category_key)}`\n상태: 켜짐 ✅\n관리자: {interaction.user.mention}",
+            "general"
+        )
+
+    async def _enable_security_feature(self, interaction: discord.Interaction, setting_key: str, label: str):
+        if not await require_admin_interaction(interaction):
+            return
+        set_security_setting(interaction.guild.id, setting_key, True)
+        set_security_setting(interaction.guild.id, "security_log_enabled", True)
+        await interaction.response.edit_message(embed=build_censor_panel_embed(interaction.guild), view=CensorEnablePanelView())
+        await send_log(
+            interaction.guild,
+            f"🧹 검열켜기 패널\n카테고리: `{label}`\n상태: 켜짐 ✅\n관리자: {interaction.user.mention}",
+            "general"
+        )
+
+    async def _set_all(self, interaction: discord.Interaction, enabled: bool):
+        if not await require_admin_interaction(interaction):
+            return
+        for setting_key in [
+            "auto_filter",
+            "spam_protection",
+            "mention_spam_detection",
+            "dangerous_file_block",
+            "token_leak_guard",
+            "new_account_guard",
+            "raid_detection",
+            "permission_guard",
+        ]:
+            set_security_setting(interaction.guild.id, setting_key, enabled)
+        set_security_setting(interaction.guild.id, "security_log_enabled", True)
+        set_all_censor_category_settings(interaction.guild.id, enabled)
+        await interaction.response.edit_message(embed=build_censor_panel_embed(interaction.guild), view=CensorEnablePanelView())
+        await send_log(
+            interaction.guild,
+            f"🧹 검열패널 전체 {'켜기' if enabled else '끄기'}\n관리자: {interaction.user.mention}",
+            "general"
+        )
+
+    @discord.ui.button(label="욕설", emoji="🤬", style=discord.ButtonStyle.green, row=0)
+    async def enable_bad_words(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_censor_category(interaction, "bad_words")
+
+    @discord.ui.button(label="차단단어", emoji="🧾", style=discord.ButtonStyle.green, row=0)
+    async def enable_custom_words(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_censor_category(interaction, "custom_words")
+
+    @discord.ui.button(label="초대링크", emoji="🚫", style=discord.ButtonStyle.green, row=0)
+    async def enable_invites(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_censor_category(interaction, "invite_links")
+
+    @discord.ui.button(label="IP차단", emoji="🛡️", style=discord.ButtonStyle.green, row=0)
+    async def enable_ip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_censor_category(interaction, "ip_block")
+
+    @discord.ui.button(label="일반링크", emoji="🔗", style=discord.ButtonStyle.green, row=0)
+    async def enable_url_links(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_censor_category(interaction, "url_links")
+
+    @discord.ui.button(label="빠른도배", emoji="⚡", style=discord.ButtonStyle.blurple, row=1)
+    async def enable_fast_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "fast_spam")
+
+    @discord.ui.button(label="반복도배", emoji="🔁", style=discord.ButtonStyle.blurple, row=1)
+    async def enable_repeat_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "repeat_spam")
+
+    @discord.ui.button(label="긴글도배", emoji="📜", style=discord.ButtonStyle.blurple, row=1)
+    async def enable_long_text_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "long_text_spam")
+
+    @discord.ui.button(label="줄도배", emoji="↕️", style=discord.ButtonStyle.blurple, row=1)
+    async def enable_newline_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "newline_spam")
+
+    @discord.ui.button(label="대문자도배", emoji="🔠", style=discord.ButtonStyle.blurple, row=1)
+    async def enable_caps_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "caps_spam")
+
+    @discord.ui.button(label="이모지도배", emoji="😂", style=discord.ButtonStyle.blurple, row=2)
+    async def enable_emoji_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "emoji_spam")
+
+    @discord.ui.button(label="첨부도배", emoji="🖼️", style=discord.ButtonStyle.blurple, row=2)
+    async def enable_attachment_spam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_spam_category(interaction, "attachment_spam")
+
+    @discord.ui.button(label="멘션검열", emoji="📣", style=discord.ButtonStyle.blurple, row=2)
+    async def enable_mentions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_security_feature(interaction, "mention_spam_detection", "멘션검열")
+
+    @discord.ui.button(label="위험파일", emoji="📎", style=discord.ButtonStyle.blurple, row=2)
+    async def enable_files(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_security_feature(interaction, "dangerous_file_block", "위험파일검열")
+
+    @discord.ui.button(label="토큰보호", emoji="🔐", style=discord.ButtonStyle.blurple, row=2)
+    async def enable_token(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_security_feature(interaction, "token_leak_guard", "토큰보호")
+
+    @discord.ui.button(label="새계정보호", emoji="👶", style=discord.ButtonStyle.gray, row=3)
+    async def enable_new_account_guard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_security_feature(interaction, "new_account_guard", "새계정보호")
+
+    @discord.ui.button(label="테러감지", emoji="🚨", style=discord.ButtonStyle.gray, row=3)
+    async def enable_raid_detection(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_security_feature(interaction, "raid_detection", "테러감지")
+
+    @discord.ui.button(label="권한보호", emoji="🛡️", style=discord.ButtonStyle.gray, row=3)
+    async def enable_permission_guard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enable_security_feature(interaction, "permission_guard", "권한보호")
+
+    @discord.ui.button(label="전체켜기", emoji="✅", style=discord.ButtonStyle.green, row=3)
+    async def enable_all_censor(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_all(interaction, True)
+
+    @discord.ui.button(label="전체끄기", emoji="🧯", style=discord.ButtonStyle.red, row=3)
+    async def disable_all_censor(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_all(interaction, False)
+
+    @discord.ui.button(label="보안로그", emoji="📑", style=discord.ButtonStyle.gray, row=4)
+    async def show_censor_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_admin_interaction(interaction):
+            return
+        await interaction.response.send_message(embed=build_security_log_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="새로고침", emoji="🔄", style=discord.ButtonStyle.gray, row=4)
+    async def refresh_censor_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_admin_interaction(interaction):
+            return
+        await interaction.response.edit_message(embed=build_censor_panel_embed(interaction.guild), view=CensorEnablePanelView())
+
+
+@bot.tree.command(name="검열켜기", description="카테고리별 검열/스팸 보호를 관리자 전용 버튼으로 켭니다.")
+@app_commands.default_permissions(administrator=True)
+async def censor_enable_command(interaction: discord.Interaction):
+    if not await require_admin_interaction(interaction):
+        return
+    await interaction.response.send_message(embed=build_censor_panel_embed(interaction.guild), view=CensorEnablePanelView(), ephemeral=True)
+
+
 class SecurityPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -8948,6 +9301,64 @@ async def maybe_play_music_from_chat_message(message: discord.Message):
     return False
 
 
+
+def normalize_spam_text(content: str) -> str:
+    return re.sub(r"\s+", " ", (content or "").lower()).strip()
+
+
+def count_emoji_like(content: str) -> int:
+    if not content:
+        return 0
+    custom_count = len(CUSTOM_EMOJI_REGEX.findall(content))
+    unicode_count = 0
+    for ch in content:
+        code = ord(ch)
+        if (
+            0x1F300 <= code <= 0x1FAFF
+            or 0x2600 <= code <= 0x27BF
+            or 0xFE00 <= code <= 0xFE0F
+        ):
+            unicode_count += 1
+    return custom_count + unicode_count
+
+
+def is_caps_spam(content: str) -> bool:
+    letters = [ch for ch in (content or "") if ch.isalpha() and ch.isascii()]
+    if len(letters) < CENSOR_CAPS_MIN_LETTERS:
+        return False
+    upper_count = sum(1 for ch in letters if ch.isupper())
+    return (upper_count / max(len(letters), 1)) >= CENSOR_CAPS_RATIO
+
+
+async def handle_spam_censor_violation(message: discord.Message, reason: str, log_action: str = "스팸검열"):
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+
+    warning_count = await add_auto_warning(message.author, reason)
+    add_security_log(message.guild.id, message.author.id, log_action, reason, message.channel.id)
+    try:
+        await message.channel.send(
+            f"⚠️ {message.author.mention}님 스팸/도배 검열에 의해 메시지가 삭제되었습니다.\n사유: **{reason}**\n누적 경고: {warning_count}회",
+            delete_after=8
+        )
+    except discord.HTTPException:
+        pass
+    await send_log(
+        message.guild,
+        f"⚠️ {log_action}\n대상: {message.author.mention}\n채널: {message.channel.mention}\n사유: {reason}\n누적 경고: {warning_count}회",
+        "warning"
+    )
+    if warning_count >= 5:
+        try:
+            await message.author.ban(reason="경고 5회 누적 자동 차단")
+            await send_log(message.guild, f"⛔ 자동 밴\n대상: {message.author}\n사유: 경고 5회 누적", "punishment")
+        except (discord.Forbidden, discord.HTTPException):
+            await send_log(message.guild, f"❌ 자동 밴 실패\n대상: {message.author}\n사유: 권한 부족 또는 API 오류", "punishment")
+    return True
+
+
 # =========================
 # 메시지 처리: 초대링크 / 금지어 / 도배 / 레벨
 # =========================
@@ -8985,6 +9396,7 @@ async def on_message(message: discord.Message):
     content_lower = message.content.lower()
 
     security_settings = get_security_settings(message.guild.id)
+    censor_settings = get_censor_category_settings(message.guild.id)
     if security_settings.get("token_leak_guard") and not message.author.guild_permissions.manage_messages and looks_like_discord_token(message.content):
         try:
             await message.delete()
@@ -9058,14 +9470,21 @@ async def on_message(message: discord.Message):
         filter_reason = None
         filter_log_title = None
 
-        if IP_BLOCK_REGEX.search(message.content):
+        if censor_settings.get("ip_block", True) and IP_BLOCK_REGEX.search(message.content):
             filter_reason = "IP 주소 게시"
             filter_log_title = "🛡️ IP 주소 차단"
-        elif any(word in content_lower for word in AUTO_FILTER_INVITE_WORDS):
+        elif censor_settings.get("invite_links", True) and any(word in content_lower for word in AUTO_FILTER_INVITE_WORDS):
             filter_reason = "초대 링크 게시"
             filter_log_title = "🚫 초대 링크 차단"
+        elif censor_settings.get("url_links", False) and URL_BLOCK_REGEX.search(message.content or ""):
+            filter_reason = "외부 링크 게시"
+            filter_log_title = "🔗 일반 링크 차단"
         else:
-            matched_word = next((word for word in get_all_filter_words(message.guild.id) if word and word in content_lower), None)
+            matched_word = None
+            if censor_settings.get("bad_words", True):
+                matched_word = next((word for word in AUTO_FILTER_BAD_WORDS if word and word in content_lower), None)
+            if not matched_word and censor_settings.get("custom_words", True):
+                matched_word = next((word for word in get_custom_filter_words(message.guild.id) if word and word in content_lower), None)
             if matched_word:
                 filter_reason = f"금지어 사용({matched_word})"
                 filter_log_title = "🤬 금지어 차단"
@@ -9090,25 +9509,70 @@ async def on_message(message: discord.Message):
             return
 
     if security_settings.get("spam_protection") and not message.author.guild_permissions.manage_messages:
-        spam_key = (message.guild.id, user_id)
-        spam_tracker.setdefault(spam_key, []).append(now)
-        spam_tracker[spam_key] = [t for t in spam_tracker[spam_key] if now - t <= SPAM_TIME]
+        spam_reason = None
+        spam_action = "스팸검열"
 
-        if len(spam_tracker[spam_key]) >= SPAM_LIMIT:
-            spam_tracker[spam_key] = []
-            c.execute("INSERT INTO warnings VALUES (?, ?, ?, ?)", (user_id, bot.user.id, "도배 감지", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-            conn.commit()
-            warning_count = await update_warning_role(message.author)
-            add_security_log(message.guild.id, message.author.id, "도배보호", f"{SPAM_TIME}초 내 {SPAM_LIMIT}회 메시지", message.channel.id)
-            await message.channel.send(f"⚠️ {message.author.mention}님 도배가 감지되었습니다.\n누적 경고: {warning_count}회")
-            await send_log(message.guild, f"⚠️ 자동 경고 지급\n대상: {message.author.mention}\n사유: 도배 감지\n누적 경고: {warning_count}회", "warning")
-            if warning_count >= 5:
-                try:
-                    await message.author.ban(reason="경고 5회 누적 자동 차단")
-                    await send_log(message.guild, f"⛔ 자동 밴\n대상: {message.author}\n사유: 경고 5회 누적", "punishment")
-                except (discord.Forbidden, discord.HTTPException):
-                    await send_log(message.guild, f"❌ 자동 밴 실패\n대상: {message.author}\n사유: 권한 부족 또는 API 오류", "punishment")
-                return
+        if censor_settings.get("fast_spam", True):
+            spam_key = (message.guild.id, user_id)
+            spam_tracker.setdefault(spam_key, []).append(now)
+            spam_tracker[spam_key] = [t for t in spam_tracker[spam_key] if now - t <= SPAM_TIME]
+            if len(spam_tracker[spam_key]) >= SPAM_LIMIT:
+                spam_tracker[spam_key] = []
+                spam_reason = f"빠른 채팅 도배({SPAM_TIME}초 내 {SPAM_LIMIT}회)"
+                spam_action = "빠른도배감지"
+
+        normalized_content = normalize_spam_text(message.content)
+        if not spam_reason and censor_settings.get("repeat_spam", True) and normalized_content and len(normalized_content) >= 2:
+            repeat_key = (message.guild.id, user_id)
+            repeat_message_tracker.setdefault(repeat_key, []).append((normalized_content, now))
+            repeat_message_tracker[repeat_key] = [
+                (text, ts) for text, ts in repeat_message_tracker[repeat_key]
+                if now - ts <= CENSOR_REPEAT_WINDOW
+            ]
+            repeat_count = sum(1 for text, ts in repeat_message_tracker[repeat_key] if text == normalized_content)
+            if repeat_count >= CENSOR_REPEAT_LIMIT:
+                repeat_message_tracker[repeat_key] = []
+                spam_reason = f"반복 문장 도배({CENSOR_REPEAT_WINDOW}초 내 같은 문장 {CENSOR_REPEAT_LIMIT}회)"
+                spam_action = "반복도배감지"
+
+        if not spam_reason and censor_settings.get("long_text_spam", False) and len(message.content or "") >= CENSOR_LONG_TEXT_LIMIT:
+            spam_reason = f"긴 글 도배({len(message.content or '')}자)"
+            spam_action = "긴글도배감지"
+
+        if not spam_reason and censor_settings.get("newline_spam", False) and (message.content or "").count("\n") >= CENSOR_NEWLINE_LIMIT:
+            spam_reason = f"줄바꿈 도배({(message.content or '').count(chr(10))}줄)"
+            spam_action = "줄바꿈도배감지"
+
+        if not spam_reason and censor_settings.get("caps_spam", False) and is_caps_spam(message.content or ""):
+            spam_reason = "대문자 도배"
+            spam_action = "대문자도배감지"
+
+        emoji_count = count_emoji_like(message.content or "")
+        if not spam_reason and censor_settings.get("emoji_spam", False) and emoji_count >= CENSOR_EMOJI_LIMIT:
+            spam_reason = f"이모지 도배({emoji_count}개)"
+            spam_action = "이모지도배감지"
+
+        if not spam_reason and censor_settings.get("attachment_spam", True) and getattr(message, "attachments", None):
+            attachment_count = len(message.attachments)
+            if attachment_count >= CENSOR_ATTACHMENT_SINGLE_LIMIT:
+                spam_reason = f"첨부파일 도배({attachment_count}개)"
+                spam_action = "첨부도배감지"
+            else:
+                attachment_key = (message.guild.id, user_id)
+                attachment_spam_tracker.setdefault(attachment_key, []).append((attachment_count, now))
+                attachment_spam_tracker[attachment_key] = [
+                    (count, ts) for count, ts in attachment_spam_tracker[attachment_key]
+                    if now - ts <= CENSOR_ATTACHMENT_WINDOW
+                ]
+                total_attachments = sum(count for count, ts in attachment_spam_tracker[attachment_key])
+                if total_attachments >= CENSOR_ATTACHMENT_LIMIT:
+                    attachment_spam_tracker[attachment_key] = []
+                    spam_reason = f"첨부파일 연속 도배({CENSOR_ATTACHMENT_WINDOW}초 내 {total_attachments}개)"
+                    spam_action = "첨부도배감지"
+
+        if spam_reason:
+            await handle_spam_censor_violation(message, spam_reason, spam_action)
+            return
 
     try:
         add_daily_mission_message_progress(message.guild.id, user_id)
@@ -10909,31 +11373,6 @@ def resolve_ytdlp_cookie_file():
 
 YTDLP_COOKIE_FILE = resolve_ytdlp_cookie_file()
 
-# yt-dlp는 여러 포맷/클라이언트를 재시도할 때 실패한 중간 과정도
-# 콘솔에 ERROR로 찍을 수 있습니다. 실제 재생은 성공해도 빨간 로그가 남아서
-# 아래 로거로 중간 재시도 로그는 숨기고, 진짜 실패는 디스코드 메시지로만 보여줍니다.
-SHOW_YTDLP_RETRY_LOGS = os.getenv("SHOW_YTDLP_RETRY_LOGS", "0").strip() == "1"
-
-
-class QuietYTDLPLogger:
-    def debug(self, msg):
-        return
-
-    def info(self, msg):
-        return
-
-    def warning(self, msg):
-        if SHOW_YTDLP_RETRY_LOGS:
-            print(f"yt-dlp warning: {msg}")
-
-    def error(self, msg):
-        if SHOW_YTDLP_RETRY_LOGS:
-            print(f"yt-dlp retry error: {msg}")
-
-
-YTDLP_QUIET_LOGGER = QuietYTDLPLogger()
-
-
 # YouTube 영상마다 제공 포맷이 달라서 특정 포맷만 고르면
 # "Requested format is not available" 오류가 날 수 있습니다.
 # 아래처럼 오디오 후보를 넓게 두고, 실패하면 여러 클라이언트/포맷으로 재시도합니다.
@@ -10995,10 +11434,8 @@ def build_ytdl_options(format_value: str = None, player_clients=None):
         "extract_flat": False,
         "geo_bypass": True,
         "nocheckcertificate": True,
-        # 포맷 선택이 실패해도 콘솔 ERROR를 크게 찍지 않고,
-        # 가능한 정보/formats를 최대한 받아서 아래 코드에서 직접 고릅니다.
-        "ignore_no_formats_error": True,
-        "logger": YTDLP_QUIET_LOGGER,
+        # 포맷 선택이 실패해도 가능한 정보/formats를 최대한 받아서 아래 코드에서 직접 고릅니다.
+        "ignore_no_formats_error": False,
         "retries": 8,
         "fragment_retries": 8,
         "extractor_retries": 3,
