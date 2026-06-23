@@ -21,7 +21,9 @@ from collections import deque
 MNB_V200_RELEASE = "v200 shop-single-panel slash-sync-fix"
 MNB_V202_RELEASE = "v202 real slash/prefix fallback use-panel fix"
 MNB_V203_RELEASE = "v203 guild-only-sync dedupe single-instance fix"
+MNB_V213_RELEASE = "v213 full duplicate command event log fix"
 MNB_V211_RELEASE = "v211 remove economy subcommands top-level economy commands only"
+MNB_V212_RELEASE = "v212 single-bootstrap single-sync prefix-slash-dedupe"
 MNB_V210_RELEASE = "v210 stability-dedupe-required-commands-fix"
 
 import yt_dlp
@@ -111,8 +113,18 @@ MNB_SYNC_MODE = os.getenv("MNB_COMMAND_SYNC_MODE", "guild_only").strip().lower()
 MNB_PERSISTENT_VIEWS_REGISTERED = False
 MNB_MAINBOT_INSTANCE_SOCKET = None
 MNB_LOG_DEDUPE_MEMORY = {}
-MNB_LOG_DEDUPE_SECONDS = 8
+MNB_LOG_DEDUPE_SECONDS = 20
 MNB_ON_READY_RAN_ONCE = False
+# v212: on_ready/setup/sync가 여러 번 불리더라도 실제 자동생성·동기화는 1번만 실행합니다.
+MNB_V212_BOOTSTRAPPED = False
+MNB_V212_BOOTSTRAP_LOCK = None
+MNB_V212_SYNC_LOCK = None
+MNB_V212_STARTUP_SYNC_DONE = False
+MNB_V212_LAST_SYNC_TS = 0.0
+MNB_V212_PERSISTENT_VIEWS_DONE = False
+MNB_V212_PROCESSED_PREFIX_MESSAGES = {}
+MNB_V212_PREFIX_DEDUPE_SECONDS = 30
+MNB_REMOVED_TOP_LEVEL_COMMAND_NAMES = {"경제"}
 MNB_V210_REQUIRED_COMMANDS_REGISTERED = False
 MNB_V210_ON_READY_STARTED_AT = 0.0
 
@@ -9251,91 +9263,160 @@ async def rotate_bot_presence():
         pass
 
 
+
+# =========================
+# v212 중복 실행/명령 처리 방어 헬퍼
+# =========================
+def mnb_v212_get_bootstrap_lock():
+    global MNB_V212_BOOTSTRAP_LOCK
+    if MNB_V212_BOOTSTRAP_LOCK is None:
+        MNB_V212_BOOTSTRAP_LOCK = asyncio.Lock()
+    return MNB_V212_BOOTSTRAP_LOCK
+
+
+def mnb_v212_get_sync_lock():
+    global MNB_V212_SYNC_LOCK
+    if MNB_V212_SYNC_LOCK is None:
+        MNB_V212_SYNC_LOCK = asyncio.Lock()
+    return MNB_V212_SYNC_LOCK
+
+
+def mnb_v212_cleanup_prefix_dedupe(now_ts: float):
+    try:
+        cutoff = now_ts - MNB_V212_PREFIX_DEDUPE_SECONDS
+        for msg_id, ts in list(MNB_V212_PROCESSED_PREFIX_MESSAGES.items()):
+            if ts < cutoff:
+                MNB_V212_PROCESSED_PREFIX_MESSAGES.pop(msg_id, None)
+    except Exception:
+        pass
+
+
+async def mnb_v212_process_commands_once(message: discord.Message):
+    """같은 메시지에서 !명령어가 2번 실행되는 것을 막습니다."""
+    if message is None:
+        return
+    now_ts = time.time()
+    mnb_v212_cleanup_prefix_dedupe(now_ts)
+    msg_id = getattr(message, "id", None)
+    if msg_id is not None:
+        old_ts = MNB_V212_PROCESSED_PREFIX_MESSAGES.get(msg_id)
+        if old_ts and now_ts - old_ts < MNB_V212_PREFIX_DEDUPE_SECONDS:
+            return
+        MNB_V212_PROCESSED_PREFIX_MESSAGES[msg_id] = now_ts
+    await bot.process_commands(message)
+
+
+def mnb_v212_required_names_text():
+    return ", ".join(f"/{name}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES))
+
+
 # =========================
 # v203 슬래시 명령어 중복 제거 동기화
 # =========================
-async def mnb_sync_commands_guild_only(reason: str = "auto"):
-    # v210: 동기화 직전에 필수 단일 패널 명령어를 다시 한 번 고정 등록합니다.
-    try:
-        mnb_v210_register_required_commands(force=True)
-    except NameError:
-        pass
-    except Exception as e:
-        print(f"⚠️ v210 필수 명령어 고정 등록 실패: {e}")
+async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: int = None):
+    """v212: 서버별 슬래시만 유지하고, 같은 동기화가 여러 번 겹치지 않게 막습니다.
 
-    """전역/서버 명령어가 동시에 떠서 2개씩 보이는 문제를 막습니다.
-
-    처리 순서:
-    1) 현재 코드에 등록된 전역 명령어를 스냅샷으로 보관
-    2) 각 서버의 서버명령어를 비우고 스냅샷을 복사해서 즉시 동기화
-    3) 원격 전역 명령어를 비워서 디스코드 명령어 목록에 같은 명령어가 2개 보이지 않게 함
-    4) 로컬 전역 명령어는 다시 복구해두어 다음 서버 동기화/수동 복구에서 재사용 가능하게 함
+    - 봇 시작 자동 동기화는 프로세스당 1회만 실행
+    - 수동 복구는 요청한 서버만 실행
+    - 원격 전역 슬래시는 비워서 서버 명령어와 2개씩 보이는 문제 방지
+    - /경제 그룹은 사용자 요청대로 등록하지 않음
     """
-    try:
-        global_commands = list(bot.tree.get_commands(guild=None))
-    except Exception:
-        global_commands = []
+    global MNB_V212_STARTUP_SYNC_DONE, MNB_V212_LAST_SYNC_TS
 
-    # v210: 로컬 트리에서도 같은 이름이 2개 이상이면 마지막 1개만 동기화합니다.
-    try:
+    manual = str(reason or "").startswith("manual")
+    now_ts = time.time()
+
+    if not manual and MNB_V212_STARTUP_SYNC_DONE:
+        print(f"♻️ v213 슬래시 동기화 중복 호출 건너뜀: {reason}")
+        return []
+
+    async with mnb_v212_get_sync_lock():
+        now_ts = time.time()
+        if not manual and MNB_V212_STARTUP_SYNC_DONE:
+            print(f"♻️ v213 슬래시 동기화 중복 호출 건너뜀: {reason}")
+            return []
+        if manual and now_ts - MNB_V212_LAST_SYNC_TS < 5:
+            print("♻️ v212 수동 슬래시 복구가 너무 연속으로 호출되어 1회만 처리합니다.")
+            return []
+
+        try:
+            # force=True를 반복 호출하면 로그와 로컬 트리 재등록이 계속 반복됩니다.
+            # v212부터는 누락된 경우에만 고정 등록합니다.
+            mnb_v210_register_required_commands(force=False)
+        except NameError:
+            pass
+        except Exception as e:
+            print(f"⚠️ v212 필수 명령어 고정 등록 확인 실패: {e}")
+
+        try:
+            global_commands = list(bot.tree.get_commands(guild=None))
+        except Exception:
+            global_commands = []
+
+        # 이름 기준으로 1개만 유지하고, 제거 요청된 /경제 그룹은 제외합니다.
         deduped = {}
         for command in global_commands:
-            deduped[getattr(command, "name", str(id(command)))] = command
+            name = getattr(command, "name", "")
+            if not name or name in MNB_REMOVED_TOP_LEVEL_COMMAND_NAMES:
+                continue
+            deduped[name] = command
         if len(deduped) != len(global_commands):
-            print(f"⚠️ v210 로컬 슬래시 중복 감지/정리: {len(global_commands)}개 → {len(deduped)}개")
+            print(f"⚠️ v212 로컬 슬래시 중복/제거 정리: {len(global_commands)}개 → {len(deduped)}개")
         global_commands = list(deduped.values())
-    except Exception:
-        pass
 
-    required_found = {cmd.name for cmd in global_commands} & MNB_REQUIRED_COMMAND_NAMES
-    missing_required = sorted(MNB_REQUIRED_COMMAND_NAMES - required_found)
-    if missing_required:
-        print(f"⚠️ v210 필수 명령어 로컬 누락: {missing_required}")
-    else:
-        print("✅ v211 필수 명령어 로컬 등록 확인: /편의 /추가기능 /사용 /통합상점 /잔액 /인벤토리")
+        required_found = {cmd.name for cmd in global_commands} & MNB_REQUIRED_COMMAND_NAMES
+        missing_required = sorted(MNB_REQUIRED_COMMAND_NAMES - required_found)
+        if missing_required:
+            print(f"⚠️ v212 필수 명령어 로컬 누락: {missing_required}")
+        else:
+            print("✅ v212 필수 명령어 로컬 등록 확인: " + mnb_v212_required_names_text())
 
-    guild_results = []
-    for guild in list(bot.guilds):
-        try:
-            guild_object = discord.Object(id=guild.id)
-            bot.tree.clear_commands(guild=guild_object)
-            for command in global_commands:
-                try:
-                    bot.tree.add_command(command, guild=guild_object)
-                except app_commands.CommandAlreadyRegistered:
-                    pass
-                except Exception as e:
-                    print(f"⚠️ {guild.name} 명령어 복사 실패 /{getattr(command, 'name', '?')}: {e}")
-            synced_guild = await bot.tree.sync(guild=guild_object)
-            synced_names = {cmd.name for cmd in synced_guild}
-            check_text = ", ".join(f"/{name}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES & synced_names))
-            guild_results.append((guild.name, len(synced_guild), check_text))
-            print(f"✅ {guild.name} v203 서버 슬래시 동기화 완료: {len(synced_guild)}개 | {check_text}")
-        except Exception as e:
-            print(f"❌ {guild.name} v203 서버 슬래시 동기화 실패: {e}")
+        guild_results = []
+        target_guilds = [g for g in list(bot.guilds) if target_guild_id is None or g.id == int(target_guild_id)]
+        for guild in target_guilds:
+            try:
+                guild_object = discord.Object(id=guild.id)
+                bot.tree.clear_commands(guild=guild_object)
+                for command in global_commands:
+                    try:
+                        bot.tree.add_command(command, guild=guild_object)
+                    except app_commands.CommandAlreadyRegistered:
+                        pass
+                    except Exception as e:
+                        print(f"⚠️ {guild.name} 명령어 복사 실패 /{getattr(command, 'name', '?')}: {e}")
+                synced_guild = await bot.tree.sync(guild=guild_object)
+                synced_names = {cmd.name for cmd in synced_guild}
+                check_text = ", ".join(f"/{name}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES & synced_names))
+                guild_results.append((guild.name, len(synced_guild), check_text))
+                print(f"✅ {guild.name} v212 서버 슬래시 동기화 완료: {len(synced_guild)}개 | {check_text}")
+            except Exception as e:
+                print(f"❌ {guild.name} v212 서버 슬래시 동기화 실패: {e}")
 
-    # 전역 명령어가 남아 있으면 서버 명령어와 같이 보여서 2개씩 표시될 수 있으므로 원격 전역 명령어는 비웁니다.
-    if MNB_SYNC_MODE in {"guild", "guild_only", "server", "server_only"}:
-        try:
-            bot.tree.clear_commands(guild=None)
-            cleared = await bot.tree.sync(guild=None)
-            print(f"✅ v203 원격 전역 슬래시 정리 완료: {len(cleared)}개 유지")
-        except Exception as e:
-            print(f"⚠️ v203 원격 전역 슬래시 정리 실패: {e}")
+        # 전역 명령어는 원격에서 비워야 같은 명령어가 2개씩 보이지 않습니다.
+        if MNB_SYNC_MODE in {"guild", "guild_only", "server", "server_only"}:
+            try:
+                bot.tree.clear_commands(guild=None)
+                cleared = await bot.tree.sync(guild=None)
+                print(f"✅ v212 원격 전역 슬래시 정리 완료: {len(cleared)}개 유지")
+            except Exception as e:
+                print(f"⚠️ v212 원격 전역 슬래시 정리 실패: {e}")
 
-        # 로컬 전역 명령어 복구. 원격에는 다시 올리지 않고, 다음 copy/sync용으로만 보관합니다.
-        try:
-            for command in global_commands:
-                try:
-                    bot.tree.add_command(command)
-                except app_commands.CommandAlreadyRegistered:
-                    pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            # 원격에는 올리지 않고, 다음 수동 복구용 로컬 트리만 복구합니다.
+            try:
+                for command in global_commands:
+                    try:
+                        bot.tree.add_command(command)
+                    except app_commands.CommandAlreadyRegistered:
+                        pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
-    return guild_results
+        MNB_V212_LAST_SYNC_TS = time.time()
+        if not manual:
+            MNB_V212_STARTUP_SYNC_DONE = True
+        return guild_results
 
 
 def acquire_mnb_mainbot_single_instance_lock() -> bool:
@@ -9368,119 +9449,116 @@ def acquire_mnb_mainbot_single_instance_lock() -> bool:
 
 @bot.event
 async def on_ready():
-    global MNB_ON_READY_RAN_ONCE, MNB_V210_ON_READY_STARTED_AT
-    if MNB_ON_READY_RAN_ONCE:
-        # v210: 디스코드 게이트웨이 재연결 때 on_ready가 다시 호출되면서
-        # 자동 패널/로그/채널 생성이 2번씩 실행되는 문제를 막습니다.
-        print(f"♻️ v210 on_ready 재진입 감지: 자동 생성/동기화 재실행을 건너뜁니다. ({bot.user})")
+    global MNB_ON_READY_RAN_ONCE, MNB_V212_BOOTSTRAPPED, MNB_V212_PERSISTENT_VIEWS_DONE
+
+    async with mnb_v212_get_bootstrap_lock():
+        if MNB_V212_BOOTSTRAPPED:
+            print(f"♻️ v212 on_ready 재진입 감지: 자동 생성/동기화 재실행을 건너뜁니다. ({bot.user})")
+            try:
+                if not rotate_bot_presence.is_running():
+                    rotate_bot_presence.start()
+            except Exception:
+                pass
+            return
+
+        MNB_V212_BOOTSTRAPPED = True
+        MNB_ON_READY_RAN_ONCE = True
+
         try:
-            if not rotate_bot_presence.is_running():
-                rotate_bot_presence.start()
-        except Exception:
+            mnb_v210_register_required_commands(force=False)
+        except NameError:
             pass
-        return
-    MNB_ON_READY_RAN_ONCE = True
-    MNB_V210_ON_READY_STARTED_AT = time.time()
-    try:
-        mnb_v210_register_required_commands(force=True)
-    except NameError:
-        pass
-    except Exception as e:
-        print(f"⚠️ v210 on_ready 필수 명령어 고정 등록 실패: {e}")
-
-    bot.add_view(UnifiedTicketView())
-    bot.add_view(CloseTicketView())
-    bot.add_view(GameRoleView())
-    bot.add_view(ProfileRoleSelectView())
-    bot.add_view(CreatorRoleSelectView())
-    bot.add_view(FriendWantedRoleSelectView())
-    bot.add_view(VerifyView())
-    bot.add_view(MusicPanelView())
-    for _custom_music_slot in (1, 2, 3):
-        bot.add_view(CustomMusicPanelView(_custom_music_slot))
-    bot.add_view(BuskingPanelView())
-    bot.add_view(BirthdayPanelView())
-    bot.add_view(BirthdayPanelCompatView())
-    try:
-        bot.add_view(UltimateCenterView())
-    except Exception:
-        pass
-    try:
-        bot.add_view(ShopView())
-    except Exception as e:
-        print(f"⚠️ 통합상점 지속 버튼 등록 실패: {e}")
-    try:
-        bot.add_view(DevAlertRoleView())
-    except Exception:
-        pass
-
-    # 대시보드에서 버튼 없이 전송된 최근 임베드를 재시작 시 자동 복구합니다.
-    for guild in bot.guilds:
-        try:
-            fixed_count = await repair_recent_auto_button_messages_for_guild(guild)
-            if fixed_count:
-                print(f"✅ {guild.name} 대시보드 임베드 버튼 자동 복구: {fixed_count}개")
         except Exception as e:
-            print(f"⚠️ {guild.name} 버튼 자동 복구 실패: {e}")
+            print(f"⚠️ v212 on_ready 필수 명령어 확인 실패: {e}")
 
-    # 플레이중 상태 메시지를 5초마다 자동 변경합니다.
-    if not rotate_bot_presence.is_running():
-        rotate_bot_presence.start()
+        if not MNB_V212_PERSISTENT_VIEWS_DONE:
+            MNB_V212_PERSISTENT_VIEWS_DONE = True
+            for _view_factory in [
+                UnifiedTicketView,
+                CloseTicketView,
+                GameRoleView,
+                ProfileRoleSelectView,
+                CreatorRoleSelectView,
+                FriendWantedRoleSelectView,
+                VerifyView,
+                MusicPanelView,
+                BuskingPanelView,
+                BirthdayPanelView,
+                BirthdayPanelCompatView,
+                UltimateCenterView,
+                ShopView,
+                DevAlertRoleView,
+            ]:
+                try:
+                    bot.add_view(_view_factory())
+                except Exception as e:
+                    # 이미 등록된 persistent view나 선택 기능은 조용히 넘깁니다.
+                    if _view_factory.__name__ in {"ShopView"}:
+                        print(f"⚠️ 통합상점 지속 버튼 등록 확인: {e}")
+            for _custom_music_slot in (1, 2, 3):
+                try:
+                    bot.add_view(CustomMusicPanelView(_custom_music_slot))
+                except Exception:
+                    pass
 
-    # v203: 전역 슬래시와 서버 슬래시를 동시에 올리면 명령어가 2개씩 보입니다.
-    # 그래서 전역 동기화는 하지 않고, 서버별 명령어만 최신 코드로 동기화한 뒤 원격 전역 명령어를 비웁니다.
-    await mnb_sync_commands_guild_only("on_ready")
+        # 대시보드 임베드 버튼 복구는 시작 시 서버별 1번만 실행합니다.
+        for guild in list(bot.guilds):
+            try:
+                fixed_count = await repair_recent_auto_button_messages_for_guild(guild)
+                if fixed_count:
+                    print(f"✅ {guild.name} 대시보드 임베드 버튼 자동 복구: {fixed_count}개")
+            except Exception as e:
+                print(f"⚠️ {guild.name} 버튼 자동 복구 실패: {e}")
 
-    print(f"✅ 로그인 완료: {bot.user}")
+        if not rotate_bot_presence.is_running():
+            rotate_bot_presence.start()
 
-    # 봇이 켜질 때마다 상점 채널에 /통합상점 패널을 자동 생성/복구합니다.
-    for guild in bot.guilds:
-        try:
-            shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=True)
-            if shop_result.get("panel_changed"):
-                channel = shop_result.get("channel")
-                channel_name = getattr(channel, "name", "미확인")
-                print(f"✅ {guild.name} 통합상점 자동 생성/갱신 완료: #{channel_name}")
-        except Exception as e:
-            print(f"⚠️ {guild.name} 통합상점 자동 생성 실패: {e}")
+        await mnb_sync_commands_guild_only("startup_once")
 
-    # bot.py를 GitHub/Render에 업데이트해서 봇이 다시 켜질 때마다
-    # 이미지에 있는 개발로그 카테고리와 4개 채널을 자동으로 생성/복구합니다.
-    for guild in bot.guilds:
-        try:
-            devlog_result = await ensure_development_log_channels(guild)
-            created_count = len(devlog_result.get("created", [])) if isinstance(devlog_result, dict) else 0
-            updated_count = len(devlog_result.get("updated", [])) if isinstance(devlog_result, dict) else 0
-            if created_count or updated_count:
-                print(f"✅ {guild.name} 개발로그 자동 생성/복구 완료: 생성 {created_count}개, 정리 {updated_count}개")
-        except Exception as e:
-            print(f"⚠️ {guild.name} 개발로그 자동 생성/복구 실패: {e}")
+        print(f"✅ 로그인 완료: {bot.user}")
 
-    for guild in bot.guilds:
-        await refresh_invite_cache(guild)
+        for guild in list(bot.guilds):
+            try:
+                shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=True)
+                if shop_result.get("panel_changed"):
+                    channel = shop_result.get("channel")
+                    channel_name = getattr(channel, "name", "미확인")
+                    print(f"✅ {guild.name} 통합상점 자동 생성/갱신 완료: #{channel_name}")
+            except Exception as e:
+                print(f"⚠️ {guild.name} 통합상점 자동 생성 실패: {e}")
 
-    if not update_server_stats.is_running():
-        update_server_stats.start()
+        for guild in list(bot.guilds):
+            try:
+                devlog_result = await ensure_development_log_channels(guild)
+                created_count = len(devlog_result.get("created", [])) if isinstance(devlog_result, dict) else 0
+                updated_count = len(devlog_result.get("updated", [])) if isinstance(devlog_result, dict) else 0
+                if created_count or updated_count:
+                    print(f"✅ {guild.name} 개발로그 자동 생성/복구 완료: 생성 {created_count}개, 정리 {updated_count}개")
+            except Exception as e:
+                print(f"⚠️ {guild.name} 개발로그 자동 생성/복구 실패: {e}")
 
-    if not auto_disconnect_empty_voice_clients.is_running():
-        auto_disconnect_empty_voice_clients.start()
-    if not auto_disconnect_empty_custom_voice_clients.is_running():
-        auto_disconnect_empty_custom_voice_clients.start()
+        for guild in list(bot.guilds):
+            try:
+                await refresh_invite_cache(guild)
+            except Exception:
+                pass
 
-    if not scheduled_event_sender.is_running():
-        scheduled_event_sender.start()
-
-    if not attendance_vip_expire_checker.is_running():
-        attendance_vip_expire_checker.start()
-
-    if not enhance_biweekly_reset_checker.is_running():
-        enhance_biweekly_reset_checker.start()
-
-    if not birthday_daily_reminder.is_running():
-        birthday_daily_reminder.start()
-
-    if not maneung_runtime_cleanup_loop.is_running():
-        maneung_runtime_cleanup_loop.start()
+        if not update_server_stats.is_running():
+            update_server_stats.start()
+        if not auto_disconnect_empty_voice_clients.is_running():
+            auto_disconnect_empty_voice_clients.start()
+        if not auto_disconnect_empty_custom_voice_clients.is_running():
+            auto_disconnect_empty_custom_voice_clients.start()
+        if not scheduled_event_sender.is_running():
+            scheduled_event_sender.start()
+        if not attendance_vip_expire_checker.is_running():
+            attendance_vip_expire_checker.start()
+        if not enhance_biweekly_reset_checker.is_running():
+            enhance_biweekly_reset_checker.start()
+        if not birthday_daily_reminder.is_running():
+            birthday_daily_reminder.start()
+        if not maneung_runtime_cleanup_loop.is_running():
+            maneung_runtime_cleanup_loop.start()
 
 # =========================
 # 입장 / 퇴장
@@ -11053,7 +11131,7 @@ async def on_message(message: discord.Message):
         return
 
     if message.guild is None:
-        await bot.process_commands(message)
+        await mnb_v212_process_commands_once(message)
         return
 
     if message.channel.name in TTS_CHANNEL_NAMES and not message.content.startswith(("!", ".", "/")):
@@ -11281,7 +11359,7 @@ async def on_message(message: discord.Message):
         c.execute("UPDATE levels SET exp=?, level=? WHERE user_id=?", (exp, level, user_id))
         conn.commit()
 
-    await bot.process_commands(message)
+    await mnb_v212_process_commands_once(message)
 
 
 @bot.event
@@ -25215,13 +25293,16 @@ async def ultimate_group_slash_sync(interaction: discord.Interaction):
         return
     await safe_interaction_defer(interaction, ephemeral=True)
     try:
-        synced = await bot.tree.sync()
+        results = await mnb_sync_commands_guild_only("manual_ultimate_slash_sync", target_guild_id=interaction.guild.id if interaction.guild else None)
+        synced_count = results[0][1] if results else 0
+        synced_names = results[0][2] if results else ""
         embed = discord.Embed(
-            title="🔄 슬래시 명령어 동기화 완료",
+            title="🔄 v212 서버 슬래시 명령어 정리 완료",
             description=(
-                f"디스코드에 명령어 동기화를 요청했어요.\n"
-                f"동기화된 명령어 수: `{len(synced)}`개\n\n"
-                "전역 슬래시 명령어는 디스코드 반영까지 시간이 걸릴 수 있어요."
+                f"이 서버의 슬래시 명령어를 다시 정리했어요.\n"
+                f"동기화된 명령어 수: `{synced_count}`개\n"
+                f"확인: {synced_names or '필수 명령어 확인 필요'}\n\n"
+                "전역 슬래시는 비워서 같은 명령어가 2개씩 보이는 문제를 막았습니다."
             ),
             color=SKY_BLUE,
         )
@@ -26093,7 +26174,8 @@ class MnbUtilityPanelView(discord.ui.View):
         await safe_interaction_edit(interaction, embed=build_mnb_utility_panel_embed(), view=MnbUtilityPanelView())
 
 
-@bot.tree.command(name="편의", description="25개 편의 기능을 통합 패널 하나로 엽니다.")
+# v213 중복 등록 방지: 최종 registry에서만 등록합니다.
+# @bot.tree.command(name="편의", description="25개 편의 기능을 통합 패널 하나로 엽니다.")
 async def mnb_utility_unified_command(interaction: discord.Interaction):
     await safe_interaction_send(interaction, embed=build_mnb_utility_panel_embed(), view=MnbUtilityPanelView(), ephemeral=True)
 
@@ -26326,7 +26408,8 @@ class ShopView(discord.ui.View):
         await self.show_inventory(interaction)
 
 
-@bot.tree.command(name="통합상점", description="상점 채널에 통합상점 패널을 1개만 자동 생성/갱신합니다.")
+# v213 중복 등록 방지: 최종 registry에서만 등록합니다.
+# @bot.tree.command(name="통합상점", description="상점 채널에 통합상점 패널을 1개만 자동 생성/갱신합니다.")
 async def mnb_integrated_shop_top_command(interaction: discord.Interaction):
     await mnb_shop_open_channel_panel_response(interaction)
 
@@ -26897,7 +26980,8 @@ class MnbExtraFeatureView(discord.ui.View):
         await mnb_shop_open_channel_panel_response(interaction)
 
 
-@bot.tree.command(name="추가기능", description="새 기능 여러 개를 한묶음 통합 패널로 엽니다.")
+# v213 중복 등록 방지: 최종 registry에서만 등록합니다.
+# @bot.tree.command(name="추가기능", description="새 기능 여러 개를 한묶음 통합 패널로 엽니다.")
 async def mnb_extra_features_unified_command(interaction: discord.Interaction):
     await safe_interaction_send(interaction, embed=build_mnb_extra_panel_embed(), view=MnbExtraFeatureView(), ephemeral=True)
 
@@ -27353,7 +27437,8 @@ class MnbUseItemPanelView(discord.ui.View):
         await safe_interaction_edit(interaction, embed=build_mnb_use_panel_embed(interaction.user), view=MnbUseItemPanelView(interaction.user.id))
 
 
-@bot.tree.command(name="사용", description="/통합상점에서 구매한 아이템을 박스형 패널로 사용합니다.")
+# v213 중복 등록 방지: 최종 registry에서만 등록합니다.
+# @bot.tree.command(name="사용", description="/통합상점에서 구매한 아이템을 박스형 패널로 사용합니다.")
 async def mnb_use_item_panel_command(interaction: discord.Interaction):
     await safe_interaction_send(interaction, embed=build_mnb_use_panel_embed(interaction.user), view=MnbUseItemPanelView(interaction.user.id), ephemeral=True)
 
@@ -27413,12 +27498,12 @@ async def prefix_mnb_slash_repair(ctx: commands.Context):
     if not getattr(ctx.author.guild_permissions, "administrator", False) and not await can_use_setup_commands(ctx.author):
         return await ctx.reply("❌ 관리자만 사용할 수 있습니다.", mention_author=False)
     try:
-        results = await mnb_sync_commands_guild_only("manual_prefix_repair")
+        results = await mnb_sync_commands_guild_only("manual_prefix_repair", target_guild_id=ctx.guild.id)
         this_result = next((r for r in results if r[0] == ctx.guild.name), None)
         if this_result:
             _, count, names = this_result
             await ctx.reply(
-                f"✅ v203 슬래시 중복 정리/복구 완료: {count}개\n"
+                f"✅ v213 슬래시 중복 정리/복구 완료: {count}개\n"
                 f"확인: {names or '필수 명령어 확인 필요'}\n"
                 "전역 슬래시는 비워서 2개씩 보이는 문제를 막았습니다.",
                 mention_author=False,
@@ -27489,7 +27574,7 @@ MNB_V210_REQUIRED_COMMAND_SPECS = [
 
 
 def mnb_v210_register_required_commands(*, force: bool = False):
-    """필수 명령어 4개를 로컬 app command tree에 정확히 1개씩만 남깁니다."""
+    """v212: 필수 명령어를 로컬 app command tree에 정확히 1개씩만 남깁니다."""
     global MNB_V210_REQUIRED_COMMANDS_REGISTERED
     if MNB_V210_REQUIRED_COMMANDS_REGISTERED and not force:
         return True
@@ -27517,15 +27602,15 @@ def mnb_v210_register_required_commands(*, force: bool = False):
             print(f"❌ v210 필수 명령어 등록 실패 /{name}: {e}")
 
     MNB_V210_REQUIRED_COMMANDS_REGISTERED = True
-    print("✅ v211 필수 명령어 고정 등록 완료: " + ", ".join(registered))
+    print("✅ v212 필수 명령어 고정 등록 완료: " + ", ".join(registered))
     return True
 
 
-# 파일 로딩이 끝난 뒤에도 on_ready 전 로컬 트리에 필수 명령어를 고정합니다.
-mnb_v210_register_required_commands(force=True)
+# v213: 예전 v210/v212 강제등록 호출은 최종 registry에서만 실행합니다.
+# mnb_v210_register_required_commands(force=True)
 
 
-@bot.command(name="v210점검", aliases=["오류점검", "중복점검", "명령어점검"])
+@bot.command(name="v213점검", aliases=["v212점검", "v210점검", "오류점검", "중복점검", "명령어점검"])
 async def prefix_mnb_v210_healthcheck(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
@@ -27536,7 +27621,7 @@ async def prefix_mnb_v210_healthcheck(ctx: commands.Context):
         duplicate_names = sorted({name for name in local_names if local_names.count(name) > 1})
         required_state = [f"/{name}: {'✅' if name in local_names else '❌'}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES)]
         embed = discord.Embed(
-            title="🛠️ v211 오류/중복 점검",
+            title="🛠️ v213 오류/중복 점검",
             description="현재 코드에 로컬 등록된 명령어와 /경제 하위명령어 제거 상태를 확인했어요.",
             color=COLOR_MINT,
         )
@@ -27546,12 +27631,12 @@ async def prefix_mnb_v210_healthcheck(ctx: commands.Context):
         embed.add_field(name="/경제 하위명령어", value="등록 안 함 ✅", inline=True)
         embed.add_field(
             name="다음 조치",
-            value="중복이 보이면 `!중복정리` 또는 `!슬래시복구`를 실행하고, Render 로그의 v210 등록 완료 문구를 확인하세요.",
+            value="중복이 보이면 `!중복정리` 또는 `!슬래시복구`를 실행하고, Render 로그의 v212 등록 완료 문구를 확인하세요.",
             inline=False,
         )
         await ctx.reply(embed=embed, mention_author=False)
     except Exception as e:
-        await ctx.reply(f"❌ v210 점검 실패: `{str(e)[:800]}`", mention_author=False)
+        await ctx.reply(f"❌ v213 점검 실패: `{str(e)[:800]}`", mention_author=False)
 
 
 for _group in [
@@ -27573,6 +27658,372 @@ for _group in [
     except app_commands.CommandAlreadyRegistered:
         pass
 
+
+
+# =========================
+# v213 전체 중복 제거 안정화 패치
+# =========================
+# 목표:
+# - /편의, /추가기능, /사용, /통합상점, /잔액, /인벤토리는 최종 registry 한 곳에서만 등록
+# - on_ready 재진입/재연결 시 자동생성, 로그, 슬래시 동기화가 다시 돌지 않게 차단
+# - !명령어가 같은 메시지에서 2번 처리되지 않게 메모리+DB로 차단
+# - 전역 슬래시와 서버 슬래시가 같이 떠서 2개씩 보이는 문제 방지
+
+MNB_V213_READY_DONE = False
+MNB_V213_READY_LOCK = None
+MNB_V213_SYNC_LOCK = None
+MNB_V213_GLOBAL_COMMANDS_CLEARED = False
+MNB_V213_SYNCED_GUILDS = set()
+MNB_V213_SHOP_PANEL_GUILDS = set()
+MNB_V213_DEVLOG_GUILDS = set()
+MNB_V213_INVITE_CACHE_GUILDS = set()
+MNB_V213_MESSAGE_GUARD = {}
+MNB_V213_MESSAGE_GUARD_SECONDS = 45
+MNB_V213_REGISTER_LOGGED = False
+MNB_V213_VIEW_DONE = False
+
+
+def mnb_v213_get_ready_lock():
+    global MNB_V213_READY_LOCK
+    if MNB_V213_READY_LOCK is None:
+        MNB_V213_READY_LOCK = asyncio.Lock()
+    return MNB_V213_READY_LOCK
+
+
+def mnb_v213_get_sync_lock():
+    global MNB_V213_SYNC_LOCK
+    if MNB_V213_SYNC_LOCK is None:
+        MNB_V213_SYNC_LOCK = asyncio.Lock()
+    return MNB_V213_SYNC_LOCK
+
+
+def mnb_v213_required_names_text():
+    return ", ".join(f"/{name}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES))
+
+
+def mnb_v213_purge_message_guard(now_ts: float):
+    if len(MNB_V213_MESSAGE_GUARD) < 1500:
+        return
+    cutoff = now_ts - MNB_V213_MESSAGE_GUARD_SECONDS
+    for key, ts in list(MNB_V213_MESSAGE_GUARD.items()):
+        if ts < cutoff:
+            MNB_V213_MESSAGE_GUARD.pop(key, None)
+
+
+def mnb_v213_claim_message(message: discord.Message) -> bool:
+    """같은 메시지가 on_message/listener/중복 프로세스에서 2번 처리되는 것을 줄입니다."""
+    try:
+        now_ts = time.time()
+        mnb_v213_purge_message_guard(now_ts)
+        guild_id = getattr(getattr(message, "guild", None), "id", 0) or 0
+        channel_id = getattr(getattr(message, "channel", None), "id", 0) or 0
+        message_id = getattr(message, "id", None)
+        if message_id:
+            key = f"msg:{guild_id}:{channel_id}:{message_id}"
+        else:
+            author_id = getattr(getattr(message, "author", None), "id", 0) or 0
+            content_hash = hashlib.sha256((getattr(message, "content", "") or "").encode("utf-8", errors="ignore")).hexdigest()[:24]
+            key = f"fallback:{guild_id}:{channel_id}:{author_id}:{content_hash}"
+
+        old_ts = MNB_V213_MESSAGE_GUARD.get(key)
+        if old_ts and now_ts - old_ts < MNB_V213_MESSAGE_GUARD_SECONDS:
+            return False
+        MNB_V213_MESSAGE_GUARD[key] = now_ts
+
+        # 같은 database.db를 공유하는 중복 실행까지 최대한 방어합니다.
+        try:
+            with DB_MUTEX:
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS runtime_dedupe_messages (
+                    dedupe_key TEXT PRIMARY KEY,
+                    created_ts REAL
+                )
+                """)
+                c.execute("DELETE FROM runtime_dedupe_messages WHERE created_ts < ?", (now_ts - 90,))
+                c.execute(
+                    "INSERT OR IGNORE INTO runtime_dedupe_messages(dedupe_key, created_ts) VALUES (?, ?)",
+                    (key, now_ts),
+                )
+                inserted = c.rowcount
+                conn.commit()
+            if inserted == 0:
+                return False
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return True
+
+
+def mnb_v213_remove_global_command_name(name: str):
+    removed = 0
+    try:
+        while bot.tree.remove_command(name, guild=None) is not None:
+            removed += 1
+    except Exception:
+        try:
+            if bot.tree.remove_command(name, guild=None) is not None:
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def mnb_v210_register_required_commands(*, force: bool = False):
+    """v213: 필수 명령어는 이 registry 한 곳에서만 top-level slash로 등록합니다."""
+    global MNB_V210_REQUIRED_COMMANDS_REGISTERED, MNB_V213_REGISTER_LOGGED
+    if MNB_V210_REQUIRED_COMMANDS_REGISTERED and not force:
+        return True
+
+    # 예전 직접 데코레이터/구버전 top-level 등록을 전부 제거하고 하나씩만 다시 넣습니다.
+    for name in sorted(set(MNB_REQUIRED_COMMAND_NAMES) | set(MNB_REMOVED_TOP_LEVEL_COMMAND_NAMES)):
+        mnb_v213_remove_global_command_name(name)
+
+    registered = []
+    for name, description, callback in MNB_V210_REQUIRED_COMMAND_SPECS:
+        command = app_commands.Command(name=name, description=description, callback=callback)
+        try:
+            bot.tree.add_command(command)
+            registered.append(f"/{name}")
+        except app_commands.CommandAlreadyRegistered:
+            # 남아 있으면 제거 후 1번만 재등록합니다.
+            mnb_v213_remove_global_command_name(name)
+            try:
+                bot.tree.add_command(command)
+                registered.append(f"/{name}")
+            except Exception as e:
+                print(f"❌ v213 필수 명령어 재등록 실패 /{name}: {e}")
+        except Exception as e:
+            print(f"❌ v213 필수 명령어 등록 실패 /{name}: {e}")
+
+    MNB_V210_REQUIRED_COMMANDS_REGISTERED = True
+    if not MNB_V213_REGISTER_LOGGED:
+        MNB_V213_REGISTER_LOGGED = True
+        print("✅ v213 필수 명령어 단일 등록 완료: " + ", ".join(registered))
+    return True
+
+
+def mnb_v213_get_local_command_staging():
+    """현재 로컬 tree에서 서버로 복사할 명령어를 이름 기준 1개씩만 반환합니다."""
+    mnb_v210_register_required_commands(force=False)
+    try:
+        commands_now = list(bot.tree.get_commands(guild=None))
+    except Exception:
+        commands_now = []
+
+    deduped = {}
+    for command in commands_now:
+        name = getattr(command, "name", "")
+        if not name or name in MNB_REMOVED_TOP_LEVEL_COMMAND_NAMES:
+            continue
+        # 필수 명령어는 v213 registry의 것을 우선 유지하고, 나머지는 마지막 등록 1개만 유지합니다.
+        deduped[name] = command
+    return list(deduped.values())
+
+
+async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: int = None):
+    """v213: 서버 슬래시만 사용하고 중복 호출/중복 등록을 차단합니다."""
+    global MNB_V212_STARTUP_SYNC_DONE, MNB_V212_LAST_SYNC_TS, MNB_V213_GLOBAL_COMMANDS_CLEARED
+
+    manual = str(reason or "").startswith("manual")
+    now_ts = time.time()
+    if manual and now_ts - MNB_V212_LAST_SYNC_TS < 6:
+        return []
+
+    async with mnb_v213_get_sync_lock():
+        now_ts = time.time()
+        if manual and now_ts - MNB_V212_LAST_SYNC_TS < 6:
+            return []
+
+        target_guilds = [
+            guild for guild in list(bot.guilds)
+            if target_guild_id is None or guild.id == int(target_guild_id)
+        ]
+        if not manual:
+            pending = [guild for guild in target_guilds if guild.id not in MNB_V213_SYNCED_GUILDS]
+            if not pending and MNB_V212_STARTUP_SYNC_DONE:
+                return []
+            target_guilds = pending
+
+        staging_commands = mnb_v213_get_local_command_staging()
+        local_names = [getattr(cmd, "name", "") for cmd in staging_commands]
+        missing_required = sorted(set(MNB_REQUIRED_COMMAND_NAMES) - set(local_names))
+        if missing_required:
+            print(f"⚠️ v213 필수 명령어 로컬 누락: {missing_required}")
+        else:
+            print("✅ v213 필수 명령어 로컬 확인: " + mnb_v213_required_names_text())
+
+        results = []
+        for guild in target_guilds:
+            guild_object = discord.Object(id=guild.id)
+            try:
+                bot.tree.clear_commands(guild=guild_object)
+                added_names = set()
+                for command in staging_commands:
+                    name = getattr(command, "name", "")
+                    if not name or name in added_names or name in MNB_REMOVED_TOP_LEVEL_COMMAND_NAMES:
+                        continue
+                    try:
+                        bot.tree.add_command(command, guild=guild_object)
+                        added_names.add(name)
+                    except app_commands.CommandAlreadyRegistered:
+                        pass
+                    except Exception as e:
+                        print(f"⚠️ {guild.name} v213 명령어 복사 실패 /{name}: {e}")
+
+                synced = await bot.tree.sync(guild=guild_object)
+                synced_names = {cmd.name for cmd in synced}
+                check_text = ", ".join(f"/{name}" for name in sorted(set(MNB_REQUIRED_COMMAND_NAMES) & synced_names))
+                results.append((guild.name, len(synced), check_text))
+                MNB_V213_SYNCED_GUILDS.add(guild.id)
+                print(f"✅ {guild.name} v213 서버 슬래시 정리 완료: {len(synced)}개 | {check_text}")
+            except Exception as e:
+                print(f"❌ {guild.name} v213 서버 슬래시 정리 실패: {e}")
+
+        # 원격 전역 슬래시는 한 번만 비워서 서버 명령어와 2개씩 보이는 문제를 막습니다.
+        if not MNB_V213_GLOBAL_COMMANDS_CLEARED and MNB_SYNC_MODE in {"guild", "guild_only", "server", "server_only"}:
+            try:
+                bot.tree.clear_commands(guild=None)
+                cleared = await bot.tree.sync(guild=None)
+                MNB_V213_GLOBAL_COMMANDS_CLEARED = True
+                print(f"✅ v213 원격 전역 슬래시 정리 완료: {len(cleared)}개 유지")
+            except Exception as e:
+                print(f"⚠️ v213 원격 전역 슬래시 정리 실패: {e}")
+            finally:
+                # 수동 복구와 다음 서버 동기화를 위해 로컬 tree는 다시 복구합니다.
+                for command in staging_commands:
+                    try:
+                        bot.tree.add_command(command)
+                    except app_commands.CommandAlreadyRegistered:
+                        pass
+                    except Exception:
+                        pass
+
+        MNB_V212_LAST_SYNC_TS = time.time()
+        if target_guild_id is None and len(MNB_V213_SYNCED_GUILDS) >= len(bot.guilds):
+            MNB_V212_STARTUP_SYNC_DONE = True
+        return results
+
+
+def mnb_v213_register_persistent_views_once():
+    global MNB_V213_VIEW_DONE, MNB_V212_PERSISTENT_VIEWS_DONE
+    if MNB_V213_VIEW_DONE:
+        return
+    MNB_V213_VIEW_DONE = True
+    MNB_V212_PERSISTENT_VIEWS_DONE = True
+    for _view_factory in [
+        UnifiedTicketView,
+        CloseTicketView,
+        GameRoleView,
+        ProfileRoleSelectView,
+        CreatorRoleSelectView,
+        FriendWantedRoleSelectView,
+        VerifyView,
+        MusicPanelView,
+        BuskingPanelView,
+        BirthdayPanelView,
+        BirthdayPanelCompatView,
+        UltimateCenterView,
+        ShopView,
+        DevAlertRoleView,
+    ]:
+        try:
+            bot.add_view(_view_factory())
+        except Exception:
+            pass
+    for _custom_music_slot in (1, 2, 3):
+        try:
+            bot.add_view(CustomMusicPanelView(_custom_music_slot))
+        except Exception:
+            pass
+
+
+def mnb_v213_start_background_loops_once():
+    for _loop in [
+        rotate_bot_presence,
+        update_server_stats,
+        auto_disconnect_empty_voice_clients,
+        auto_disconnect_empty_custom_voice_clients,
+        scheduled_event_sender,
+        attendance_vip_expire_checker,
+        enhance_biweekly_reset_checker,
+        birthday_daily_reminder,
+        maneung_runtime_cleanup_loop,
+    ]:
+        try:
+            if not _loop.is_running():
+                _loop.start()
+        except Exception:
+            pass
+
+
+_MNB_V213_LEGACY_ON_MESSAGE = getattr(bot, "on_message", None)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # 같은 메시지가 2번 처리되는 경우를 먼저 차단합니다.
+    if not mnb_v213_claim_message(message):
+        return
+    if _MNB_V213_LEGACY_ON_MESSAGE:
+        await _MNB_V213_LEGACY_ON_MESSAGE(message)
+
+
+@bot.event
+async def on_ready():
+    global MNB_V213_READY_DONE, MNB_V212_BOOTSTRAPPED, MNB_ON_READY_RAN_ONCE
+    async with mnb_v213_get_ready_lock():
+        if MNB_V213_READY_DONE:
+            mnb_v213_start_background_loops_once()
+            return
+        MNB_V213_READY_DONE = True
+        MNB_V212_BOOTSTRAPPED = True
+        MNB_ON_READY_RAN_ONCE = True
+
+        mnb_v210_register_required_commands(force=True)
+        mnb_v213_register_persistent_views_once()
+        mnb_v213_start_background_loops_once()
+
+        await mnb_sync_commands_guild_only("startup_v213")
+        print(f"✅ 로그인 완료: {bot.user}")
+
+        for guild in list(bot.guilds):
+            if guild.id in MNB_V213_SHOP_PANEL_GUILDS:
+                continue
+            MNB_V213_SHOP_PANEL_GUILDS.add(guild.id)
+            try:
+                shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=True)
+                if shop_result.get("panel_changed"):
+                    channel = shop_result.get("channel")
+                    print(f"✅ {guild.name} 통합상점 자동 생성/갱신 완료: #{getattr(channel, 'name', '미확인')}")
+            except Exception as e:
+                print(f"⚠️ {guild.name} 통합상점 자동 생성 실패: {e}")
+
+        for guild in list(bot.guilds):
+            if guild.id in MNB_V213_DEVLOG_GUILDS:
+                continue
+            MNB_V213_DEVLOG_GUILDS.add(guild.id)
+            try:
+                devlog_result = await ensure_development_log_channels(guild)
+                created_count = len(devlog_result.get("created", [])) if isinstance(devlog_result, dict) else 0
+                updated_count = len(devlog_result.get("updated", [])) if isinstance(devlog_result, dict) else 0
+                if created_count or updated_count:
+                    print(f"✅ {guild.name} 개발로그 자동 생성/복구 완료: 생성 {created_count}개, 정리 {updated_count}개")
+            except Exception as e:
+                print(f"⚠️ {guild.name} 개발로그 자동 생성/복구 실패: {e}")
+
+        for guild in list(bot.guilds):
+            if guild.id in MNB_V213_INVITE_CACHE_GUILDS:
+                continue
+            MNB_V213_INVITE_CACHE_GUILDS.add(guild.id)
+            try:
+                await refresh_invite_cache(guild)
+            except Exception:
+                pass
+
+
+# 최종 group 등록 이후 required command를 다시 1번 정리해서, 이전 데코레이터/구버전 등록이 남지 않게 합니다.
+mnb_v210_register_required_commands(force=True)
 
 async def start_all_discord_clients():
     tasks = []
