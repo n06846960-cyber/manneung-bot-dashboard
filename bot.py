@@ -21,6 +21,7 @@ from collections import deque
 MNB_V200_RELEASE = "v200 shop-single-panel slash-sync-fix"
 MNB_V202_RELEASE = "v202 real slash/prefix fallback use-panel fix"
 MNB_V203_RELEASE = "v203 guild-only-sync dedupe single-instance fix"
+MNB_V211_RELEASE = "v211 remove economy subcommands top-level economy commands only"
 MNB_V210_RELEASE = "v210 stability-dedupe-required-commands-fix"
 
 import yt_dlp
@@ -105,7 +106,7 @@ bot = commands.Bot(command_prefix=commands.when_mentioned_or(".", "!"), intents=
 # =========================
 # 같은 코드가 전역 슬래시 + 서버 슬래시를 동시에 동기화하면 디스코드 명령어가 2개씩 보일 수 있습니다.
 # v203부터는 서버별 슬래시만 유지하고, 전역 슬래시는 비워서 중복 표시를 막습니다.
-MNB_REQUIRED_COMMAND_NAMES = {"편의", "추가기능", "사용", "통합상점"}
+MNB_REQUIRED_COMMAND_NAMES = {"편의", "추가기능", "사용", "통합상점", "인벤토리", "잔액"}
 MNB_SYNC_MODE = os.getenv("MNB_COMMAND_SYNC_MODE", "guild_only").strip().lower() or "guild_only"
 MNB_PERSISTENT_VIEWS_REGISTERED = False
 MNB_MAINBOT_INSTANCE_SOCKET = None
@@ -9291,7 +9292,7 @@ async def mnb_sync_commands_guild_only(reason: str = "auto"):
     if missing_required:
         print(f"⚠️ v210 필수 명령어 로컬 누락: {missing_required}")
     else:
-        print("✅ v210 필수 명령어 로컬 등록 확인: /편의 /추가기능 /사용 /통합상점")
+        print("✅ v211 필수 명령어 로컬 등록 확인: /편의 /추가기능 /사용 /통합상점 /잔액 /인벤토리")
 
     guild_results = []
     for guild in list(bot.guilds):
@@ -22742,7 +22743,7 @@ async def custom_bot_panel(interaction: discord.Interaction):
 server_group = app_commands.Group(name="서버", description="서버 세팅, 카테고리 생성, 역할/스텟/지원서버 템플릿을 관리합니다.")
 embed_group = app_commands.Group(name="임베드", description="임베드 디자인, 버튼, 인증/규칙 문구를 관리합니다.")
 manage_group = app_commands.Group(name="관리", description="청소, 킥, 밴, 경고, 검열 패널을 관리합니다.")
-economy_group = app_commands.Group(name="경제", description="포인트, 상점, 아이템, 랭킹을 사용합니다. 출석은 /출첵 또는 !출첵을 사용합니다.")
+economy_group = app_commands.Group(name="경제", description="v211부터 /경제 하위명령어는 등록하지 않습니다. /잔액, /인벤토리, /통합상점처럼 최상위 명령어를 사용합니다.")
 stock_group = app_commands.Group(name="주식", description="서버 전용 가상 주식 시장을 사용합니다.")
 event_group = app_commands.Group(name="이벤트", description="이벤트 생성, 목록, 종료, 보상을 관리합니다.")
 voice_group = app_commands.Group(name="음성", description="TTS 입장/퇴장/목소리와 TTS 카테고리를 관리합니다.")
@@ -23327,82 +23328,98 @@ async def economy_group_attendance_short(interaction: discord.Interaction):
     await attendance_short(interaction)
 
 
-@economy_group.command(name="잔액", description="내 포인트 또는 다른 유저의 포인트를 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="잔액", description="내 포인트 또는 다른 유저의 포인트를 확인합니다.")
 async def economy_group_balance(interaction: discord.Interaction, 유저: discord.Member = None):
     await balance_command(interaction, 유저)
 
 
-@economy_group.command(name="송금", description="내 포인트를 다른 유저에게 송금합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="송금", description="내 포인트를 다른 유저에게 송금합니다.")
 async def economy_group_transfer(interaction: discord.Interaction, 유저: discord.Member, 금액: int):
     await transfer_point_command(interaction, 유저, 금액)
 
 
-@economy_group.command(name="가챠", description="원하는 포인트를 걸어서 가챠를 돌립니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="가챠", description="원하는 포인트를 걸어서 가챠를 돌립니다.")
 async def economy_group_gacha(interaction: discord.Interaction, 금액: int, 횟수: int = 1):
     await point_gacha(interaction, 금액, 횟수)
 
 
-@economy_group.command(name="상점", description="통합 상점 패널을 엽니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="상점", description="통합 상점 패널을 엽니다.")
 async def economy_group_shop(interaction: discord.Interaction):
     await integrated_shop(interaction)
 
 
-@economy_group.command(name="구매", description="박스에 상품명과 개수를 입력해서 구매합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="구매", description="박스에 상품명과 개수를 입력해서 구매합니다.")
 async def economy_group_buy(interaction: discord.Interaction):
     await buy_shop_item_command(interaction)
 
 
-@economy_group.command(name="인벤토리", description="구매한 아이템을 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="인벤토리", description="구매한 아이템을 확인합니다.")
 async def economy_group_inventory(interaction: discord.Interaction):
     await inventory_command(interaction)
 
 
-@economy_group.command(name="랜덤박스", description="랜덤박스를 열어 보상을 얻습니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="랜덤박스", description="랜덤박스를 열어 보상을 얻습니다.")
 async def economy_group_random_box(interaction: discord.Interaction, 횟수: int = 1):
     await use_random_box(interaction, 횟수)
 
 
-@economy_group.command(name="닉네임색변경권", description="닉네임 색 역할을 받습니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="닉네임색변경권", description="닉네임 색 역할을 받습니다.")
 async def economy_group_nickname_color(interaction: discord.Interaction, 색상: str):
     await use_nickname_color_ticket(interaction, 색상)
 
 
-@economy_group.command(name="vip", description="VIP권으로 VIP 역할을 받습니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="vip", description="VIP권으로 VIP 역할을 받습니다.")
 async def economy_group_vip(interaction: discord.Interaction):
     await use_vip_ticket(interaction)
 
 
-@economy_group.command(name="경험치부스터", description="24시간 동안 채팅/음성 경험치를 2배로 받습니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="경험치부스터", description="24시간 동안 채팅/음성 경험치를 2배로 받습니다.")
 async def economy_group_exp_booster(interaction: discord.Interaction):
     await use_exp_booster(interaction)
 
 
-@economy_group.command(name="출석보너스권", description="다음 출석 보상 추가권을 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="출석보너스권", description="다음 출석 보상 추가권을 확인합니다.")
 async def economy_group_attendance_bonus(interaction: discord.Interaction):
     await use_attendance_bonus_ticket(interaction)
 
 
-@economy_group.command(name="강화보호권", description="보유한 강화보호권 개수를 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="강화보호권", description="보유한 강화보호권 개수를 확인합니다.")
 async def economy_group_enhance_protect(interaction: discord.Interaction):
     await use_enhance_protect_ticket(interaction)
 
 
-@economy_group.command(name="강화확률업권", description="보유한 강화확률업권 개수를 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="강화확률업권", description="보유한 강화확률업권 개수를 확인합니다.")
 async def economy_group_enhance_rate(interaction: discord.Interaction):
     await use_enhance_rate_ticket(interaction)
 
 
-@economy_group.command(name="프로필꾸미기권", description="프로필 표시를 꾸밉니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="프로필꾸미기권", description="프로필 표시를 꾸밉니다.")
 async def economy_group_profile_custom(interaction: discord.Interaction):
     await use_profile_custom_ticket(interaction)
 
 
-@economy_group.command(name="상점할인권", description="상점할인권 사용법을 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="상점할인권", description="상점할인권 사용법을 확인합니다.")
 async def economy_group_shop_discount(interaction: discord.Interaction):
     await use_shop_discount_ticket(interaction)
 
 
-@economy_group.command(name="포인트랭킹", description="포인트 TOP 10을 확인합니다.")
+# v211 제거: /경제 하위명령어 비등록
+# @economy_group.command(name="포인트랭킹", description="포인트 TOP 10을 확인합니다.")
 async def economy_group_point_rank(interaction: discord.Interaction):
     await point_ranking(interaction)
 
@@ -27389,7 +27406,7 @@ async def prefix_mnb_integrated_shop(ctx: commands.Context):
         await ctx.reply(f"❌ 통합상점 정리 실패: `{str(e)[:500]}`", mention_author=False)
 
 
-@bot.command(name="슬래시복구", aliases=["명령어복구", "명령어동기화", "중복정리", "명령어중복정리"])
+@bot.command(name="슬래시복구", aliases=["명령어복구", "명령어동기화", "중복정리", "명령어중복정리", "경제정리", "경제하위명령정리"])
 async def prefix_mnb_slash_repair(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
@@ -27451,11 +27468,23 @@ async def mnb_v210_shop_callback(interaction: discord.Interaction):
     await mnb_shop_open_channel_panel_response(interaction)
 
 
+async def mnb_v211_balance_callback(interaction: discord.Interaction, 유저: discord.Member = None):
+    # /경제 잔액 대신 최상위 /잔액만 사용합니다.
+    await balance_command(interaction, 유저)
+
+
+async def mnb_v211_inventory_callback(interaction: discord.Interaction):
+    # /경제 인벤토리 대신 최상위 /인벤토리만 사용합니다.
+    await inventory_command(interaction)
+
+
 MNB_V210_REQUIRED_COMMAND_SPECS = [
     ("편의", "25개 편의 기능을 통합 패널 하나로 엽니다.", mnb_v210_utility_callback),
     ("추가기능", "새 기능 여러 개를 한묶음 통합 패널로 엽니다.", mnb_v210_extra_callback),
     ("사용", "/통합상점에서 구매한 아이템을 박스형 패널로 사용합니다.", mnb_v210_use_callback),
     ("통합상점", "상점 채널에 통합상점 패널을 1개만 자동 생성/갱신합니다.", mnb_v210_shop_callback),
+    ("잔액", "내 포인트 또는 다른 유저의 포인트를 확인합니다.", mnb_v211_balance_callback),
+    ("인벤토리", "/통합상점에서 구매한 아이템을 확인합니다.", mnb_v211_inventory_callback),
 ]
 
 
@@ -27488,7 +27517,7 @@ def mnb_v210_register_required_commands(*, force: bool = False):
             print(f"❌ v210 필수 명령어 등록 실패 /{name}: {e}")
 
     MNB_V210_REQUIRED_COMMANDS_REGISTERED = True
-    print("✅ v210 필수 명령어 고정 등록 완료: " + ", ".join(registered))
+    print("✅ v211 필수 명령어 고정 등록 완료: " + ", ".join(registered))
     return True
 
 
@@ -27507,13 +27536,14 @@ async def prefix_mnb_v210_healthcheck(ctx: commands.Context):
         duplicate_names = sorted({name for name in local_names if local_names.count(name) > 1})
         required_state = [f"/{name}: {'✅' if name in local_names else '❌'}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES)]
         embed = discord.Embed(
-            title="🛠️ v210 오류/중복 점검",
-            description="현재 코드에 로컬 등록된 명령어와 중복 상태를 확인했어요.",
+            title="🛠️ v211 오류/중복 점검",
+            description="현재 코드에 로컬 등록된 명령어와 /경제 하위명령어 제거 상태를 확인했어요.",
             color=COLOR_MINT,
         )
         embed.add_field(name="필수 명령어", value="\n".join(required_state), inline=False)
         embed.add_field(name="로컬 명령어 수", value=f"`{len(local_names)}`개", inline=True)
         embed.add_field(name="로컬 중복", value=", ".join(f"`/{n}`" for n in duplicate_names) if duplicate_names else "없음", inline=True)
+        embed.add_field(name="/경제 하위명령어", value="등록 안 함 ✅", inline=True)
         embed.add_field(
             name="다음 조치",
             value="중복이 보이면 `!중복정리` 또는 `!슬래시복구`를 실행하고, Render 로그의 v210 등록 완료 문구를 확인하세요.",
@@ -27528,7 +27558,7 @@ for _group in [
     server_group,
     embed_group,
     manage_group,
-    economy_group,
+    # v211: /경제 하위명령어 그룹은 사용자 요청으로 등록하지 않습니다.
     stock_group,
     event_group,
     voice_group,
