@@ -17,6 +17,7 @@ from collections import deque
 
 # v201: /편의·/추가기능 즉시 등록 보강 + /사용 박스형 아이템 사용 패널 추가
 MNB_V200_RELEASE = "v200 shop-single-panel slash-sync-fix"
+MNB_V202_RELEASE = "v202 real slash/prefix fallback use-panel fix"
 
 import yt_dlp
 
@@ -9231,16 +9232,28 @@ async def on_ready():
     except Exception as e:
         print(f"❌ 슬래시 명령어 전역 동기화 실패: {e}")
 
-    # v201: /편의, /추가기능, /사용 같은 새 최상위 명령어가 전역 캐시 때문에
-    # 안 보이는 문제를 줄이기 위해 전역 명령어를 각 서버 명령어로 복사 후 즉시 동기화합니다.
+    # v202: 이전 배포에서 남은 구버전 /편의 그룹, /통합상점 안내, /추가기능 누락 문제를 줄이기 위해
+    # 서버별 명령어 캐시를 먼저 비우고 현재 코드의 전역 명령어만 다시 복사해서 강제 동기화합니다.
+    # 이 블록이 성공하면 /편의, /추가기능, /사용, /통합상점이 서버 명령어로 바로 표시됩니다.
+    required_command_names = {"편의", "추가기능", "사용", "통합상점"}
+    global_names = {cmd.name for cmd in bot.tree.get_commands()}
+    missing_local = sorted(required_command_names - global_names)
+    if missing_local:
+        print(f"⚠️ v202 필수 명령어가 로컬 트리에 없습니다: {missing_local}")
+    else:
+        print("✅ v202 필수 명령어 로컬 등록 확인: /편의 /추가기능 /사용 /통합상점")
+
     for guild in bot.guilds:
         try:
             guild_object = discord.Object(id=guild.id)
+            # 기존 서버 명령어 캐시를 비워야 예전 /편의 하위명령어 구조가 계속 남지 않습니다.
+            bot.tree.clear_commands(guild=guild_object)
             bot.tree.copy_global_to(guild=guild_object)
             synced_guild = await bot.tree.sync(guild=guild_object)
-            print(f"✅ {guild.name} 서버 슬래시 즉시 동기화 완료: {len(synced_guild)}개")
+            synced_names = ", ".join(f"/{cmd.name}" for cmd in synced_guild if cmd.name in required_command_names)
+            print(f"✅ {guild.name} v202 서버 슬래시 강제 동기화 완료: {len(synced_guild)}개 | {synced_names}")
         except Exception as e:
-            print(f"⚠️ {guild.name} 서버 슬래시 즉시 동기화 실패: {e}")
+            print(f"⚠️ {guild.name} v202 서버 슬래시 강제 동기화 실패: {e}")
 
     print(f"✅ 로그인 완료: {bot.user}")
 
@@ -27151,6 +27164,71 @@ class MnbUseItemPanelView(discord.ui.View):
 @bot.tree.command(name="사용", description="/통합상점에서 구매한 아이템을 박스형 패널로 사용합니다.")
 async def mnb_use_item_panel_command(interaction: discord.Interaction):
     await safe_interaction_send(interaction, embed=build_mnb_use_panel_embed(interaction.user), view=MnbUseItemPanelView(interaction.user.id), ephemeral=True)
+
+
+# =========================
+# v202 슬래시 캐시 실패 대비 즉시 사용 가능한 접두사 백업 명령어
+# =========================
+# Discord 슬래시 캐시가 늦게 갱신되거나 GitHub/Render 배포 직후 /편의, /추가기능, /사용이
+# 바로 안 보이는 경우에도 !편의, !추가기능, !사용, !통합상점 으로 동일 기능을 사용할 수 있습니다.
+
+@bot.command(name="편의", aliases=["편의기능", "유틸", "utility"])
+async def prefix_mnb_utility_panel(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
+    await ctx.reply(embed=build_mnb_utility_panel_embed(), view=MnbUtilityPanelView(), mention_author=False)
+
+
+@bot.command(name="추가기능", aliases=["추가", "extra"])
+async def prefix_mnb_extra_panel(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
+    await ctx.reply(embed=build_mnb_extra_panel_embed(), view=MnbExtraFeatureView(), mention_author=False)
+
+
+@bot.command(name="사용", aliases=["아이템사용", "아이템"])
+async def prefix_mnb_use_panel(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
+    await ctx.reply(embed=build_mnb_use_panel_embed(ctx.author), view=MnbUseItemPanelView(ctx.author.id), mention_author=False)
+
+
+@bot.command(name="통합상점", aliases=["상점패널", "상점"])
+async def prefix_mnb_integrated_shop(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
+    try:
+        result = await ensure_integrated_shop_panel_for_guild(ctx.guild, create_missing=True)
+        channel = result.get("channel") if isinstance(result, dict) else None
+        embed = discord.Embed(
+            title="✅ 통합상점 정리 완료",
+            description=(
+                f"{channel.mention if channel else '#상점'} 채널에 최신 통합상점 패널을 1개만 남겨뒀어요.\n"
+                "슬래시가 아직 안 보이면 `!편의`, `!추가기능`, `!사용`으로 바로 쓸 수 있어요."
+            ),
+            color=COLOR_GREEN,
+        )
+        embed.set_footer(text="만능 봇 | v202 접두사 백업 명령어")
+        await ctx.reply(embed=embed, mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"❌ 통합상점 정리 실패: `{str(e)[:500]}`", mention_author=False)
+
+
+@bot.command(name="슬래시복구", aliases=["명령어복구", "명령어동기화"])
+async def prefix_mnb_slash_repair(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
+    if not getattr(ctx.author.guild_permissions, "administrator", False) and not await can_use_setup_commands(ctx.author):
+        return await ctx.reply("❌ 관리자만 사용할 수 있습니다.", mention_author=False)
+    try:
+        guild_object = discord.Object(id=ctx.guild.id)
+        bot.tree.clear_commands(guild=guild_object)
+        bot.tree.copy_global_to(guild=guild_object)
+        synced = await bot.tree.sync(guild=guild_object)
+        names = ", ".join(f"/{cmd.name}" for cmd in synced if cmd.name in {"편의", "추가기능", "사용", "통합상점"})
+        await ctx.reply(f"✅ 슬래시 명령어 복구 완료: {len(synced)}개\n확인: {names or '필수 명령어 확인 필요'}", mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"❌ 슬래시 복구 실패: `{str(e)[:800]}`", mention_author=False)
 
 
 for _group in [
