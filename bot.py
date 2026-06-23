@@ -15,7 +15,7 @@ import json
 import urllib.request
 from collections import deque
 
-# v200: 통합상점 중복/구버전 패널 완전 정리 + /편의, /추가기능 즉시 동기화 보강
+# v201: /편의·/추가기능 즉시 등록 보강 + /사용 박스형 아이템 사용 패널 추가
 MNB_V200_RELEASE = "v200 shop-single-panel slash-sync-fix"
 
 import yt_dlp
@@ -9231,11 +9231,13 @@ async def on_ready():
     except Exception as e:
         print(f"❌ 슬래시 명령어 전역 동기화 실패: {e}")
 
-    # v200: 새로 추가한 /편의, /추가기능, /통합상점이 디스코드 캐시 때문에
-    # 안 뜨는 문제를 줄이기 위해 각 서버에도 즉시 동기화합니다.
+    # v201: /편의, /추가기능, /사용 같은 새 최상위 명령어가 전역 캐시 때문에
+    # 안 보이는 문제를 줄이기 위해 전역 명령어를 각 서버 명령어로 복사 후 즉시 동기화합니다.
     for guild in bot.guilds:
         try:
-            synced_guild = await bot.tree.sync(guild=discord.Object(id=guild.id))
+            guild_object = discord.Object(id=guild.id)
+            bot.tree.copy_global_to(guild=guild_object)
+            synced_guild = await bot.tree.sync(guild=guild_object)
             print(f"✅ {guild.name} 서버 슬래시 즉시 동기화 완료: {len(synced_guild)}개")
         except Exception as e:
             print(f"⚠️ {guild.name} 서버 슬래시 즉시 동기화 실패: {e}")
@@ -12152,6 +12154,13 @@ async def attendance(interaction: discord.Interaction):
             milestone_lines.append("⚠️ VIP 역할 지급 실패: 봇 역할 위치 또는 권한 부족")
         except discord.HTTPException:
             milestone_lines.append("⚠️ VIP 역할 지급 실패: 디스코드 처리 오류")
+
+    # 🎟️ 출석더블권: 오늘 출석 보상 전체를 2배로 지급합니다.
+    # /사용 패널에서 안내하고, 실제 소모는 출석할 때 자동 처리합니다.
+    if get_inventory_amount(user_id, "출석더블권") > 0:
+        consume_inventory_item(user_id, "출석더블권", 1)
+        reward *= 2
+        bonus_lines.append("🎟️ 출석더블권 1개 사용: 오늘 출석 보상 2배")
 
     # 100일마다 특별 칭호 지급
     if attendance_count % 100 == 0:
@@ -26686,6 +26695,462 @@ class MnbExtraFeatureView(discord.ui.View):
 @bot.tree.command(name="추가기능", description="새 기능 여러 개를 한묶음 통합 패널로 엽니다.")
 async def mnb_extra_features_unified_command(interaction: discord.Interaction):
     await safe_interaction_send(interaction, embed=build_mnb_extra_panel_embed(), view=MnbExtraFeatureView(), ephemeral=True)
+
+
+# =========================
+# v201 /사용 박스형 아이템 사용 패널
+# =========================
+# /통합상점에서 구매한 아이템을 /사용 하나에서 선택 메뉴 + 입력 박스로 사용할 수 있게 합니다.
+MNB_USE_PANEL_MARKER = "mnb_use_panel_v201"
+MNB_USE_BOX_ITEMS = {
+    "랜덤박스", "미니랜덤박스", "프리미엄랜덤박스", "오늘의선물",
+    "경험치부스터", "채팅경험치부스터", "음성경험치부스터",
+    "출석보너스권", "출석더블권", "강화보호권", "강화확률업권",
+    "강화안전패키지", "강화재도전권", "프로필꾸미기권", "프로필배경권",
+    "닉네임색변경권", "닉네임꾸미기권", "칭호권", "VIP권", "VVIP권",
+    "상점할인권", "행운부적", "칭찬뱃지권", "이벤트응모권",
+    "상점쿠폰상자", "랜덤칭호상자",
+}
+MNB_USE_ITEM_EMOJI = {
+    "랜덤박스": "🎁", "미니랜덤박스": "📦", "프리미엄랜덤박스": "🌟", "오늘의선물": "🎀",
+    "경험치부스터": "✨", "채팅경험치부스터": "💬", "음성경험치부스터": "🔊",
+    "출석보너스권": "📅", "출석더블권": "🎟️", "강화보호권": "🛡️", "강화확률업권": "🎯",
+    "강화안전패키지": "⚒️", "강화재도전권": "🔁", "프로필꾸미기권": "🖼️", "프로필배경권": "🌌",
+    "닉네임색변경권": "🎨", "닉네임꾸미기권": "💎", "칭호권": "🏷️", "VIP권": "💎", "VVIP권": "👑",
+    "상점할인권": "🎫", "행운부적": "🍀", "칭찬뱃지권": "🌟", "이벤트응모권": "🎟️",
+    "상점쿠폰상자": "🎫", "랜덤칭호상자": "🏷️",
+}
+MNB_USE_ITEM_DESCRIPTIONS = {
+    "랜덤박스": "랜덤 보상을 획득합니다.",
+    "미니랜덤박스": "가벼운 포인트 보상을 획득합니다.",
+    "프리미엄랜덤박스": "높은 포인트 또는 희귀 아이템을 획득합니다.",
+    "오늘의선물": "오늘의 포인트 선물을 받습니다.",
+    "경험치부스터": "24시간 채팅/음성 경험치 2배 효과를 켭니다.",
+    "채팅경험치부스터": "24시간 채팅 경험치 보너스 효과를 켭니다.",
+    "음성경험치부스터": "24시간 음성 경험치 보너스 효과를 켭니다.",
+    "출석보너스권": "다음 출석 때 +300P가 자동 적용됩니다.",
+    "출석더블권": "다음 출석 보상을 2배로 만듭니다.",
+    "강화보호권": "강화 파괴 방지권 보유량을 확인합니다.",
+    "강화확률업권": "강화 성공률 증가권 보유량을 확인합니다.",
+    "강화안전패키지": "강화보호권/확률업권 묶음으로 개봉합니다.",
+    "강화재도전권": "강화 재도전 효과를 7일간 보관합니다.",
+    "프로필꾸미기권": "프로필 제목/소개/색상/이미지를 꾸밉니다.",
+    "프로필배경권": "프로필 배경 이미지를 바꿉니다.",
+    "닉네임색변경권": "원하는 색상 역할을 받습니다.",
+    "닉네임꾸미기권": "닉네임 꾸미기 안내/인증용으로 사용합니다.",
+    "칭호권": "원하는 칭호 역할을 받고 대표 칭호로 장착합니다.",
+    "VIP권": "VIP 역할을 받습니다.",
+    "VVIP권": "VVIP 역할을 받습니다.",
+    "상점할인권": "다음 구매 때 자동 20% 할인됩니다.",
+    "행운부적": "24시간 행운 효과를 켭니다.",
+    "칭찬뱃지권": "칭찬뱃지 역할을 받습니다.",
+    "이벤트응모권": "이벤트 응모권 사용 기록을 남깁니다.",
+    "상점쿠폰상자": "상점할인권 또는 포인트를 획득합니다.",
+    "랜덤칭호상자": "랜덤 칭호권 보상을 획득합니다.",
+}
+
+
+def mnb_use_normalize_item(item_name: str) -> str:
+    item_name = normalize_shop_item(item_name)
+    return item_name.strip()
+
+
+def mnb_get_merged_inventory(user_id: int):
+    merged = {}
+    for raw_name, amount in get_inventory_rows(user_id):
+        name = mnb_use_normalize_item(raw_name)
+        if not name:
+            continue
+        merged[name] = merged.get(name, 0) + int(amount or 0)
+    return merged
+
+
+def build_mnb_use_panel_embed(user: discord.User):
+    merged = mnb_get_merged_inventory(user.id)
+    embed = discord.Embed(
+        title="🎒 아이템 사용 패널",
+        description=(
+            "`/통합상점`에서 구매한 아이템을 아래 선택 메뉴로 사용할 수 있어요.\n"
+            "입력이 필요한 아이템은 자동으로 **박스형 입력창**이 열립니다."
+        ),
+        color=COLOR_MINT,
+    )
+    usable_lines = []
+    other_lines = []
+    for index, (item_name, amount) in enumerate(sorted(merged.items()), 1):
+        emoji = MNB_USE_ITEM_EMOJI.get(item_name, "🎁")
+        line = f"{emoji} **{item_name}** x{amount}"
+        if item_name in MNB_USE_BOX_ITEMS:
+            usable_lines.append(line)
+        else:
+            other_lines.append(line)
+    embed.add_field(
+        name="✅ 사용 가능 아이템",
+        value="\n".join(usable_lines[:20]) if usable_lines else "사용 가능한 아이템이 없어요. `/통합상점`에서 먼저 구매해보세요.",
+        inline=False,
+    )
+    if other_lines:
+        embed.add_field(name="📦 기타 보유 아이템", value="\n".join(other_lines[:10]), inline=False)
+    embed.add_field(
+        name="사용 방법",
+        value="1) 메뉴에서 아이템 선택\n2) 필요한 값 입력\n3) 결과 임베드 확인",
+        inline=False,
+    )
+    embed.set_footer(text=f"만능 봇 | /사용 | {MNB_USE_PANEL_MARKER}")
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    return embed
+
+
+def mnb_use_success_embed(title: str, description: str, *, color: int = COLOR_MINT):
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text=f"만능 봇 | /사용 | {MNB_USE_PANEL_MARKER}")
+    return embed
+
+
+def mnb_add_inventory(user_id: int, item_name: str, amount: int = 1):
+    item_name = mnb_use_normalize_item(item_name)
+    if not item_name or amount <= 0:
+        return
+    try:
+        add_inventory_item_simple(user_id, item_name, amount)
+    except NameError:
+        c.execute("INSERT INTO inventory VALUES (?, ?, ?)", (user_id, item_name, amount))
+        conn.commit()
+
+
+def mnb_parse_count(raw: str, default: int = 1, maximum: int = 5):
+    try:
+        count = int(str(raw or default).strip())
+    except ValueError:
+        count = default
+    return max(1, min(maximum, count))
+
+
+async def mnb_use_random_point_box(interaction: discord.Interaction, item_name: str, count: int, low: int, high: int, *, rare_items=None, rare_chance: float = 0.0):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    user_id = interaction.user.id
+    count = max(1, min(5, int(count or 1)))
+    if get_inventory_amount(user_id, item_name) < count:
+        return await safe_interaction_send(interaction, f"❌ `{item_name}` 보유 수량이 부족합니다.", ephemeral=True)
+    if not consume_inventory_item(user_id, item_name, count):
+        return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+
+    total_point = 0
+    lines = []
+    rare_items = rare_items or []
+    for i in range(1, count + 1):
+        if rare_items and random.random() < rare_chance:
+            reward_item = random.choice(rare_items)
+            mnb_add_inventory(user_id, reward_item, 1)
+            lines.append(f"`{i}회차` 🌈 **{reward_item} 1개** 획득")
+        else:
+            reward = random.randint(low, high)
+            total_point += reward
+            lines.append(f"`{i}회차` 💰 **+{reward:,}P**")
+    if total_point:
+        point = get_user_point(interaction.guild.id, user_id)
+        set_user_point(interaction.guild.id, user_id, point + total_point)
+    embed = mnb_use_success_embed(
+        f"🎁 {item_name} 사용 완료",
+        "\n".join(lines) + (f"\n\n총 획득 포인트: **{total_point:,}P**" if total_point else ""),
+        color=COLOR_GOLD,
+    )
+    return await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+
+
+async def mnb_use_title_ticket_public(interaction: discord.Interaction, title: str):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    user_id = interaction.user.id
+    title = safe_role_text(title, max_len=20)
+    if not title:
+        return await safe_interaction_send(interaction, "❌ 칭호 이름을 입력해주세요.", ephemeral=True)
+    if get_inventory_amount(user_id, "칭호권") < 1:
+        return await safe_interaction_send(interaction, "❌ 인벤토리에 `칭호권`이 없습니다.", ephemeral=True)
+    if not consume_inventory_item(user_id, "칭호권", 1):
+        return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+    role_name = f"🏷️ {title}"
+    try:
+        role = await get_or_create_simple_role(interaction.guild, role_name[:100], color=discord.Color.random(), hoist=False, mentionable=True)
+        await interaction.user.add_roles(role, reason="/사용 칭호권 사용")
+        try:
+            add_user_title(interaction.guild.id, interaction.user.id, title)
+            equip_user_title(interaction.guild.id, interaction.user.id, title)
+        except Exception:
+            pass
+    except discord.Forbidden:
+        mnb_add_inventory(user_id, "칭호권", 1)
+        return await safe_interaction_send(interaction, "❌ 봇 역할 위치 또는 권한이 부족해서 칭호 역할을 줄 수 없습니다.", ephemeral=True)
+    except discord.HTTPException as e:
+        mnb_add_inventory(user_id, "칭호권", 1)
+        return await safe_interaction_send(interaction, f"❌ 칭호 생성 실패: `{str(e)[:500]}`", ephemeral=True)
+    return await safe_interaction_send(interaction, embed=mnb_use_success_embed("✅ 칭호권 사용 완료", f"칭호 {role.mention} 를 지급하고 대표 칭호로 장착했어요."), ephemeral=True)
+
+
+async def mnb_use_vvip_ticket(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    user_id = interaction.user.id
+    if get_inventory_amount(user_id, "VVIP권") < 1:
+        return await safe_interaction_send(interaction, "❌ 인벤토리에 `VVIP권`이 없습니다.", ephemeral=True)
+    if not consume_inventory_item(user_id, "VVIP권", 1):
+        return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+    try:
+        role = await get_or_create_simple_role(interaction.guild, "VVIP", color=discord.Color.purple(), hoist=True, mentionable=True)
+        await interaction.user.add_roles(role, reason="/사용 VVIP권 사용")
+    except discord.Forbidden:
+        mnb_add_inventory(user_id, "VVIP권", 1)
+        return await safe_interaction_send(interaction, "❌ 봇 역할 위치 또는 권한이 부족해서 VVIP 역할을 줄 수 없습니다.", ephemeral=True)
+    return await safe_interaction_send(interaction, embed=mnb_use_success_embed("✅ VVIP권 사용 완료", f"{role.mention} 역할을 지급했어요."), ephemeral=True)
+
+
+async def mnb_use_simple_role_ticket(interaction: discord.Interaction, item_name: str, role_name: str, color: discord.Color, reason: str):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    user_id = interaction.user.id
+    if get_inventory_amount(user_id, item_name) < 1:
+        return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+    if not consume_inventory_item(user_id, item_name, 1):
+        return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+    try:
+        role = await get_or_create_simple_role(interaction.guild, role_name, color=color, hoist=False, mentionable=True)
+        await interaction.user.add_roles(role, reason=reason)
+    except discord.Forbidden:
+        mnb_add_inventory(user_id, item_name, 1)
+        return await safe_interaction_send(interaction, "❌ 봇 역할 위치 또는 권한이 부족해서 역할을 줄 수 없습니다.", ephemeral=True)
+    return await safe_interaction_send(interaction, embed=mnb_use_success_embed("✅ 아이템 사용 완료", f"{role.mention} 역할을 지급했어요."), ephemeral=True)
+
+
+class MnbProfileBackgroundModal(discord.ui.Modal, title="🌌 프로필 배경 사용"):
+    def __init__(self):
+        super().__init__()
+        self.image_input = discord.ui.TextInput(label="이미지 URL", placeholder="https://...", required=True, max_length=400)
+        self.add_item(self.image_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        if get_inventory_amount(user_id, "프로필배경권") < 1:
+            return await safe_interaction_send(interaction, "❌ 인벤토리에 `프로필배경권`이 없습니다.", ephemeral=True)
+        image_url = safe_url(str(self.image_input.value)) if str(self.image_input.value).strip() else ""
+        if not image_url:
+            return await safe_interaction_send(interaction, "❌ 이미지 URL은 `http://` 또는 `https://`로 시작해야 합니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, "프로필배경권", 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        current = get_profile_custom(user_id) or {}
+        save_profile_custom(user_id, current.get("title") or "⭐ 만능 봇 프로필", current.get("description") or "", current.get("color") or "", image_url)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("✅ 프로필배경권 사용 완료", "프로필 배경 이미지를 저장했어요. `/프로필`에서 확인할 수 있어요."), ephemeral=True)
+
+
+class MnbUseItemInputModal(discord.ui.Modal):
+    def __init__(self, item_name: str):
+        self.item_name = item_name
+        title_map = {
+            "직접입력": "🎒 아이템 직접 사용",
+            "닉네임색변경권": "🎨 닉네임색 사용",
+            "칭호권": "🏷️ 칭호권 사용",
+            "랜덤박스": "🎁 랜덤박스 사용",
+            "미니랜덤박스": "📦 미니랜덤박스 사용",
+            "프리미엄랜덤박스": "🌟 프리미엄랜덤박스 사용",
+        }
+        super().__init__(title=title_map.get(item_name, "🎒 아이템 사용"))
+        self.first = None
+        self.second = None
+        if item_name == "직접입력":
+            self.first = discord.ui.TextInput(label="아이템명", placeholder="예: 랜덤박스, 칭호권, 닉네임색변경권", required=True, max_length=40)
+            self.second = discord.ui.TextInput(label="입력값/개수", placeholder="색상, 칭호, 개수 등을 적어주세요", required=False, max_length=80)
+            self.add_item(self.first)
+            self.add_item(self.second)
+        elif item_name == "닉네임색변경권":
+            self.first = discord.ui.TextInput(label="색상", placeholder="예: 핑크, 파랑, #87CEFA", required=True, max_length=20)
+            self.add_item(self.first)
+        elif item_name == "칭호권":
+            self.first = discord.ui.TextInput(label="칭호", placeholder="예: 서버요정, 전설의냥이", required=True, max_length=20)
+            self.add_item(self.first)
+        elif item_name in {"랜덤박스", "미니랜덤박스", "프리미엄랜덤박스"}:
+            self.first = discord.ui.TextInput(label="사용 개수", placeholder="1~5", required=False, default="1", max_length=2)
+            self.add_item(self.first)
+        else:
+            self.first = discord.ui.TextInput(label="입력값", placeholder="필요한 값이 있으면 적어주세요", required=False, max_length=80)
+            self.add_item(self.first)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        item_name = self.item_name
+        value = str(self.first.value).strip() if self.first else ""
+        extra = str(self.second.value).strip() if self.second else ""
+        if item_name == "직접입력":
+            item_name = mnb_use_normalize_item(value)
+            value = extra
+        return await mnb_use_item_dispatch(interaction, item_name, value)
+
+
+async def mnb_use_item_dispatch(interaction: discord.Interaction, item_name: str, value: str = ""):
+    item_name = mnb_use_normalize_item(item_name)
+    user_id = interaction.user.id
+
+    if item_name == "인벤토리보기":
+        return await safe_interaction_send(interaction, embed=build_inventory_embed(interaction.user), ephemeral=True)
+    if not item_name:
+        return await safe_interaction_send(interaction, "❌ 사용할 아이템을 선택해주세요.", ephemeral=True)
+
+    if item_name == "닉네임색변경권":
+        if not value:
+            return await interaction.response.send_modal(MnbUseItemInputModal(item_name))
+        return await use_nickname_color_ticket(interaction, value)
+    if item_name == "칭호권":
+        if not value:
+            return await interaction.response.send_modal(MnbUseItemInputModal(item_name))
+        return await mnb_use_title_ticket_public(interaction, value)
+    if item_name == "프로필꾸미기권":
+        return await use_profile_custom_ticket(interaction)
+    if item_name == "프로필배경권":
+        return await interaction.response.send_modal(MnbProfileBackgroundModal())
+    if item_name == "VIP권":
+        return await use_vip_ticket(interaction)
+    if item_name == "VVIP권":
+        return await mnb_use_vvip_ticket(interaction)
+    if item_name == "랜덤박스":
+        count = mnb_parse_count(value, default=1, maximum=5)
+        return await use_random_box(interaction, count)
+    if item_name == "미니랜덤박스":
+        count = mnb_parse_count(value, default=1, maximum=5)
+        return await mnb_use_random_point_box(interaction, item_name, count, 50, 250, rare_items=["랜덤박스"], rare_chance=0.08)
+    if item_name == "프리미엄랜덤박스":
+        count = mnb_parse_count(value, default=1, maximum=5)
+        return await mnb_use_random_point_box(interaction, item_name, count, 700, 2200, rare_items=["강화보호권", "강화확률업권", "칭호권", "VIP권"], rare_chance=0.22)
+    if item_name == "오늘의선물":
+        return await mnb_use_random_point_box(interaction, item_name, 1, 200, 900, rare_items=["랜덤박스", "상점할인권"], rare_chance=0.15)
+    if item_name == "경험치부스터":
+        return await use_exp_booster(interaction)
+    if item_name in {"채팅경험치부스터", "음성경험치부스터"}:
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        expires_at = (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
+        # 현재 경험치 지급 로직은 경험치부스터 효과를 공통으로 확인하므로 공통 효과도 같이 켭니다.
+        add_user_effect(user_id, "경험치부스터", 1, expires_at=expires_at)
+        add_user_effect(user_id, item_name, 1, expires_at=expires_at)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("✅ 부스터 사용 완료", f"`{item_name}` 효과가 24시간 적용됩니다."), ephemeral=True)
+    if item_name == "출석보너스권":
+        return await use_attendance_bonus_ticket(interaction)
+    if item_name == "출석더블권":
+        amount = get_inventory_amount(user_id, "출석더블권")
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("🎟️ 출석더블권", f"보유: **{amount}개**\n다음 `/출첵` 또는 `!출첵` 때 자동으로 1개 소모되고 출석 보상이 2배가 됩니다."), ephemeral=True)
+    if item_name == "강화보호권":
+        return await use_enhance_protect_ticket(interaction)
+    if item_name == "강화확률업권":
+        return await use_enhance_rate_ticket(interaction)
+    if item_name == "강화안전패키지":
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        mnb_add_inventory(user_id, "강화보호권", 3)
+        mnb_add_inventory(user_id, "강화확률업권", 2)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("⚒️ 강화안전패키지 개봉", "강화보호권 **3개**와 강화확률업권 **2개**를 획득했어요."), ephemeral=True)
+    if item_name == "강화재도전권":
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        expires_at = (datetime.datetime.now() + datetime.timedelta(days=7)).isoformat()
+        add_user_effect(user_id, "강화재도전권", 1, expires_at=expires_at)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("🔁 강화재도전권 사용 완료", "7일 동안 강화 재도전 효과가 보관됩니다. 운영 이벤트/강화 보정에 활용할 수 있어요."), ephemeral=True)
+    if item_name == "상점할인권":
+        return await use_shop_discount_ticket(interaction)
+    if item_name == "행운부적":
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        expires_at = (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
+        add_user_effect(user_id, "행운부적", 1, expires_at=expires_at)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("🍀 행운부적 사용 완료", "24시간 행운 효과가 적용됐어요."), ephemeral=True)
+    if item_name == "칭찬뱃지권":
+        return await mnb_use_simple_role_ticket(interaction, item_name, "🌟 칭찬뱃지", discord.Color.gold(), "/사용 칭찬뱃지권 사용")
+    if item_name == "닉네임꾸미기권":
+        return await mnb_use_simple_role_ticket(interaction, item_name, "💎 닉네임꾸미기 사용", discord.Color.teal(), "/사용 닉네임꾸미기권 사용")
+    if item_name == "이벤트응모권":
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("🎟️ 이벤트응모권 사용 완료", f"{interaction.user.mention} 님의 이벤트 응모권 사용이 기록됐어요. 운영진이 이벤트 보상 확인용으로 사용할 수 있습니다."), ephemeral=False)
+    if item_name == "상점쿠폰상자":
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        if random.random() < 0.65:
+            mnb_add_inventory(user_id, "상점할인권", 1)
+            text = "상점할인권 **1개**를 획득했어요."
+        else:
+            reward = random.randint(300, 900)
+            point = get_user_point(interaction.guild.id, user_id) if interaction.guild else 0
+            if interaction.guild:
+                set_user_point(interaction.guild.id, user_id, point + reward)
+            text = f"포인트 **+{reward:,}P**를 획득했어요."
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("🎫 상점쿠폰상자 개봉", text), ephemeral=True)
+    if item_name == "랜덤칭호상자":
+        if get_inventory_amount(user_id, item_name) < 1:
+            return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없습니다.", ephemeral=True)
+        if not consume_inventory_item(user_id, item_name, 1):
+            return await safe_interaction_send(interaction, "❌ 아이템 사용 중 오류가 발생했습니다.", ephemeral=True)
+        random_title = random.choice(["행운의냥이", "서버요정", "수다왕", "게임천재", "오늘의주인공", "반짝별"])
+        mnb_add_inventory(user_id, "칭호권", 1)
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("🏷️ 랜덤칭호상자 개봉", f"칭호권 **1개**를 획득했어요. 추천 칭호: **{random_title}**\n`/사용`에서 칭호권을 선택해 원하는 칭호로 사용할 수 있어요."), ephemeral=True)
+
+    amount = get_inventory_amount(user_id, item_name)
+    if amount > 0:
+        return await safe_interaction_send(interaction, embed=mnb_use_success_embed("📦 아이템 안내", f"`{item_name}`은 현재 직접 효과가 없는 이벤트/운영용 아이템이에요.\n보유 수량: **{amount}개**"), ephemeral=True)
+    return await safe_interaction_send(interaction, f"❌ 인벤토리에 `{item_name}`이 없거나 사용할 수 없는 아이템입니다.", ephemeral=True)
+
+
+class MnbUseItemSelect(discord.ui.Select):
+    def __init__(self, user_id: int):
+        merged = mnb_get_merged_inventory(user_id)
+        options = []
+        usable_items = [(name, amount) for name, amount in merged.items() if name in MNB_USE_BOX_ITEMS and amount > 0]
+        for name, amount in sorted(usable_items)[:23]:
+            emoji = MNB_USE_ITEM_EMOJI.get(name, "🎁")
+            desc = MNB_USE_ITEM_DESCRIPTIONS.get(name, "아이템을 사용합니다.")
+            options.append(discord.SelectOption(label=f"{name} x{amount}"[:100], value=name, description=desc[:100], emoji=emoji))
+        options.append(discord.SelectOption(label="아이템 직접 입력", value="직접입력", description="목록에 없으면 이름을 직접 적어서 사용", emoji="⌨️"))
+        options.append(discord.SelectOption(label="인벤토리 보기", value="인벤토리보기", description="내 전체 인벤토리를 확인", emoji="🎒"))
+        super().__init__(placeholder="사용할 아이템을 선택해주세요", min_values=1, max_values=1, options=options, custom_id="mnb_use_item_select_v201")
+
+    async def callback(self, interaction: discord.Interaction):
+        item_name = self.values[0]
+        if item_name == "인벤토리보기":
+            return await mnb_use_item_dispatch(interaction, item_name)
+        if item_name in {"닉네임색변경권", "칭호권", "랜덤박스", "미니랜덤박스", "프리미엄랜덤박스", "직접입력"}:
+            return await interaction.response.send_modal(MnbUseItemInputModal(item_name))
+        return await mnb_use_item_dispatch(interaction, item_name)
+
+
+class MnbUseItemPanelView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=600)
+        self.add_item(MnbUseItemSelect(user_id))
+
+    @discord.ui.button(label="인벤토리", emoji="🎒", style=discord.ButtonStyle.secondary, custom_id="mnb_use_inventory_v201")
+    async def inventory(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_interaction_send(interaction, embed=build_inventory_embed(interaction.user), ephemeral=True)
+
+    @discord.ui.button(label="상점 열기", emoji="🛒", style=discord.ButtonStyle.green, custom_id="mnb_use_shop_v201")
+    async def shop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await mnb_shop_open_channel_panel_response(interaction)
+
+    @discord.ui.button(label="새로고침", emoji="🔄", style=discord.ButtonStyle.gray, custom_id="mnb_use_refresh_v201")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_interaction_edit(interaction, embed=build_mnb_use_panel_embed(interaction.user), view=MnbUseItemPanelView(interaction.user.id))
+
+
+@bot.tree.command(name="사용", description="/통합상점에서 구매한 아이템을 박스형 패널로 사용합니다.")
+async def mnb_use_item_panel_command(interaction: discord.Interaction):
+    await safe_interaction_send(interaction, embed=build_mnb_use_panel_embed(interaction.user), view=MnbUseItemPanelView(interaction.user.id), ephemeral=True)
 
 
 for _group in [
