@@ -13,6 +13,7 @@ import time
 import html
 import json
 import urllib.request
+import urllib.error
 import hashlib
 import socket
 from collections import deque
@@ -21,6 +22,7 @@ from collections import deque
 MNB_V200_RELEASE = "v200 shop-single-panel slash-sync-fix"
 MNB_V202_RELEASE = "v202 real slash/prefix fallback use-panel fix"
 MNB_V203_RELEASE = "v203 guild-only-sync dedupe single-instance fix"
+MNB_V214_RELEASE = "v214 clean-console-log dashboard-404-off full-dedupe"
 MNB_V213_RELEASE = "v213 full duplicate command event log fix"
 MNB_V211_RELEASE = "v211 remove economy subcommands top-level economy commands only"
 MNB_V212_RELEASE = "v212 single-bootstrap single-sync prefix-slash-dedupe"
@@ -863,7 +865,7 @@ migrate_guild_enhance_tables()
 # 기본값은 네 Render 대시보드 주소입니다. 다른 주소를 쓰면 DASHBOARD_SYNC_URL 환경변수로 바꿀 수 있습니다.
 DASHBOARD_SYNC_URL = os.getenv("DASHBOARD_SYNC_URL", "https://manneung-bot-dashboard.onrender.com").strip().rstrip("/")
 DASHBOARD_SYNC_TOKEN = os.getenv("DASHBOARD_SYNC_TOKEN", "").strip()
-DASHBOARD_SYNC_ENABLED = os.getenv("DASHBOARD_SYNC_ENABLED", "1").strip() != "0"
+DASHBOARD_SYNC_ENABLED = os.getenv("DASHBOARD_SYNC_FORCE_ON", "0").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_SYNC_CACHE_SECONDS = 30
 try:
     DASHBOARD_SYNC_TIMEOUT = max(1.0, float(os.getenv("DASHBOARD_SYNC_TIMEOUT", "3")))
@@ -871,6 +873,7 @@ except ValueError:
     DASHBOARD_SYNC_TIMEOUT = 3.0
 DASHBOARD_SYNC_CACHE = {}
 DASHBOARD_SYNC_LAST_ERROR = {}
+DASHBOARD_SYNC_404_DISABLED = False
 
 DASHBOARD_GUILD_SETTING_COLUMNS = ['welcome_channel_id', 'goodbye_channel_id', 'boost_channel_id', 'rule_channel_id', 'intro_channel_id', 'verify_channel_id', 'role_select_channel_id', 'game_role_channel_id', 'notice_channel_id', 'log_channel_id', 'general_log_channel_id', 'warning_log_channel_id', 'punishment_log_channel_id', 'chat_log_channel_id', 'voice_log_channel_id', 'nickname_log_channel_id', 'level_log_channel_id', 'security_log_channel_id', 'clean_log_channel_id', 'shop_channel_id', 'point_channel_id', 'stock_channel_id', 'attendance_channel_id', 'attendance_reward_channel_id', 'level_channel_id', 'enhance_channel_id', 'coupon_channel_id', 'mission_channel_id', 'title_channel_id', 'achievement_channel_id', 'ticket_channel_id', 'ticket_log_channel_id', 'report_channel_id', 'admin_panel_channel_id', 'bot_command_channel_id', 'event_channel_id', 'event_list_channel_id', 'vote_channel_id', 'giveaway_channel_id', 'music_command_channel_id', 'music_now_playing_channel_id', 'music_queue_channel_id', 'tts_text_channel_id', 'music_voice_channel_id', 'tts_voice_channel_id', 'recruit_benefit_channel_id', 'recruit_planning_channel_id', 'recruit_newbie_channel_id', 'recruit_guide_channel_id', 'recruit_promotion_channel_id', 'recruit_security_channel_id', 'recruit_scrim_channel_id', 'recruit_admin_channel_id', 'recruit_design_channel_id', 'recruit_fixed_channel_id', 'interview_waiting_voice_id', 'interview_room_1_voice_id', 'interview_room_2_voice_id', 'dev_update_channel_id', 'dev_patch_channel_id', 'dev_status_channel_id', 'dev_diary_channel_id', 'support_welcome_channel_id', 'support_notice_channel_id', 'rule_category_id', 'welcome_category_id', 'log_category_id', 'shop_category_id', 'bot_command_category_id', 'music_category_id', 'tts_category_id', 'recruit_category_id', 'event_category_id', 'devlog_category_id', 'server_stats_category_id', 'temp_voice_category_id', 'enhance_category_id']
 DASHBOARD_SYNC_SIMPLE_TABLES = {
@@ -1034,7 +1037,8 @@ def dashboard_replace_list_table(table_name: str, rows: list, key_columns=("guil
 
 
 def fetch_dashboard_sync_data(guild_id: int, *, force: bool = False):
-    if not DASHBOARD_SYNC_ENABLED or not DASHBOARD_SYNC_URL:
+    global DASHBOARD_SYNC_404_DISABLED
+    if not DASHBOARD_SYNC_ENABLED or not DASHBOARD_SYNC_URL or DASHBOARD_SYNC_404_DISABLED:
         return None
     now_ts = datetime.datetime.now().timestamp()
     cached = DASHBOARD_SYNC_CACHE.get(guild_id)
@@ -1055,6 +1059,15 @@ def fetch_dashboard_sync_data(guild_id: int, *, force: bool = False):
             return None
         DASHBOARD_SYNC_CACHE[guild_id] = {"time": now_ts, "data": data}
         return data
+    except urllib.error.HTTPError as e:
+        # /api/bot-sync 라우트가 없는 대시보드/봇 통합 서버에서는 404가 계속 찍히므로
+        # 한 번 감지하면 이번 실행 동안 대시보드 동기화를 자동 중지합니다.
+        if getattr(e, "code", None) == 404:
+            DASHBOARD_SYNC_404_DISABLED = True
+            DASHBOARD_SYNC_LAST_ERROR[guild_id] = "대시보드 /api/bot-sync 라우트 없음(404) - 자동 동기화 중지"
+            return None
+        DASHBOARD_SYNC_LAST_ERROR[guild_id] = str(e)
+        return None
     except Exception as e:
         DASHBOARD_SYNC_LAST_ERROR[guild_id] = str(e)
         return None
@@ -9369,7 +9382,8 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
         if missing_required:
             print(f"⚠️ v212 필수 명령어 로컬 누락: {missing_required}")
         else:
-            print("✅ v212 필수 명령어 로컬 등록 확인: " + mnb_v212_required_names_text())
+            # v214: 내부 로컬 확인 성공 로그 숨김
+            pass
 
         guild_results = []
         target_guilds = [g for g in list(bot.guilds) if target_guild_id is None or g.id == int(target_guild_id)]
@@ -9388,7 +9402,8 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
                 synced_names = {cmd.name for cmd in synced_guild}
                 check_text = ", ".join(f"/{name}" for name in sorted(MNB_REQUIRED_COMMAND_NAMES & synced_names))
                 guild_results.append((guild.name, len(synced_guild), check_text))
-                print(f"✅ {guild.name} v212 서버 슬래시 동기화 완료: {len(synced_guild)}개 | {check_text}")
+                # v214: 서버별 성공 로그 숨김
+                pass
             except Exception as e:
                 print(f"❌ {guild.name} v212 서버 슬래시 동기화 실패: {e}")
 
@@ -9397,7 +9412,8 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
             try:
                 bot.tree.clear_commands(guild=None)
                 cleared = await bot.tree.sync(guild=None)
-                print(f"✅ v212 원격 전역 슬래시 정리 완료: {len(cleared)}개 유지")
+                # v214: 전역 정리 성공 로그 숨김
+                pass
             except Exception as e:
                 print(f"⚠️ v212 원격 전역 슬래시 정리 실패: {e}")
 
@@ -9435,7 +9451,7 @@ def acquire_mnb_mainbot_single_instance_lock() -> bool:
         sock.bind(("127.0.0.1", port))
         sock.listen(1)
         MNB_MAINBOT_INSTANCE_SOCKET = sock
-        print(f"✅ v203 메인 봇 단일 실행 락 확보: 127.0.0.1:{port}")
+        # v214: 정상 단일 실행 락 확보 로그는 숨깁니다.
         return True
     except OSError:
         print("❌ v203 중복 실행 감지: 같은 컴퓨터/컨테이너에서 메인 봇이 이미 실행 중입니다.")
@@ -9506,7 +9522,8 @@ async def on_ready():
             try:
                 fixed_count = await repair_recent_auto_button_messages_for_guild(guild)
                 if fixed_count:
-                    print(f"✅ {guild.name} 대시보드 임베드 버튼 자동 복구: {fixed_count}개")
+                    # v214: 대시보드 버튼 자동 복구 성공 로그 숨김
+                    pass
             except Exception as e:
                 print(f"⚠️ {guild.name} 버튼 자동 복구 실패: {e}")
 
@@ -9515,7 +9532,8 @@ async def on_ready():
 
         await mnb_sync_commands_guild_only("startup_once")
 
-        print(f"✅ 로그인 완료: {bot.user}")
+        # v214: 이전 on_ready 로그인 성공 로그 숨김
+        pass
 
         for guild in list(bot.guilds):
             try:
@@ -9523,7 +9541,8 @@ async def on_ready():
                 if shop_result.get("panel_changed"):
                     channel = shop_result.get("channel")
                     channel_name = getattr(channel, "name", "미확인")
-                    print(f"✅ {guild.name} 통합상점 자동 생성/갱신 완료: #{channel_name}")
+                    # v214: 통합상점 자동 생성/갱신 성공 로그는 숨깁니다.
+                    pass
             except Exception as e:
                 print(f"⚠️ {guild.name} 통합상점 자동 생성 실패: {e}")
 
@@ -9533,7 +9552,8 @@ async def on_ready():
                 created_count = len(devlog_result.get("created", [])) if isinstance(devlog_result, dict) else 0
                 updated_count = len(devlog_result.get("updated", [])) if isinstance(devlog_result, dict) else 0
                 if created_count or updated_count:
-                    print(f"✅ {guild.name} 개발로그 자동 생성/복구 완료: 생성 {created_count}개, 정리 {updated_count}개")
+                    # v214: 개발로그 자동 생성/복구 성공 로그는 숨깁니다.
+                    pass
             except Exception as e:
                 print(f"⚠️ {guild.name} 개발로그 자동 생성/복구 실패: {e}")
 
@@ -25512,7 +25532,8 @@ async def maneung_runtime_cleanup_loop():
 
 try:
     _v193_indexes, _v193_skipped = ensure_maneung_performance_indexes()
-    print(f"⚡ v193 DB 인덱스 점검 완료: {_v193_indexes}개")
+    # v214: 정상 DB 인덱스 점검 로그는 콘솔을 깔끔하게 유지하기 위해 숨깁니다.
+    pass
 except Exception as e:
     print(f"⚠️ v193 DB 인덱스 점검 실패: {e}")
 
@@ -27602,7 +27623,7 @@ def mnb_v210_register_required_commands(*, force: bool = False):
             print(f"❌ v210 필수 명령어 등록 실패 /{name}: {e}")
 
     MNB_V210_REQUIRED_COMMANDS_REGISTERED = True
-    print("✅ v212 필수 명령어 고정 등록 완료: " + ", ".join(registered))
+    # v214: 최종 콘솔 요약에서만 표시하므로 내부 등록 성공 로그는 숨깁니다.
     return True
 
 
@@ -27610,7 +27631,7 @@ def mnb_v210_register_required_commands(*, force: bool = False):
 # mnb_v210_register_required_commands(force=True)
 
 
-@bot.command(name="v213점검", aliases=["v212점검", "v210점검", "오류점검", "중복점검", "명령어점검"])
+@bot.command(name="v214점검", aliases=["v213점검", "v212점검", "v210점검", "오류점검", "중복점검", "명령어점검"])
 async def prefix_mnb_v210_healthcheck(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
@@ -27799,7 +27820,8 @@ def mnb_v210_register_required_commands(*, force: bool = False):
     MNB_V210_REQUIRED_COMMANDS_REGISTERED = True
     if not MNB_V213_REGISTER_LOGGED:
         MNB_V213_REGISTER_LOGGED = True
-        print("✅ v213 필수 명령어 단일 등록 완료: " + ", ".join(registered))
+        # v214: 필수 명령어 내부 등록 로그는 최종 요약 로그로 대체합니다.
+        pass
     return True
 
 
@@ -27851,7 +27873,8 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
         if missing_required:
             print(f"⚠️ v213 필수 명령어 로컬 누락: {missing_required}")
         else:
-            print("✅ v213 필수 명령어 로컬 확인: " + mnb_v213_required_names_text())
+            # v214: 로컬 확인 로그는 최종 요약 로그로 대체합니다.
+            pass
 
         results = []
         for guild in target_guilds:
@@ -27876,7 +27899,7 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
                 check_text = ", ".join(f"/{name}" for name in sorted(set(MNB_REQUIRED_COMMAND_NAMES) & synced_names))
                 results.append((guild.name, len(synced), check_text))
                 MNB_V213_SYNCED_GUILDS.add(guild.id)
-                print(f"✅ {guild.name} v213 서버 슬래시 정리 완료: {len(synced)}개 | {check_text}")
+                # v214: 서버별 동기화 성공 로그는 한 줄 요약으로만 출력합니다.
             except Exception as e:
                 print(f"❌ {guild.name} v213 서버 슬래시 정리 실패: {e}")
 
@@ -27886,7 +27909,7 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
                 bot.tree.clear_commands(guild=None)
                 cleared = await bot.tree.sync(guild=None)
                 MNB_V213_GLOBAL_COMMANDS_CLEARED = True
-                print(f"✅ v213 원격 전역 슬래시 정리 완료: {len(cleared)}개 유지")
+                # v214: 전역 슬래시 정리 성공 로그는 숨깁니다.
             except Exception as e:
                 print(f"⚠️ v213 원격 전역 슬래시 정리 실패: {e}")
             finally:
@@ -27984,7 +28007,15 @@ async def on_ready():
         mnb_v213_register_persistent_views_once()
         mnb_v213_start_background_loops_once()
 
-        await mnb_sync_commands_guild_only("startup_v213")
+        sync_results = await mnb_sync_commands_guild_only("startup_v214")
+        try:
+            slash_count = max((count for _, count, _ in sync_results), default=0)
+            if slash_count <= 0:
+                # 이미 동기화가 끝난 재호출이면 현재 로컬 명령어 개수로 표시합니다.
+                slash_count = len([cmd for cmd in bot.tree.get_commands(guild=None) if getattr(cmd, "name", "") not in MNB_REMOVED_TOP_LEVEL_COMMAND_NAMES])
+            print(f"✅ 슬래시 명령어 동기화: {slash_count}개")
+        except Exception:
+            print("✅ 슬래시 명령어 동기화: 완료")
         print(f"✅ 로그인 완료: {bot.user}")
 
         for guild in list(bot.guilds):
@@ -27995,7 +28026,8 @@ async def on_ready():
                 shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=True)
                 if shop_result.get("panel_changed"):
                     channel = shop_result.get("channel")
-                    print(f"✅ {guild.name} 통합상점 자동 생성/갱신 완료: #{getattr(channel, 'name', '미확인')}")
+                    # v214: 통합상점 자동 생성/갱신 성공 로그는 숨깁니다.
+                    pass
             except Exception as e:
                 print(f"⚠️ {guild.name} 통합상점 자동 생성 실패: {e}")
 
@@ -28008,7 +28040,8 @@ async def on_ready():
                 created_count = len(devlog_result.get("created", [])) if isinstance(devlog_result, dict) else 0
                 updated_count = len(devlog_result.get("updated", [])) if isinstance(devlog_result, dict) else 0
                 if created_count or updated_count:
-                    print(f"✅ {guild.name} 개발로그 자동 생성/복구 완료: 생성 {created_count}개, 정리 {updated_count}개")
+                    # v214: 개발로그 자동 생성/복구 성공 로그는 숨깁니다.
+                    pass
             except Exception as e:
                 print(f"⚠️ {guild.name} 개발로그 자동 생성/복구 실패: {e}")
 
