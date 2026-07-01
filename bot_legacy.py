@@ -27,6 +27,10 @@ MNB_V213_RELEASE = "v213 full duplicate command event log fix"
 MNB_V211_RELEASE = "v211 remove economy subcommands top-level economy commands only"
 MNB_V212_RELEASE = "v212 single-bootstrap single-sync prefix-slash-dedupe"
 MNB_V210_RELEASE = "v210 stability-dedupe-required-commands-fix"
+MNB_V215_RELEASE = "v215 manual-only-alert-panel quiet-logs"
+MNB_V221_RELEASE = "v221 slash-option-name-fix"
+MNB_V218_RELEASE = "v218 log-history-dedupe single-send-fix"
+MNB_V220_RELEASE = "v220 comfort-upgrade tts-cooldown status-guide"
 
 import yt_dlp
 
@@ -61,16 +65,35 @@ def load_local_env_file(filename: str = ".env"):
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
         if not os.path.exists(env_path):
             return
-        with open(env_path, "r", encoding="utf-8") as fp:
+        # utf-8-sig: .env 첫 줄에 BOM이 붙어도 TTS_BOT_TOKEN 같은 키를 정상 인식합니다.
+        with open(env_path, "r", encoding="utf-8-sig") as fp:
             for raw_line in fp:
                 line = raw_line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
+                if line.lower().startswith("export "):
+                    line = line[7:].strip()
                 key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key and (key not in os.environ or not os.environ.get(key, "")):
-                    os.environ[key] = value
+                key = key.strip().replace("\ufeff", "").replace("\u200b", "")
+                value = value.strip()
+
+                # 따옴표로 감싼 값은 따옴표만 제거합니다.
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1].strip()
+                else:
+                    # 토큰 뒤에 실수로 적은 주석: TTS_BOT_TOKEN=xxx # comment
+                    if " #" in value:
+                        value = value.split(" #", 1)[0].strip()
+                    if "	#" in value:
+                        value = value.split("	#", 1)[0].strip()
+                    value = value.strip().strip('"').strip("'")
+
+                if not key:
+                    continue
+                # 원래 키 + 대문자 키 둘 다 넣어서 Windows/Render 키 대소문자 차이를 흡수합니다.
+                for env_key in dict.fromkeys([key, key.upper()]):
+                    if env_key and (env_key not in os.environ or not os.environ.get(env_key, "")):
+                        os.environ[env_key] = value
     except Exception as e:
         print(f"⚠️ .env 로드 실패: {e}")
 
@@ -82,13 +105,171 @@ load_local_env_file()
 # 토큰 설정
 # 방법 1) Render/환경변수: DISCORD_TOKEN 에 토큰 넣기
 # 방법 2) 기존 Render 키를 쓰고 있다면 DISCORD_BOT_TOKEN 도 자동으로 읽습니다.
-# 방법 3) 로컬 실행: 아래 DIRECT_BOT_TOKEN 따옴표 안에 새 토큰 붙여넣기
+# 방법 3) 일부 호스팅/대시보드에서 BOT_TOKEN 이름을 썼다면 이것도 자동으로 읽습니다.
+# 방법 4) 로컬 실행: 아래 DIRECT_BOT_TOKEN 따옴표 안에 새 토큰 붙여넣기
 # 주의: 토큰은 절대 다른 사람에게 보내지 마세요.
 DIRECT_BOT_TOKEN = ""
-TOKEN = (
-    os.getenv("DISCORD_TOKEN", "").strip()
-    or os.getenv("DISCORD_BOT_TOKEN", "").strip()
-    or DIRECT_BOT_TOKEN.strip()
+
+# =========================
+# Render/환경변수 토큰 안전 로더 v3
+# =========================
+# - Render Environment의 DISCORD_TOKEN / DISCORD_BOT_TOKEN / BOT_TOKEN을 읽습니다.
+# - 길이 5짜리 "token" 같은 가짜 값은 절대 로그인에 사용하지 않습니다.
+# - 서브봇도 CUSTOM_BOT_TOKEN_1~3 / TTS_BOT_TOKEN을 같은 방식으로 검사합니다.
+# - 토큰 원문은 콘솔에 출력하지 않습니다.
+BAD_TOKEN_VALUES = {
+    "", "none", "null", "false", "0", "1", "true",
+    "token", "bot_token", "your_token", "your_bot_token",
+    "discord_token", "discord_bot_token", "bot token", "xxxxx", "xxxxx",
+    "넣어주세요", "토큰", "봇토큰", "여기에_토큰", "토큰넣기",
+}
+
+MIN_DISCORD_BOT_TOKEN_LENGTH = 50
+
+
+def is_running_on_render() -> bool:
+    return any(os.getenv(name) for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_HOSTNAME"))
+
+
+def get_env_value_any_case(env_name: str):
+    """Render는 대소문자를 구분하므로, 혹시 tts_bot_token처럼 넣어도 찾아냅니다."""
+    if env_name in os.environ:
+        return os.environ.get(env_name, ""), env_name
+    upper_name = env_name.upper()
+    for key, value in os.environ.items():
+        if key.upper() == upper_name:
+            return value, key
+    return "", env_name
+
+
+def parse_env_token_line(raw_line: str):
+    """Windows/Render에서 자주 생기는 .env 표기 차이를 최대한 흡수해서 key/value를 뽑습니다."""
+    line = (raw_line or "").strip()
+    if not line or line.startswith("#"):
+        return None, None
+    if line.lower().startswith("export "):
+        line = line[7:].strip()
+    if line.lower().startswith("set "):
+        line = line[4:].strip()
+
+    if "=" in line:
+        key, value = line.split("=", 1)
+    elif ":" in line:
+        # 혹시 TTS_BOT_TOKEN: xxxxx 처럼 적었어도 잡아줍니다.
+        key, value = line.split(":", 1)
+    else:
+        return None, None
+
+    key = key.strip().strip('"').strip("'").replace("\ufeff", "").replace("\u200b", "")
+    value = value.strip()
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1].strip()
+    else:
+        for marker in (" #", "\t#"):
+            if marker in value:
+                value = value.split(marker, 1)[0].strip()
+        value = value.strip().strip('"').strip("'")
+    return key, value
+
+
+def read_discord_token_directly_from_env_file(label: str, env_names):
+    """os.environ에 안 올라온 경우를 대비해 bot_legacy.py 옆 .env를 직접 다시 스캔합니다."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        if label == "TTS봇":
+            print(f"⚠️ TTS봇 .env 직접스캔 실패: 파일 없음 → {env_path}")
+        return ""
+
+    wanted = {name.upper(): name for name in env_names}
+    saw_matching_key = False
+    try:
+        with open(env_path, "r", encoding="utf-8-sig") as fp:
+            for line_no, raw_line in enumerate(fp, start=1):
+                key, value = parse_env_token_line(raw_line)
+                if not key:
+                    continue
+                key_upper = key.upper()
+                if key_upper not in wanted:
+                    continue
+
+                saw_matching_key = True
+                cleaned = normalize_discord_token(value)
+                if cleaned:
+                    place = "Render/환경변수" if is_running_on_render() else "로컬 .env 직접스캔"
+                    print(f"🔐 {label} 토큰 감지: {key} / 길이 {len(cleaned)} / 위치 {place} / .env {line_no}줄")
+                    return cleaned
+                print(f"⚠️ {label} 토큰 무시: .env {line_no}줄 {key} 값 형식 이상 또는 빈 값입니다. 값 길이 {len(str(value).strip())}")
+    except Exception as e:
+        if label == "TTS봇":
+            print(f"⚠️ TTS봇 .env 직접스캔 실패: {e}")
+        return ""
+
+    if label == "TTS봇" and not saw_matching_key:
+        print(f"⚠️ TTS봇 .env 직접스캔 결과: TTS 키가 없습니다. 검사 경로: {env_path}")
+    return ""
+
+
+def normalize_discord_token(raw_value):
+    """환경변수/로컬 .env에 들어간 봇 토큰을 안전하게 정리합니다.
+
+    - 앞뒤 공백/따옴표 제거
+    - 실수로 붙인 'Bot ' 접두사 제거
+    - placeholder 값/너무 짧은 값은 빈 값으로 처리
+    - 토큰 원문은 절대 출력하지 않음
+    """
+    if raw_value is None:
+        return ""
+    token = str(raw_value).strip().strip('"').strip("'").strip()
+    token = token.replace("\ufeff", "").replace("\u200b", "").strip()
+    if token.lower().startswith("bot "):
+        token = token[4:].strip()
+    if token.lower() in BAD_TOKEN_VALUES:
+        return ""
+    if any(ch.isspace() for ch in token):
+        return ""
+    # Discord 봇 토큰은 보통 50자 이상입니다. 길이 5 같은 값은 환경변수 이름만 있고 값이 잘못된 상태입니다.
+    if len(token) < MIN_DISCORD_BOT_TOKEN_LENGTH:
+        return ""
+    return token
+
+
+def read_discord_token(label, *env_names, direct_value=""):
+    """여러 환경변수 이름 중 실제로 사용 가능한 토큰 1개를 선택합니다."""
+    checked_names = []
+    for env_name in env_names:
+        raw, actual_name = get_env_value_any_case(env_name)
+        checked_names.append(env_name)
+        cleaned = normalize_discord_token(raw)
+        if cleaned:
+            place = "Render/환경변수" if is_running_on_render() else "로컬 환경변수/.env"
+            shown_name = actual_name if actual_name == env_name else f"{actual_name}→{env_name}"
+            print(f"🔐 {label} 토큰 감지: {shown_name} / 길이 {len(cleaned)} / 위치 {place}")
+            return cleaned
+        if raw and str(raw).strip():
+            print(f"⚠️ {label} 토큰 무시: {actual_name} 값 형식이 이상합니다. 길이 {len(str(raw).strip())}")
+
+    # 중요: os.environ에 안 올라온 경우, bot_legacy.py 옆 .env를 직접 다시 읽습니다.
+    # TTS 줄이 파일에는 있는데 기존 로더가 놓치는 문제를 여기서 해결합니다.
+    file_token = read_discord_token_directly_from_env_file(label, env_names)
+    if file_token:
+        return file_token
+
+    cleaned = normalize_discord_token(direct_value)
+    if cleaned:
+        print(f"🔐 {label} 토큰 감지: DIRECT_BOT_TOKEN / 길이 {len(cleaned)}")
+        return cleaned
+    if label == "TTS봇":
+        print("⚠️ TTS봇 토큰 미감지: " + ", ".join(checked_names) + " 중 하나가 .env/Render에 있어야 TTS봇을 시작합니다.")
+    return ""
+
+
+TOKEN = read_discord_token(
+    "메인봇",
+    "DISCORD_TOKEN",      # 권장: Render Environment에 이 이름으로 넣기
+    "DISCORD_BOT_TOKEN",  # 예전 이름 호환
+    "MAIN_BOT_TOKEN",     # 메인봇 별도 이름 호환
+    "BOT_TOKEN",          # 값이 진짜 토큰처럼 보일 때만 사용, 길이 5 값은 자동 무시
+    direct_value=DIRECT_BOT_TOKEN,
 )
 
 # 봇 소유자 Discord ID를 환경변수로 등록하세요. 예: set BOT_OWNER_IDS=305132904651030528
@@ -104,6 +285,242 @@ intents.members = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned_or(".", "!"), intents=intents)
+
+
+# =========================
+# 조용한 명령어 모드 v216
+# =========================
+# 사용자가 ! 또는 / 명령어를 사용할 때 채널 푸시/멘션 알림이 최대한 울리지 않게 합니다.
+# - / 슬래시 명령어 응답: Discord가 지원하면 silent=True로 전송
+# - !/. 접두사 명령어 응답: ctx.send/ctx.reply 기본 silent=True
+# - !/. 접두사 명령어 입력 메시지: 삭제하지 않음
+#   삭제하면 채팅삭제 로그 채널에 기록이 남아서 오히려 알림이 늘어납니다.
+# 완전한 제한: 사용자가 직접 보낸 !메시지 자체의 푸시는 Discord 클라이언트 영역이라 봇이 0초 전에 막을 수 없습니다.
+#          그래서 이 버전은 삭제 없이 봇 응답만 silent 처리합니다.
+MNB_COMMAND_QUIET_MODE = os.getenv("MNB_COMMAND_QUIET_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
+MNB_DELETE_PREFIX_COMMAND_MESSAGE = os.getenv("MNB_DELETE_PREFIX_COMMAND_MESSAGE", "0").strip().lower() in {"1", "true", "yes", "on"}
+MNB_COMMAND_QUIET_PATCHED = False
+
+# =========================
+# 로그 전체 알림 끄기 v217
+# =========================
+# Discord 채널 목록에 보이는 알림 꺼짐 아이콘 자체는 유저별 앱 설정이라 봇이 직접 바꿀 수 없습니다.
+# 대신 봇이 보내는 모든 로그 메시지를 silent=True로 보내서 푸시/알림을 최대한 막고,
+# 로그에 포함된 유저/역할 멘션도 실제 알림이 가지 않도록 allowed_mentions를 차단합니다.
+MNB_LOG_SILENT_MODE = os.getenv("MNB_LOG_SILENT_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
+MNB_LOG_DISABLE_MENTIONS = os.getenv("MNB_LOG_DISABLE_MENTIONS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# =========================
+# 레벨업 채널 v230
+# =========================
+# 레벨업은 관리자 전용 로그방이 아니라 사람들이 볼 수 있는 공개 채널에 보냅니다.
+# - 채팅 레벨업: 레벨업이 발생한 현재 채널 우선
+# - 음성 레벨업: 공개 레벨 채널/시스템 채널/첫 공개 채널 순서로 전송
+# - embed 안의 mention은 보이기만 하고 실제 멘션 알림은 거의 발생하지 않습니다.
+MNB_PUBLIC_LEVELUP_ANNOUNCE = os.getenv("MNB_PUBLIC_LEVELUP_ANNOUNCE", "1").strip().lower() not in {"0", "false", "no", "off"}
+MNB_LEVELUP_SILENT = os.getenv("MNB_LEVELUP_SILENT", "0").strip().lower() in {"1", "true", "yes", "on"}
+# 같은 로그가 2개 프로세스/재시작 직후에 동시에 올라오는 경우까지 막기 위해
+# 실제 로그 채널의 최근 메시지를 한번 확인한 뒤 전송합니다.
+MNB_LOG_HISTORY_DEDUPE = os.getenv("MNB_LOG_HISTORY_DEDUPE", "1").strip().lower() not in {"0", "false", "no", "off"}
+try:
+    MNB_LOG_HISTORY_DEDUPE_SECONDS = max(5, int(os.getenv("MNB_LOG_HISTORY_DEDUPE_SECONDS", "45")))
+except ValueError:
+    MNB_LOG_HISTORY_DEDUPE_SECONDS = 45
+try:
+    MNB_LOG_HISTORY_DEDUPE_LIMIT = max(3, int(os.getenv("MNB_LOG_HISTORY_DEDUPE_LIMIT", "12")))
+except ValueError:
+    MNB_LOG_HISTORY_DEDUPE_LIMIT = 12
+try:
+    MNB_LOG_HISTORY_DEDUPE_DELAY = max(0.0, float(os.getenv("MNB_LOG_HISTORY_DEDUPE_DELAY", "0.35")))
+except ValueError:
+    MNB_LOG_HISTORY_DEDUPE_DELAY = 0.35
+
+# =========================
+# 원하는 채널에서 바로 사용 모드 v218
+# =========================
+# 전용 채널을 꼭 만들지 않아도 관리자가 실행한 현재 채널에서 바로 패널/기능을 쓰게 합니다.
+# 끄고 싶으면 Render/로컬 환경변수에서 각 값을 0으로 설정하세요.
+MNB_FREE_CHANNEL_MODE = os.getenv("MNB_FREE_CHANNEL_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
+MNB_SHOP_CURRENT_CHANNEL_MODE = os.getenv("MNB_SHOP_CURRENT_CHANNEL_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
+MNB_MUSIC_EXPLICIT_ANY_CHANNEL = os.getenv("MNB_MUSIC_EXPLICIT_ANY_CHANNEL", "1").strip().lower() not in {"0", "false", "no", "off"}
+MNB_CUSTOM_MUSIC_PANEL_CURRENT_CHANNEL = os.getenv("MNB_CUSTOM_MUSIC_PANEL_CURRENT_CHANNEL", "1").strip().lower() not in {"0", "false", "no", "off"}
+# 유저가 음성 채널에 들어간 상태에서 일반 채팅을 치면, 특정 TTS 채널이 아니어도 자동으로 읽습니다.
+MNB_TTS_AUTO_ALL_CHANNELS = os.getenv("MNB_TTS_AUTO_ALL_CHANNELS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# v220: 아무 채널 TTS 모드가 편한 대신, 채팅이 너무 빠르면 음성 도배가 될 수 있어서
+# 유저별 짧은 쿨타임을 둡니다. 0으로 설정하면 쿨타임 없이 동작합니다.
+try:
+    MNB_TTS_AUTO_COOLDOWN_SECONDS = max(0.0, float(os.getenv("MNB_TTS_AUTO_COOLDOWN_SECONDS", "2.5")))
+except ValueError:
+    MNB_TTS_AUTO_COOLDOWN_SECONDS = 2.5
+MNB_TTS_COOLDOWNS = {}
+
+
+def mnb_quiet_command_kwargs(kwargs: dict):
+    """명령어 응답 kwargs에 silent=True를 안전하게 기본 적용합니다."""
+    new_kwargs = dict(kwargs or {})
+    if MNB_COMMAND_QUIET_MODE and not new_kwargs.get("ephemeral") and "silent" not in new_kwargs:
+        new_kwargs["silent"] = True
+    return new_kwargs
+
+
+def mnb_strip_silent(kwargs: dict):
+    new_kwargs = dict(kwargs or {})
+    new_kwargs.pop("silent", None)
+    return new_kwargs
+
+
+def install_mnb_quiet_command_mode():
+    """discord.py 버전 차이를 흡수하면서 명령어 응답을 조용하게 보냅니다."""
+    global MNB_COMMAND_QUIET_PATCHED
+    if MNB_COMMAND_QUIET_PATCHED:
+        return
+    MNB_COMMAND_QUIET_PATCHED = True
+
+    original_ctx_send = commands.Context.send
+
+    async def quiet_ctx_send(self, *args, **kwargs):
+        quiet_kwargs = mnb_quiet_command_kwargs(kwargs)
+        added_silent = "silent" in quiet_kwargs and "silent" not in kwargs
+        try:
+            return await original_ctx_send(self, *args, **quiet_kwargs)
+        except TypeError:
+            if added_silent:
+                return await original_ctx_send(self, *args, **mnb_strip_silent(quiet_kwargs))
+            raise
+
+    commands.Context.send = quiet_ctx_send
+
+    original_ctx_reply = getattr(commands.Context, "reply", None)
+    if original_ctx_reply is not None:
+        async def quiet_ctx_reply(self, *args, **kwargs):
+            # 답장 알림 멘션도 기본으로 끕니다.
+            kwargs.setdefault("mention_author", False)
+            quiet_kwargs = mnb_quiet_command_kwargs(kwargs)
+            added_silent = "silent" in quiet_kwargs and "silent" not in kwargs
+            try:
+                return await original_ctx_reply(self, *args, **quiet_kwargs)
+            except TypeError:
+                if added_silent:
+                    return await original_ctx_reply(self, *args, **mnb_strip_silent(quiet_kwargs))
+                raise
+
+        commands.Context.reply = quiet_ctx_reply
+
+    original_interaction_send = discord.InteractionResponse.send_message
+
+    async def quiet_interaction_send_message(self, *args, **kwargs):
+        quiet_kwargs = mnb_quiet_command_kwargs(kwargs)
+        added_silent = "silent" in quiet_kwargs and "silent" not in kwargs
+        try:
+            return await original_interaction_send(self, *args, **quiet_kwargs)
+        except TypeError:
+            if added_silent:
+                return await original_interaction_send(self, *args, **mnb_strip_silent(quiet_kwargs))
+            raise
+
+    discord.InteractionResponse.send_message = quiet_interaction_send_message
+
+    original_webhook_send = getattr(discord.Webhook, "send", None)
+    if original_webhook_send is not None:
+        async def quiet_webhook_send(self, *args, **kwargs):
+            quiet_kwargs = mnb_quiet_command_kwargs(kwargs)
+            added_silent = "silent" in quiet_kwargs and "silent" not in kwargs
+            try:
+                return await original_webhook_send(self, *args, **quiet_kwargs)
+            except TypeError:
+                if added_silent:
+                    return await original_webhook_send(self, *args, **mnb_strip_silent(quiet_kwargs))
+                raise
+
+        discord.Webhook.send = quiet_webhook_send
+
+
+install_mnb_quiet_command_mode()
+
+
+# =========================
+# v233 TTS 오류 문구 전역 숨김 패치
+# =========================
+def mnb_is_hidden_tts_error_text(value) -> bool:
+    try:
+        content = str(value or "")
+    except Exception:
+        return False
+    return (
+        "__MNB_TTS_SUBBOT_NOT_IN_GUILD__" in content
+        or "TTS 서브봇이 이 서버에 초대되어 있지 않습니다" in content
+        or "TTS 서브봇을 서버에 초대해주세요" in content
+    )
+
+
+def install_mnb_hide_tts_error_message_patch():
+    """TTS 서브봇 미초대 오류가 어떤 send 경로로도 채팅창에 뜨지 않게 막습니다."""
+    try:
+        original_messageable_send = discord.abc.Messageable.send
+
+        async def hidden_tts_error_messageable_send(self, *args, **kwargs):
+            content = args[0] if args else kwargs.get("content", "")
+            if mnb_is_hidden_tts_error_text(content):
+                return None
+            return await original_messageable_send(self, *args, **kwargs)
+
+        discord.abc.Messageable.send = hidden_tts_error_messageable_send
+    except Exception:
+        pass
+
+    try:
+        original_interaction_send = discord.InteractionResponse.send_message
+
+        async def hidden_tts_error_interaction_send(self, *args, **kwargs):
+            content = args[0] if args else kwargs.get("content", "")
+            if mnb_is_hidden_tts_error_text(content):
+                return None
+            return await original_interaction_send(self, *args, **kwargs)
+
+        discord.InteractionResponse.send_message = hidden_tts_error_interaction_send
+    except Exception:
+        pass
+
+    try:
+        original_webhook_send = discord.Webhook.send
+
+        async def hidden_tts_error_webhook_send(self, *args, **kwargs):
+            content = args[0] if args else kwargs.get("content", "")
+            if mnb_is_hidden_tts_error_text(content):
+                return None
+            return await original_webhook_send(self, *args, **kwargs)
+
+        discord.Webhook.send = hidden_tts_error_webhook_send
+    except Exception:
+        pass
+
+
+install_mnb_hide_tts_error_message_patch()
+
+
+
+@bot.before_invoke
+async def mnb_delete_prefix_command_message(ctx: commands.Context):
+    """기본값은 삭제하지 않습니다.
+
+    ! 또는 . 명령어 입력 메시지를 삭제하면 서버의 메시지 삭제 로그가 뜰 수 있어서
+    조용한 명령어 모드에서는 삭제를 기본으로 사용하지 않습니다.
+    정말 삭제 정리를 원할 때만 환경변수 MNB_DELETE_PREFIX_COMMAND_MESSAGE=1 로 켤 수 있습니다.
+    """
+    if not MNB_COMMAND_QUIET_MODE or not MNB_DELETE_PREFIX_COMMAND_MESSAGE:
+        return
+    if ctx.guild is None or ctx.message is None:
+        return
+    if getattr(ctx.author, "bot", False):
+        return
+    try:
+        content = ctx.message.content or ""
+        if not content.startswith(("!", ".")):
+            return
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
 
 # =========================
 # v203 중복 실행/중복 등록 방지
@@ -1172,6 +1589,13 @@ def _strip_ephemeral_for_channel(kwargs: dict):
 
 
 async def safe_interaction_send(interaction: discord.Interaction, *args, **kwargs):
+    # v233: TTS 서브봇 미초대 오류 최종 차단
+    try:
+        _content = str(args[0]) if args else str(kwargs.get("content", ""))
+        if "__MNB_TTS_SUBBOT_NOT_IN_GUILD__" in _content or "TTS 서브봇이 이 서버에 초대되어 있지 않습니다" in _content or "TTS 서브봇을 서버에 초대해주세요" in _content:
+            return None
+    except Exception:
+        pass
     """Interaction 40060/10062 오류를 줄이는 안전 응답 헬퍼입니다.
 
     - 아직 응답 전이면 response.send_message 사용
@@ -1181,6 +1605,7 @@ async def safe_interaction_send(interaction: discord.Interaction, *args, **kwarg
     """
     if interaction is None:
         return None
+    kwargs = mnb_quiet_command_kwargs(kwargs)
     try:
         if interaction.response.is_done():
             return await interaction.followup.send(*args, **kwargs)
@@ -1257,7 +1682,63 @@ LOG_CHANNEL_NAMES = {
     "voice": "🔊-음성로그",
     "nickname": "👤-닉네임로그",
     "level": "📈-레벨로그",
+    "security": "🛡️-보안로그",
+    "clean": "🧹-청소로그",
 }
+
+LOG_TYPE_LABELS = {
+    "all": "전체 로그",
+    "general": "일반 로그",
+    "warning": "경고 로그",
+    "punishment": "처벌 로그",
+    "chat": "채팅 로그",
+    "voice": "음성 로그",
+    "nickname": "닉네임 로그",
+    "level": "레벨 로그",
+    "security": "보안 로그",
+    "clean": "청소 로그",
+    "levelup": "채팅/음성 레벨업",
+}
+
+LOG_CHANNEL_COLUMN_MAP = {
+    "general": "general_log_channel_id",
+    "warning": "warning_log_channel_id",
+    "punishment": "punishment_log_channel_id",
+    "chat": "chat_log_channel_id",
+    "voice": "voice_log_channel_id",
+    "nickname": "nickname_log_channel_id",
+    "level": "level_log_channel_id",
+    "security": "security_log_channel_id",
+    "clean": "clean_log_channel_id",
+}
+
+LOG_COMMAND_CHOICES = [
+    app_commands.Choice(name=label, value=key)
+    for key, label in LOG_TYPE_LABELS.items()
+]
+
+LOG_SEND_TYPES = set(LOG_CHANNEL_COLUMN_MAP.keys())
+
+def ensure_log_control_tables():
+    """서버별 로그 채널/켜기/끄기 설정 테이블을 준비합니다."""
+    try:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS log_settings (
+            guild_id INTEGER,
+            log_type TEXT,
+            enabled INTEGER DEFAULT 1,
+            channel_id INTEGER DEFAULT 0,
+            updated_by INTEGER DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY (guild_id, log_type)
+        )
+        """)
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"⚠️ 로그 설정 테이블 준비 실패: {e}")
+
+
+ensure_log_control_tables()
 
 DEFAULT_SERVER_CATEGORY_NAME = "📦 기본 서버"
 TEMP_VOICE_CATEGORY_NAME = "😴 잠수방"
@@ -1266,6 +1747,36 @@ TEMP_VOICE_CHANNELS = {}
 
 ENHANCE_CATEGORY_NAME = "⚒️ 강화방"
 ENHANCE_CHANNEL_NAME = "⚒️-강화"
+GAMBLING_CATEGORY_NAME = "🎲 도박방"
+GAMBLING_CHANNEL_NAMES = {
+    "dice": "🎲-주사위",
+    "roulette": "🎯-룰렛",
+    "mark": "⛏️-마크",
+    "dating": "💕-소개팅",
+}
+VALORANT_TIER_VOICE_NAMES = [
+    "🟫 발로란트 아이언 통방",
+    "🟧 발로란트 브론즈 통방",
+    "⬜ 발로란트 실버 통방",
+    "🟨 발로란트 골드 통방",
+    "🟩 발로란트 플래티넘 통방",
+    "💎 발로란트 다이아몬드 통방",
+    "🌌 발로란트 초월자 통방",
+    "🔥 발로란트 불멸 통방",
+    "✨ 발로란트 레디언트 통방",
+]
+LOL_TIER_VOICE_NAMES = [
+    "🟫 롤 아이언 통방",
+    "🟧 롤 브론즈 통방",
+    "⬜ 롤 실버 통방",
+    "🟨 롤 골드 통방",
+    "🟩 롤 플래티넘 통방",
+    "💚 롤 에메랄드 통방",
+    "💎 롤 다이아몬드 통방",
+    "👑 롤 마스터 통방",
+    "🔥 롤 그랜드마스터 통방",
+    "🏆 롤 챌린저 통방",
+]
 TTS_CATEGORY_NAME = "🔊 TTS방"
 TTS_TEXT_CHANNEL_NAME = "🔊-tts"
 TTS_VOICE_CHANNEL_NAME = "🔊 TTS 통방 1"
@@ -2085,23 +2596,96 @@ async def send_server_boost_notification(before: discord.Member, after: discord.
         pass
 
 
+def get_log_setting(guild_id: int, log_type: str):
+    ensure_log_control_tables()
+    try:
+        c.execute(
+            "SELECT enabled, channel_id FROM log_settings WHERE guild_id=? AND log_type=?",
+            (int(guild_id or 0), str(log_type or "general")),
+        )
+        return c.fetchone()
+    except sqlite3.Error:
+        return None
+
+
+def is_log_type_enabled(guild_id: int, log_type: str = "general") -> bool:
+    """서버별 로그 ON/OFF 상태입니다. 기본값은 켜짐입니다."""
+    if not guild_id:
+        return True
+
+    # 레벨업 공개 알림은 로그 전체 끄기와 별개로 따로 제어합니다.
+    if log_type != "levelup":
+        all_row = get_log_setting(guild_id, "all")
+        if all_row is not None and int(all_row[0] or 0) == 0:
+            return False
+
+    row = get_log_setting(guild_id, log_type)
+    if row is None:
+        return True
+    return bool(int(row[0] if row[0] is not None else 1))
+
+
+def set_log_setting(guild_id: int, log_type: str, *, enabled=None, channel_id=None, updated_by: int = 0):
+    ensure_log_control_tables()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    current = get_log_setting(guild_id, log_type)
+    current_enabled = int(current[0]) if current is not None and current[0] is not None else 1
+    current_channel_id = int(current[1]) if current is not None and current[1] else 0
+
+    if enabled is None:
+        enabled = current_enabled
+    else:
+        enabled = 1 if bool(enabled) else 0
+    if channel_id is None:
+        channel_id = current_channel_id
+    else:
+        try:
+            channel_id = int(channel_id or 0)
+        except (TypeError, ValueError):
+            channel_id = 0
+
+    try:
+        c.execute(
+            """
+            INSERT INTO log_settings(guild_id, log_type, enabled, channel_id, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, log_type) DO UPDATE SET
+                enabled=excluded.enabled,
+                channel_id=excluded.channel_id,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+            """,
+            (int(guild_id or 0), str(log_type or "general"), int(enabled), int(channel_id or 0), int(updated_by or 0), now),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def get_configured_log_channel_id(guild_id: int, log_type: str = "general") -> int:
+    """직접 지정한 로그 채널을 먼저 읽습니다. 종류별 채널이 없으면 전체 로그 채널을 사용합니다."""
+    row = get_log_setting(guild_id, log_type)
+    if row is not None and row[1]:
+        return int(row[1] or 0)
+    all_row = get_log_setting(guild_id, "all")
+    if all_row is not None and all_row[1]:
+        return int(all_row[1] or 0)
+    return 0
+
+
 def get_log_channel(guild: discord.Guild, log_type: str = "general"):
     if guild is None:
         return None
 
-    # 웹 대시보드에서 연결한 로그 채널을 최우선으로 사용합니다.
-    log_column_map = {
-        "general": "general_log_channel_id",
-        "warning": "warning_log_channel_id",
-        "punishment": "punishment_log_channel_id",
-        "chat": "chat_log_channel_id",
-        "voice": "voice_log_channel_id",
-        "nickname": "nickname_log_channel_id",
-        "level": "level_log_channel_id",
-        "security": "security_log_channel_id",
-        "clean": "clean_log_channel_id",
-    }
-    saved_id = get_saved_channel_id(guild.id, log_column_map.get(log_type, "log_channel_id")) or get_saved_channel_id(guild.id, "log_channel_id")
+    # /로그 채널설정으로 직접 지정한 채널을 최우선으로 사용합니다.
+    configured_id = get_configured_log_channel_id(guild.id, log_type)
+    if configured_id:
+        channel = guild.get_channel(configured_id)
+        if channel:
+            return channel
+
+    # 웹 대시보드/기존 DB에서 연결한 로그 채널을 다음 순서로 사용합니다.
+    saved_id = get_saved_channel_id(guild.id, LOG_CHANNEL_COLUMN_MAP.get(log_type, "log_channel_id")) or get_saved_channel_id(guild.id, "log_channel_id")
     if saved_id:
         channel = guild.get_channel(saved_id)
         if channel:
@@ -2115,6 +2699,135 @@ def get_log_channel(guild: discord.Guild, log_type: str = "general"):
     # 로그 카테고리를 아직 만들지 않았을 때 기존 LOG_CHANNEL_ID 또는 일반적인 로그 채널명으로도 로그가 가게 유지
     fallback = get_channel_by_id_or_name(guild, LOG_CHANNEL_ID, ["📋-일반로그", "bot-log", "로그", "관리로그"], "text")
     return fallback
+
+
+def mnb_can_use_public_level_channel(guild: discord.Guild, channel) -> bool:
+    """레벨업 알림을 사람들이 볼 수 있는 공개 채널에 보낼 수 있는지 확인합니다."""
+    if guild is None or channel is None:
+        return False
+    if getattr(channel, "guild", None) != guild:
+        return False
+    if not hasattr(channel, "send") or not hasattr(channel, "permissions_for"):
+        return False
+
+    try:
+        bot_member = guild.me or guild.get_member(getattr(getattr(bot, "user", None), "id", 0))
+        if bot_member is None:
+            return False
+
+        bot_perms = channel.permissions_for(bot_member)
+        everyone_perms = channel.permissions_for(guild.default_role)
+        bot_can_send = bool(
+            getattr(bot_perms, "send_messages", False)
+            or getattr(bot_perms, "send_messages_in_threads", False)
+        )
+        return bool(getattr(bot_perms, "view_channel", False) and bot_can_send and getattr(everyone_perms, "view_channel", False))
+    except Exception:
+        return False
+
+
+def get_public_levelup_channel(guild: discord.Guild, preferred_channel=None):
+    """레벨업 공개 알림 채널을 고릅니다.
+
+    우선순위:
+    1) /로그 채널설정 종류:레벨업 공개 알림 또는 !레벨로그 로 직접 지정한 채널
+    2) 기존 level_channel_id 저장값
+    3) 레벨업이 발생한 현재 채널
+    4) 공개 채널 자동 탐색
+
+    이제 채팅한 곳마다 레벨업 알림이 뜨지 않고,
+    관리자가 정한 채널을 먼저 사용합니다.
+    """
+    if guild is None:
+        return None
+
+    candidates = []
+
+    # /로그 채널설정 또는 !레벨로그 로 직접 지정한 레벨업 공개 알림 채널을 최우선으로 사용합니다.
+    try:
+        levelup_row = get_log_setting(guild.id, "levelup")
+        if levelup_row is not None and levelup_row[1]:
+            candidates.append(guild.get_channel(int(levelup_row[1] or 0)))
+    except Exception:
+        pass
+
+    # 대시보드/DB에서 레벨 채널을 지정해둔 경우 다음으로 사용하되, 모두가 볼 수 있는 경우에만 사용합니다.
+    try:
+        saved_level_id = get_saved_channel_id(guild.id, "level_channel_id")
+        if saved_level_id:
+            candidates.append(guild.get_channel(saved_level_id))
+    except Exception:
+        pass
+
+    # 직접 지정된 레벨업 채널이 없을 때만 현재 채팅 채널을 사용합니다.
+    if preferred_channel is not None:
+        candidates.append(preferred_channel)
+
+    for name in [LEVEL_CHANNEL_NAME, "📈-레벨업", "📈-레벨", "레벨업", "레벨", "💬-자유채팅", "💬-채팅", "자유채팅", "일반채팅", "general"]:
+        try:
+            channel = discord.utils.get(guild.text_channels, name=name)
+            if channel:
+                candidates.append(channel)
+        except Exception:
+            pass
+
+    if getattr(guild, "system_channel", None):
+        candidates.append(guild.system_channel)
+
+    try:
+        candidates.extend(list(guild.text_channels))
+    except Exception:
+        pass
+
+    seen = set()
+    for channel in candidates:
+        if channel is None:
+            continue
+        channel_id = getattr(channel, "id", None)
+        if channel_id in seen:
+            continue
+        seen.add(channel_id)
+        if mnb_can_use_public_level_channel(guild, channel):
+            return channel
+    return None
+
+
+async def send_public_levelup_announcement(member: discord.Member, title: str, description: str, preferred_channel=None):
+    """레벨업을 로그방 대신 공개 채널에 예쁘게 알립니다."""
+    if not MNB_PUBLIC_LEVELUP_ANNOUNCE:
+        return None
+    if member is None or member.guild is None:
+        return None
+    if not is_log_type_enabled(member.guild.id, "levelup"):
+        return None
+
+    channel = get_public_levelup_channel(member.guild, preferred_channel=preferred_channel)
+    if channel is None:
+        # 공개 채널을 못 찾았을 때만 기존 레벨 로그로 fallback합니다.
+        await send_log(member.guild, f"{title}\n{description}", "level")
+        return None
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=COLOR_GOLD,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+    embed.set_footer(text="만능 봇 | 레벨업 알림")
+
+    try:
+        try:
+            return await channel.send(
+                embed=embed,
+                silent=MNB_LEVELUP_SILENT,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except TypeError:
+            return await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        await send_log(member.guild, f"⚠️ 레벨업 공개 알림 전송 실패\n대상: {member}\n채널: {getattr(channel, 'name', '확인 불가')}", "warning")
+        return None
 
 
 def mnb_should_skip_duplicate_log(guild_id: int, log_type: str, message: str) -> bool:
@@ -2165,16 +2878,86 @@ def mnb_should_skip_duplicate_log(guild_id: int, log_type: str, message: str) ->
     return False
 
 
+def mnb_normalize_log_message(message: str) -> str:
+    """로그 중복 비교용 문자열을 최대한 안정적으로 정리합니다."""
+    text = str(message or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+async def mnb_recent_log_already_sent(channel: discord.TextChannel, message: str) -> bool:
+    """다른 봇 프로세스가 같은 로그를 이미 보냈는지 실제 채널 기록으로 확인합니다.
+
+    메모리/DB 중복 방지는 같은 프로세스나 같은 DB를 공유할 때만 완벽합니다.
+    Render 재시작 직후 또는 PC에서 봇을 2개 켰을 때처럼 서로 다른 프로세스가
+    같은 이벤트를 동시에 처리하면 둘 다 Discord 채널에 보내질 수 있어서,
+    보내기 직전에 최근 로그 채널 메시지를 읽고 같은 내용이면 건너뜁니다.
+    """
+    if not MNB_LOG_HISTORY_DEDUPE or channel is None:
+        return False
+    target = mnb_normalize_log_message(message)
+    if not target:
+        return False
+
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        bot_user_id = getattr(getattr(bot, "user", None), "id", None)
+        async for old_message in channel.history(limit=MNB_LOG_HISTORY_DEDUPE_LIMIT):
+            if bot_user_id and getattr(getattr(old_message, "author", None), "id", None) != bot_user_id:
+                continue
+            created_at = getattr(old_message, "created_at", None)
+            if created_at is not None:
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+                if (now - created_at).total_seconds() > MNB_LOG_HISTORY_DEDUPE_SECONDS:
+                    continue
+            if mnb_normalize_log_message(getattr(old_message, "content", "")) == target:
+                return True
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        return False
+    except Exception:
+        return False
+    return False
+
+
 async def send_log(guild: discord.Guild, message: str, log_type: str = "general"):
     if guild is None:
+        return
+    log_type = str(log_type or "general")
+    if not is_log_type_enabled(getattr(guild, "id", 0), log_type):
         return
     if mnb_should_skip_duplicate_log(getattr(guild, "id", 0), log_type, message):
         return
     channel = get_log_channel(guild, log_type)
     if not channel:
         return
+
+    # 같은 로그가 2번 뜨는 문제 방지:
+    # 1차는 메모리/DB dedupe, 2차는 실제 Discord 채널 최근 기록 확인입니다.
+    # 짧게 기다렸다가 확인하면 다른 프로세스가 먼저 보낸 로그도 잡을 수 있습니다.
+    if MNB_LOG_HISTORY_DEDUPE:
+        try:
+            if MNB_LOG_HISTORY_DEDUPE_DELAY > 0:
+                await asyncio.sleep(MNB_LOG_HISTORY_DEDUPE_DELAY)
+            if await mnb_recent_log_already_sent(channel, message):
+                return
+        except Exception:
+            pass
+
     try:
-        await channel.send(message)
+        allowed_mentions = discord.AllowedMentions.none() if MNB_LOG_DISABLE_MENTIONS else None
+        try:
+            await channel.send(
+                message,
+                silent=MNB_LOG_SILENT_MODE,
+                allowed_mentions=allowed_mentions,
+            )
+        except TypeError:
+            # 구버전 discord.py에서 silent 옵션을 지원하지 않는 경우에도
+            # 멘션 알림은 막고 로그 전송은 유지합니다.
+            await channel.send(message, allowed_mentions=allowed_mentions)
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         pass
 
@@ -4497,6 +5280,90 @@ AUTO_BUTTON_MANUAL_CHOICES = [
     app_commands.Choice(name="🎂 생일 등록 버튼", value="panel_birthday"),
 ]
 
+# /임베드 버튼붙이기·버튼제거에서 게임 역할을 1개씩 따로 붙이고 지울 때 쓰는 목록입니다.
+# 값은 기존 GameRoleView의 custom_id와 맞춰서 재시작 후에도 기존 지속 버튼 콜백이 그대로 살아있게 했습니다.
+GAME_ROLE_BUTTON_SPECS = [
+    {"key": "game_role_lol", "role_name": "롤", "emoji": "🐉", "style": discord.ButtonStyle.green, "aliases": ["lol", "leagueoflegends", "리그오브레전드"]},
+    {"key": "game_role_valorant", "role_name": "발로란트", "emoji": "🎯", "style": discord.ButtonStyle.red, "aliases": ["valorant", "발로"]},
+    {"key": "game_role_battlegrounds", "role_name": "배틀그라운드", "emoji": "🪂", "style": discord.ButtonStyle.blurple, "aliases": ["배그", "pubg", "battlegrounds"]},
+    {"key": "game_role_er", "role_name": "이터널리턴", "emoji": "🧬", "style": discord.ButtonStyle.gray, "aliases": ["이터널", "er", "eternalreturn"]},
+    {"key": "game_role_minecraft", "role_name": "마인크래프트", "emoji": "⛏️", "style": discord.ButtonStyle.green, "aliases": ["마크", "minecraft"]},
+    {"key": "game_role_roblox", "role_name": "로블록스", "emoji": "🧱", "style": discord.ButtonStyle.blurple, "aliases": ["roblox"]},
+    {"key": "game_role_overwatch", "role_name": "오버워치", "emoji": "🛡️", "style": discord.ButtonStyle.red, "aliases": ["옵치", "overwatch"]},
+    {"key": "game_role_sudden_attack", "role_name": "서든어택", "emoji": "🔫", "style": discord.ButtonStyle.gray, "aliases": ["서든", "sudden", "suddenattack"]},
+    {"key": "game_role_fifa", "role_name": "피파", "emoji": "⚽", "style": discord.ButtonStyle.green, "aliases": ["fifa"]},
+    {"key": "game_role_starcraft", "role_name": "스타크래프트", "emoji": "🚀", "style": discord.ButtonStyle.blurple, "aliases": ["스타", "starcraft"]},
+    {"key": "game_role_all_games", "role_name": "종합게임", "emoji": "🕹️", "style": discord.ButtonStyle.gray, "aliases": ["종합", "allgame", "allgames"]},
+]
+GAME_ROLE_BUTTON_BY_KEY = {spec["key"]: spec for spec in GAME_ROLE_BUTTON_SPECS}
+GAME_ROLE_BUTTON_CHOICES = [
+    app_commands.Choice(name=f"{spec['emoji']} {spec['role_name']} 버튼", value=spec["key"])
+    for spec in GAME_ROLE_BUTTON_SPECS
+]
+GAME_ROLE_BUTTON_REMOVE_CHOICES = [
+    app_commands.Choice(name="🗑️ 전체 버튼 제거", value="__all__"),
+    *GAME_ROLE_BUTTON_CHOICES,
+]
+
+
+def _normalize_button_alias_text(raw_text: str):
+    return (raw_text or "").strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+GAME_ROLE_BUTTON_ALIAS_TO_KEY = {}
+for _spec in GAME_ROLE_BUTTON_SPECS:
+    _key = _spec["key"]
+    for _alias in [_key, _spec["role_name"], f"{_spec['role_name']}버튼", *_spec.get("aliases", [])]:
+        GAME_ROLE_BUTTON_ALIAS_TO_KEY[_normalize_button_alias_text(_alias)] = _key
+
+
+def get_game_role_button_key(button_type: str):
+    raw = (button_type or "").strip()
+    if raw in GAME_ROLE_BUTTON_BY_KEY:
+        return raw
+    return GAME_ROLE_BUTTON_ALIAS_TO_KEY.get(_normalize_button_alias_text(raw), "")
+
+
+def get_game_role_button_display_name(button_type: str):
+    key = get_game_role_button_key(button_type)
+    spec = GAME_ROLE_BUTTON_BY_KEY.get(key)
+    if not spec:
+        return ""
+    return f"{spec['emoji']} {spec['role_name']} 버튼"
+
+
+def get_embed_button_autocomplete_choices(include_remove_all: bool = False):
+    choices = []
+    if include_remove_all:
+        choices.append(app_commands.Choice(name="🗑️ 전체 버튼 제거", value="__all__"))
+    choices.extend(AUTO_BUTTON_MANUAL_CHOICES)
+    choices.extend(GAME_ROLE_BUTTON_CHOICES)
+    return choices
+
+
+async def embed_button_type_autocomplete(interaction: discord.Interaction, current: str):
+    query = _normalize_button_alias_text(current)
+    results = []
+    for choice in get_embed_button_autocomplete_choices(include_remove_all=False):
+        haystack = _normalize_button_alias_text(f"{choice.name} {choice.value}")
+        if not query or query in haystack:
+            results.append(choice)
+        if len(results) >= 25:
+            break
+    return results
+
+
+async def embed_button_remove_type_autocomplete(interaction: discord.Interaction, current: str):
+    query = _normalize_button_alias_text(current)
+    results = []
+    for choice in get_embed_button_autocomplete_choices(include_remove_all=True):
+        haystack = _normalize_button_alias_text(f"{choice.name} {choice.value}")
+        if not query or query in haystack:
+            results.append(choice)
+        if len(results) >= 25:
+            break
+    return results
+
 c.execute("""
 CREATE TABLE IF NOT EXISTS auto_button_settings (
     guild_id INTEGER,
@@ -4510,7 +5377,25 @@ CREATE TABLE IF NOT EXISTS auto_button_settings (
 conn.commit()
 
 
+c.execute("""
+CREATE TABLE IF NOT EXISTS custom_role_buttons (
+    guild_id INTEGER,
+    role_id INTEGER,
+    label TEXT,
+    emoji TEXT,
+    style TEXT DEFAULT 'secondary',
+    created_by INTEGER DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (guild_id, role_id)
+)
+""")
+conn.commit()
+
+
 def normalize_auto_button_embed_key(embed_type: str):
+    game_key = get_game_role_button_key(embed_type)
+    if game_key:
+        return game_key
     key = (embed_type or "").strip().lower()
     key = key.replace(" ", "_").replace("-", "_")
     aliases = {
@@ -4553,6 +5438,9 @@ def normalize_auto_button_embed_key(embed_type: str):
 
 
 def get_auto_button_display_name(embed_key: str):
+    game_display = get_game_role_button_display_name(embed_key)
+    if game_display:
+        return game_display
     key = normalize_auto_button_embed_key(embed_key)
     return AUTO_BUTTON_DISPLAY_NAMES.get(key, key or "알 수 없음")
 
@@ -4596,6 +5484,11 @@ def set_auto_button_enabled(guild_id: int, embed_type: str, enabled: bool, updat
 
 def make_auto_button_view(embed_type: str = "", guild_id: int = 0, *, ignore_setting: bool = False):
     key = normalize_auto_button_embed_key(embed_type)
+    if key in GAME_ROLE_BUTTON_BY_KEY:
+        view_class = globals().get("GameRoleIndividualView")
+        if view_class is None:
+            return None
+        return view_class([key])
     class_name = AUTO_BUTTON_VIEW_CLASS_BY_EMBED_KEY.get(key)
     if not class_name:
         return None
@@ -4691,13 +5584,47 @@ async def attach_embed_button_command(interaction: discord.Interaction, button_t
         return
     await safe_interaction_defer(interaction, ephemeral=True)
 
-    view = make_auto_button_view(button_type, interaction.guild.id if interaction.guild else 0, ignore_setting=True)
-    if view is None:
-        return await interaction.followup.send("❌ 이 버튼 종류는 현재 코드에서 사용할 수 없습니다.", ephemeral=True)
-
     message, error = await find_target_bot_embed_message(interaction.channel, message_id)
     if error:
         return await interaction.followup.send(f"❌ {error}", ephemeral=True)
+
+    game_key = get_game_role_button_key(button_type)
+    if game_key:
+        existing_keys, has_non_game_component = extract_game_role_button_keys_from_message(message)
+        if has_non_game_component:
+            return await interaction.followup.send(
+                "❌ 이 임베드에는 다른 종류의 버튼/선택창이 이미 붙어있어요.\n"
+                "게임 역할 개별 버튼을 섞어서 붙이려면 먼저 `/임베드 버튼제거`로 기존 버튼을 제거한 뒤 다시 붙여주세요.",
+                ephemeral=True,
+            )
+        if game_key in existing_keys:
+            return await interaction.followup.send(
+                f"⚠️ 이미 **{get_auto_button_display_name(game_key)}** 이/가 붙어있습니다.",
+                ephemeral=True,
+            )
+        existing_keys.append(game_key)
+        try:
+            await edit_message_with_game_role_buttons(message, existing_keys)
+        except discord.Forbidden:
+            return await interaction.followup.send("❌ 메시지를 수정할 권한이 없습니다.", ephemeral=True)
+        except discord.HTTPException as e:
+            return await interaction.followup.send(f"❌ 게임 역할 버튼을 붙이는 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+
+        await interaction.followup.send(
+            f"✅ 최근 봇 임베드에 **{get_auto_button_display_name(game_key)}** 을/를 추가했습니다.\n"
+            "다른 게임도 `/임베드 버튼붙이기`에서 하나씩 더 붙일 수 있어요.",
+            ephemeral=True,
+        )
+        await send_log(
+            interaction.guild,
+            f"🧩 게임 역할 버튼 개별 붙이기\n채널: {interaction.channel.mention}\n버튼: {get_auto_button_display_name(game_key)}\n관리자: {interaction.user.mention}",
+            "general",
+        )
+        return
+
+    view = make_auto_button_view(button_type, interaction.guild.id if interaction.guild else 0, ignore_setting=True)
+    if view is None:
+        return await interaction.followup.send("❌ 이 버튼 종류는 현재 코드에서 사용할 수 없습니다.", ephemeral=True)
 
     try:
         await message.edit(view=view)
@@ -4718,8 +5645,8 @@ async def attach_embed_button_command(interaction: discord.Interaction, button_t
 
 
 # 통합 하위명령어로 이동됨: @bot.tree.command(name="임베드버튼제거", description="현재 채널의 봇 임베드에서 버튼을 제거합니다.")
-@app_commands.describe(message_id="비워두면 현재 채널의 최근 봇 임베드 버튼을 제거합니다.")
-async def remove_embed_button_command(interaction: discord.Interaction, message_id: str = ""):
+@app_commands.describe(message_id="비워두면 현재 채널의 최근 봇 임베드 버튼을 제거합니다.", button_type="비우면 전체 제거, 게임 역할을 고르면 해당 버튼만 제거합니다.")
+async def remove_embed_button_command(interaction: discord.Interaction, message_id: str = "", button_type: str = ""):
     if await reject_if_not_setup_manager(interaction):
         return
     await safe_interaction_defer(interaction, ephemeral=True)
@@ -4728,6 +5655,41 @@ async def remove_embed_button_command(interaction: discord.Interaction, message_
     if error:
         return await interaction.followup.send(f"❌ {error}", ephemeral=True)
 
+    if (button_type or "").strip() == "__all__":
+        button_type = ""
+
+    game_key = get_game_role_button_key(button_type)
+    if game_key:
+        existing_keys, has_non_game_component = extract_game_role_button_keys_from_message(message)
+        if game_key not in existing_keys:
+            return await interaction.followup.send(
+                f"⚠️ 이 임베드에는 **{get_auto_button_display_name(game_key)}** 이/가 붙어있지 않습니다.",
+                ephemeral=True,
+            )
+        if has_non_game_component:
+            return await interaction.followup.send(
+                "❌ 게임 역할 버튼 말고 다른 버튼/선택창이 섞여 있어 특정 게임 버튼만 안전하게 제거할 수 없어요.\n"
+                "전체 버튼 제거를 사용해주세요.",
+                ephemeral=True,
+            )
+        new_keys = [key for key in existing_keys if key != game_key]
+        try:
+            await edit_message_with_game_role_buttons(message, new_keys)
+        except discord.Forbidden:
+            return await interaction.followup.send("❌ 메시지를 수정할 권한이 없습니다.", ephemeral=True)
+        except discord.HTTPException as e:
+            return await interaction.followup.send(f"❌ 게임 역할 버튼을 제거하는 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ 해당 임베드에서 **{get_auto_button_display_name(game_key)}** 을/를 제거했습니다.",
+            ephemeral=True,
+        )
+        await send_log(
+            interaction.guild,
+            f"🧩 게임 역할 버튼 개별 제거\n채널: {interaction.channel.mention}\n버튼: {get_auto_button_display_name(game_key)}\n관리자: {interaction.user.mention}",
+            "general",
+        )
+        return
+
     try:
         await message.edit(view=None)
     except discord.Forbidden:
@@ -4735,10 +5697,10 @@ async def remove_embed_button_command(interaction: discord.Interaction, message_
     except discord.HTTPException as e:
         return await interaction.followup.send(f"❌ 버튼을 제거하는 중 오류가 발생했습니다: `{e}`", ephemeral=True)
 
-    await interaction.followup.send("✅ 해당 임베드의 버튼을 제거했습니다.", ephemeral=True)
+    await interaction.followup.send("✅ 해당 임베드의 버튼을 모두 제거했습니다.", ephemeral=True)
     await send_log(
         interaction.guild,
-        f"🧩 임베드 버튼 제거\n채널: {interaction.channel.mention}\n관리자: {interaction.user.mention}",
+        f"🧩 임베드 버튼 전체 제거\n채널: {interaction.channel.mention}\n관리자: {interaction.user.mention}",
         "general"
     )
 
@@ -5431,6 +6393,142 @@ async def create_log_category(interaction: discord.Interaction):
 
 
 
+log_group = app_commands.Group(name="로그", description="로그 채널을 직접 정하고 켜거나 끕니다.")
+
+
+def log_type_label(log_type: str) -> str:
+    return LOG_TYPE_LABELS.get(str(log_type or "general"), str(log_type or "general"))
+
+
+def log_channel_text(guild: discord.Guild, log_type: str) -> str:
+    if guild is None:
+        return "미설정"
+    if log_type == "levelup":
+        row = get_log_setting(guild.id, "levelup")
+        channel_id = int(row[1] or 0) if row is not None and row[1] else 0
+        if not channel_id:
+            channel_id = get_saved_channel_id(guild.id, "level_channel_id")
+        channel = guild.get_channel(channel_id) if channel_id else None
+        return channel.mention if channel else "자동 선택"
+    channel = get_log_channel(guild, log_type)
+    return channel.mention if channel else "미설정"
+
+
+@log_group.command(name="채널설정", description="원하는 로그/레벨업 알림을 보낼 채널을 직접 지정합니다.")
+@app_commands.choices(종류=LOG_COMMAND_CHOICES)
+async def log_channel_setting(interaction: discord.Interaction, 종류: app_commands.Choice[str], 채널: discord.TextChannel):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    log_type = 종류.value
+    if log_type == "levelup":
+        save_guild_channel_ids(interaction.guild, level_channel_id=채널)
+        set_log_setting(interaction.guild.id, "levelup", enabled=True, channel_id=채널.id, updated_by=interaction.user.id)
+        return await safe_interaction_send(interaction, f"✅ 레벨업 공개 알림 채널을 {채널.mention} 으로 고정했어요. 이제 레벨업 알림은 이 채널을 먼저 사용합니다.", ephemeral=True)
+
+    if log_type == "all":
+        set_log_setting(interaction.guild.id, "all", channel_id=채널.id, updated_by=interaction.user.id)
+        save_guild_channel_ids(interaction.guild, log_channel_id=채널)
+        return await safe_interaction_send(interaction, f"✅ 전체 로그 기본 채널을 {채널.mention} 으로 설정했어요.", ephemeral=True)
+
+    set_log_setting(interaction.guild.id, log_type, channel_id=채널.id, updated_by=interaction.user.id)
+    column = LOG_CHANNEL_COLUMN_MAP.get(log_type)
+    if column:
+        save_guild_channel_ids(interaction.guild, **{column: 채널})
+    await safe_interaction_send(interaction, f"✅ {log_type_label(log_type)} 채널을 {채널.mention} 으로 설정했어요.", ephemeral=True)
+
+
+@log_group.command(name="켜기", description="선택한 로그 또는 레벨업 알림을 켭니다.")
+@app_commands.choices(종류=LOG_COMMAND_CHOICES)
+async def log_enable(interaction: discord.Interaction, 종류: app_commands.Choice[str]):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    log_type = 종류.value
+    if log_type == "all":
+        set_log_setting(interaction.guild.id, "all", enabled=True, updated_by=interaction.user.id)
+        for key in LOG_SEND_TYPES:
+            set_log_setting(interaction.guild.id, key, enabled=True, updated_by=interaction.user.id)
+        return await safe_interaction_send(interaction, "✅ 전체 로그를 켰어요.", ephemeral=True)
+
+    set_log_setting(interaction.guild.id, log_type, enabled=True, updated_by=interaction.user.id)
+    await safe_interaction_send(interaction, f"✅ {log_type_label(log_type)}을(를) 켰어요.", ephemeral=True)
+
+
+@log_group.command(name="끄기", description="선택한 로그 또는 레벨업 알림을 끕니다.")
+@app_commands.choices(종류=LOG_COMMAND_CHOICES)
+async def log_disable(interaction: discord.Interaction, 종류: app_commands.Choice[str]):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    log_type = 종류.value
+    set_log_setting(interaction.guild.id, log_type, enabled=False, updated_by=interaction.user.id)
+    if log_type == "all":
+        return await safe_interaction_send(interaction, "✅ 전체 로그를 껐어요. 레벨업 공개 알림은 `/로그 끄기 종류:레벨업 공개 알림`으로 따로 끌 수 있어요.", ephemeral=True)
+    await safe_interaction_send(interaction, f"✅ {log_type_label(log_type)}을(를) 껐어요.", ephemeral=True)
+
+
+@log_group.command(name="초기화", description="선택한 로그 채널 지정을 초기화하고 자동 탐색으로 되돌립니다.")
+@app_commands.choices(종류=LOG_COMMAND_CHOICES)
+async def log_reset(interaction: discord.Interaction, 종류: app_commands.Choice[str]):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    log_type = 종류.value
+    if log_type == "levelup":
+        save_guild_channel_ids(interaction.guild, level_channel_id=0)
+        set_log_setting(interaction.guild.id, "levelup", channel_id=0, updated_by=interaction.user.id)
+    elif log_type == "all":
+        set_log_setting(interaction.guild.id, "all", channel_id=0, updated_by=interaction.user.id)
+        save_guild_channel_ids(interaction.guild, log_channel_id=0)
+    else:
+        set_log_setting(interaction.guild.id, log_type, channel_id=0, updated_by=interaction.user.id)
+        column = LOG_CHANNEL_COLUMN_MAP.get(log_type)
+        if column:
+            save_guild_channel_ids(interaction.guild, **{column: 0})
+    await safe_interaction_send(interaction, f"✅ {log_type_label(log_type)} 채널 지정을 초기화했어요.", ephemeral=True)
+
+
+@log_group.command(name="상태", description="현재 로그 채널과 켜짐/꺼짐 상태를 확인합니다.")
+async def log_status(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+    guild = interaction.guild
+    lines = []
+    for key, label in LOG_TYPE_LABELS.items():
+        state = "켜짐" if is_log_type_enabled(guild.id, key) else "꺼짐"
+        channel_text = log_channel_text(guild, key)
+        lines.append(f"• **{label}**: `{state}` / {channel_text}")
+
+    embed = discord.Embed(
+        title="🧾 로그 설정 상태",
+        description="\n".join(lines)[:4096],
+        color=COLOR_GRAY,
+    )
+    embed.set_footer(text="/로그 채널설정 · /로그 켜기 · /로그 끄기")
+    await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+
+
+try:
+    bot.tree.add_command(log_group)
+except app_commands.CommandAlreadyRegistered:
+    pass
+except Exception:
+    pass
+
+
+
 async def ensure_log_category_channels(guild: discord.Guild):
     """로그 카테고리와 모든 로그 채널을 생성/확인합니다."""
     category = discord.utils.get(guild.categories, name=LOG_CATEGORY_NAME)
@@ -5619,6 +6717,8 @@ FRIEND_RESET_CATEGORY_NAMES = [
     MUSIC_CATEGORY_NAME,
     TTS_CATEGORY_NAME,
     "⚔️ 내전방",
+    GAMBLING_CATEGORY_NAME,
+    ENHANCE_CATEGORY_NAME,
     "🎤 버스킹",
     "🔞 수위방",
     TEMP_VOICE_CATEGORY_NAME,
@@ -5745,6 +6845,177 @@ async def create_chat_extra_channels(guild: discord.Guild, chat_category: discor
     return channel_map
 
 
+
+async def create_game_category_channels(guild: discord.Guild):
+    """🎮 게임방 카테고리와 게임 채팅/티어표/티어별 통화방을 생성합니다."""
+    game_category = await get_or_create_category(guild, "🎮 게임방")
+    await apply_member_category_permissions(guild, game_category)
+
+    game_chat_channel = await get_or_create_text_channel(guild, "🎮-게임채팅", game_category)
+    game_role_channel = await get_or_create_text_channel(guild, "🎮-게임역할선택", game_category)
+    valorant_tier_channel = await get_or_create_text_channel(guild, "📊-발로란트-티어표", game_category)
+    lol_tier_channel = await get_or_create_text_channel(guild, "📊-롤-티어표", game_category)
+
+    await send_channel_guide_once(
+        valorant_tier_channel,
+        "📊 발로란트 티어표 안내",
+        "발로란트 티어표, 본인 티어, 같이 할 사람을 정리하는 채널입니다.\n"
+        "아래 발로란트 티어별 통방을 이용하면 같은 티어끼리 쉽게 모일 수 있어요.",
+        color=FRIEND_SERVER_COLORS.get("role", BOT_COLOR),
+    )
+    await send_channel_guide_once(
+        lol_tier_channel,
+        "📊 롤 티어표 안내",
+        "리그 오브 레전드 티어표, 본인 티어, 듀오/자랭 모집을 정리하는 채널입니다.\n"
+        "아래 롤 티어별 통방을 이용하면 같은 티어끼리 쉽게 모일 수 있어요.",
+        color=FRIEND_SERVER_COLORS.get("role", BOT_COLOR),
+    )
+
+    game_role_panel_sent = await send_game_role_panel_to_channel(game_role_channel)
+    game_voice_channel = await get_or_create_voice_channel(guild, "🎮 게임 음성 1", game_category)
+
+    valorant_voice_channels = []
+    for voice_name in VALORANT_TIER_VOICE_NAMES:
+        valorant_voice_channels.append(await get_or_create_voice_channel(guild, voice_name, game_category))
+        await asyncio.sleep(0.03)
+
+    lol_voice_channels = []
+    for voice_name in LOL_TIER_VOICE_NAMES:
+        lol_voice_channels.append(await get_or_create_voice_channel(guild, voice_name, game_category))
+        await asyncio.sleep(0.03)
+
+    save_guild_settings(guild, game_role_channel=game_role_channel)
+    return {
+        "game_category": game_category,
+        "game_chat_channel": game_chat_channel,
+        "game_role_channel": game_role_channel,
+        "game_role_panel_sent": game_role_panel_sent,
+        "game_voice_channel": game_voice_channel,
+        "valorant_tier_channel": valorant_tier_channel,
+        "lol_tier_channel": lol_tier_channel,
+        "valorant_voice_channels": valorant_voice_channels,
+        "lol_voice_channels": lol_voice_channels,
+    }
+
+
+async def create_scrim_category_channels(guild: discord.Guild):
+    """⚔️ 내전방 카테고리와 내전 텍스트/음성 채널을 생성합니다."""
+    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
+    await apply_member_category_permissions(guild, scrim_category)
+    scrim_text_channel = await get_or_create_text_channel(guild, "⚔️-내전", scrim_category)
+    wait_voice_channel = await get_or_create_voice_channel(guild, "⚔️ 내전 대기실", scrim_category, user_limit=11)
+    red_voice_channel = await get_or_create_voice_channel(guild, "🔴 내전팀 (1)", scrim_category, user_limit=6)
+    blue_voice_channel = await get_or_create_voice_channel(guild, "🔵 내전팀 (2)", scrim_category, user_limit=6)
+    return {
+        "scrim_category": scrim_category,
+        "scrim_text_channel": scrim_text_channel,
+        "wait_voice_channel": wait_voice_channel,
+        "red_voice_channel": red_voice_channel,
+        "blue_voice_channel": blue_voice_channel,
+    }
+
+
+async def send_gambling_guide_to_channel(channel: discord.TextChannel):
+    """도박방 채널에 서버 포인트/미니게임 안내 임베드를 중복 없이 전송합니다."""
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "도박방 안내" in title or "미니게임 안내" in title:
+                    return False
+    except discord.HTTPException:
+        pass
+
+    embed = create_embed(
+        "🎲 도박방 안내",
+        "이 카테고리는 서버 안에서만 즐기는 **포인트/미니게임 전용 공간**입니다.\n"
+        "실제 현금 거래나 외부 도박은 금지예요.\n\n"
+        "사용 예정 명령어\n"
+        "`/주사위` - 주사위 굴리기\n"
+        "`/룰렛` - 룰렛 미니게임\n"
+        "`/마크` - 마크 관련 미니게임/모드\n"
+        "`/소개팅` - 서버 소개팅 매칭/이벤트",
+        FRIEND_SERVER_COLORS.get("event", COLOR_GOLD),
+    )
+    await channel.send(embed=embed)
+    return True
+
+
+async def create_gambling_category_channels(guild: discord.Guild, *, send_guide: bool = True):
+    """🎲 도박방 카테고리와 /주사위·/룰렛·/마크·/소개팅 전용 채널을 생성합니다."""
+    gambling_category = await get_or_create_category(guild, GAMBLING_CATEGORY_NAME)
+    await apply_member_category_permissions(guild, gambling_category)
+
+    channels = {}
+    for key, channel_name in GAMBLING_CHANNEL_NAMES.items():
+        channels[key] = await get_or_create_text_channel(guild, channel_name, gambling_category)
+        try:
+            await channels[key].edit(topic="🎲 서버 포인트/미니게임 전용 채널입니다. 실제 현금 거래나 외부 도박은 금지입니다.")
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(0.05)
+
+    guide_sent = False
+    if send_guide and channels.get("dice"):
+        guide_sent = await send_gambling_guide_to_channel(channels["dice"])
+
+    return {
+        "gambling_category": gambling_category,
+        "gambling_channels": channels,
+        "dice_channel": channels.get("dice"),
+        "roulette_channel": channels.get("roulette"),
+        "mark_channel": channels.get("mark"),
+        "dating_channel": channels.get("dating"),
+        "gambling_guide_sent": guide_sent,
+    }
+
+
+async def create_enhance_category_channels(guild: discord.Guild, *, send_guide: bool = True):
+    """⚒️ 강화방 카테고리와 강화 전용 채널/안내 패널을 생성합니다."""
+    category = await get_or_create_category(guild, ENHANCE_CATEGORY_NAME)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            embed_links=True,
+            attach_files=True,
+        ),
+    }
+    try:
+        await category.edit(overwrites=overwrites)
+    except discord.HTTPException:
+        pass
+
+    channel = await get_or_create_text_channel(guild, ENHANCE_CHANNEL_NAME, category)
+    try:
+        await channel.edit(
+            topic="⚒️ 강화 전용 채널입니다. /강화 아이템 또는 !강화 명령어로 아이템을 강화하세요.",
+            overwrites=overwrites,
+        )
+    except discord.HTTPException:
+        pass
+
+    guide_sent = False
+    if send_guide:
+        guide_sent = await send_enhance_guide_to_channel(channel)
+
+    save_guild_channel_ids(guild, enhance_category_id=category, enhance_channel_id=channel)
+    return {
+        "enhance_category": category,
+        "enhance_channel": channel,
+        "enhance_guide_sent": guide_sent,
+    }
+
+
 async def create_requested_voice_layout(guild: discord.Guild):
     """요청한 음성/내전/버스킹/수위/이벤트/2인실/개인방 레이아웃을 생성합니다."""
     created = {}
@@ -5761,13 +7032,8 @@ async def create_requested_voice_layout(guild: discord.Guild):
         await get_or_create_voice_channel(guild, f"🌳 서버 적응방 {idx}", voice_category, user_limit=15)
     created["voice_category"] = voice_category
 
-    scrim_category = await get_or_create_category(guild, "⚔️ 내전방")
-    await apply_member_category_permissions(guild, scrim_category)
-    await get_or_create_text_channel(guild, "⚔️-내전", scrim_category)
-    await get_or_create_voice_channel(guild, "⚔️ 내전 대기실", scrim_category, user_limit=11)
-    await get_or_create_voice_channel(guild, "🔴 내전팀 (1)", scrim_category, user_limit=6)
-    await get_or_create_voice_channel(guild, "🔵 내전팀 (2)", scrim_category, user_limit=6)
-    created["scrim_category"] = scrim_category
+    scrim_layout = await create_scrim_category_channels(guild)
+    created["scrim_category"] = scrim_layout.get("scrim_category")
 
     busking_category = await get_or_create_category(guild, "🎤 버스킹")
     await apply_member_category_permissions(guild, busking_category)
@@ -7156,17 +8422,17 @@ async def send_tts_guide_to_channel(channel: discord.TextChannel):
 
     embed = create_embed(
         "🔊 TTS 안내",
-        "이 채널에 채팅을 치면 봇이 자동으로 음성 채널에 들어와 읽어줘요.\n\n"
+        "이제 TTS 전용 채널을 꼭 만들지 않아도 사용할 수 있어요.\n\n"
         "사용 방법\n"
-        "1️⃣ `🔊 TTS 통방 1~3` 중 원하는 통방에 들어가기\n"
-        "2️⃣ `🔊-tts` 채널에 읽을 문장 입력하기\n"
-        "3️⃣ 봇이 자동으로 네가 들어간 통방에 들어와서 읽어줍니다\n"
-        "4️⃣ 음성방에 아무도 없으면 첫 번째 TTS 통방으로 자동 입장합니다\n\n"
+        "1️⃣ 원하는 음성 채널에 먼저 들어가기\n"
+        "2️⃣ 아무 텍스트 채널에서나 일반 채팅 입력하기\n"
+        "3️⃣ 봇이 네가 들어간 음성 채널로 자동 입장해서 읽어줍니다\n"
+        "4️⃣ 직접 부르고 싶으면 `/입장`, 내보내고 싶으면 `/퇴장` 사용\n\n"
         "명령어\n"
         "`/입장` - 봇을 내 음성 채널로 부르기\n"
         "`/퇴장` - 봇을 음성 채널에서 내보내기\n"
         "`/목소리변경` - 연홍/연하 느낌 목소리 선택\n"
-        "`/tts text:내용` - 직접 TTS 읽기"
+        "`/음성 말하기 내용:문장` - 직접 TTS 읽기"
     )
     embed = apply_custom_panel_embed(channel.guild, "tts", embed)
     await channel.send(embed=embed)
@@ -7223,6 +8489,81 @@ def find_auto_tts_voice_channel(member: discord.Member, text_channel: discord.Te
         return tts_voice_channels[0]
 
     return None
+
+
+
+
+def mnb_should_hide_tts_error(error_text: str) -> bool:
+    """채팅창에 뿌리면 불편한 TTS 상태 오류는 조용히 무시합니다."""
+    text = str(error_text or "")
+    quiet_keywords = (
+        "__MNB_TTS_SUBBOT_NOT_IN_GUILD__",
+        "현재 다른 음성이 재생 중",
+        "TTS 서브봇이 이 서버에 초대되어 있지 않습니다",
+        "TTS 서브봇을 서버에 초대해주세요",
+        "TTS 서브봇이 아직 로그인 중입니다",
+        "TTS 서브봇이 이 음성 채널을 찾지 못했습니다",
+        "TTS 서브봇",
+    )
+    return any(keyword in text for keyword in quiet_keywords)
+
+def should_auto_tts_message(message: discord.Message) -> bool:
+    """일반 채팅을 TTS로 읽을지 판단합니다.
+
+    - 명령어(!, ., /)는 읽지 않습니다.
+    - 유저가 음성 채널에 들어가 있으면 모든 텍스트 채널에서 읽습니다.
+    - 기존 `🔊-tts` 채널은 계속 호환됩니다.
+    """
+    if message is None or message.guild is None or getattr(message.author, "bot", False):
+        return False
+
+    content = (message.content or "").strip()
+    if not content:
+        return False
+    if content.startswith(("!", ".", "/")):
+        return False
+
+    # 너무 긴 글은 TTS 도배 방지용으로 제외합니다.
+    if len(content) > 120:
+        return False
+
+    # 기존 TTS 채팅방은 계속 작동합니다.
+    if getattr(message.channel, "name", "") in TTS_CHANNEL_NAMES:
+        return True
+
+    # 자유 채널 모드: 유저가 들어간 음성 채널로 자동 입장해서 읽습니다.
+    if MNB_TTS_AUTO_ALL_CHANNELS and getattr(message.author, "voice", None) and message.author.voice.channel:
+        return True
+
+    return False
+
+
+def should_skip_tts_by_cooldown(message: discord.Message) -> bool:
+    """v220: 자유 TTS가 너무 빠르게 반복 재생되는 것을 막습니다.
+
+    관리자는 테스트/방송 상황에서 바로 말할 수 있게 쿨타임을 적용하지 않습니다.
+    """
+    if message is None or message.guild is None or message.author is None:
+        return False
+    if getattr(message.author, "guild_permissions", None) and message.author.guild_permissions.manage_messages:
+        return False
+    if MNB_TTS_AUTO_COOLDOWN_SECONDS <= 0:
+        return False
+
+    now_ts = time.time()
+    key = (message.guild.id, message.author.id)
+    last_ts = MNB_TTS_COOLDOWNS.get(key, 0.0)
+    if now_ts - last_ts < MNB_TTS_AUTO_COOLDOWN_SECONDS:
+        return True
+    MNB_TTS_COOLDOWNS[key] = now_ts
+
+    # 메모리가 계속 커지지 않게 오래된 항목을 가끔 정리합니다.
+    if len(MNB_TTS_COOLDOWNS) > 1000:
+        cutoff = now_ts - 60
+        for old_key, ts in list(MNB_TTS_COOLDOWNS.items()):
+            if ts < cutoff:
+                MNB_TTS_COOLDOWNS.pop(old_key, None)
+    return False
 
 
 async def send_ticket_panel_to_channel(channel: discord.TextChannel):
@@ -7306,7 +8647,7 @@ async def create_intro_channel(guild: discord.Guild, category: discord.CategoryC
 
 
 
-async def create_friend_roles(guild: discord.Guild):
+async def create_friend_roles(guild: discord.Guild, scope: str = "all"):
     created = []
     deleted = []
     skipped_delete = []
@@ -7315,37 +8656,54 @@ async def create_friend_roles(guild: discord.Guild):
     # /역할자동생성 또는 /친목섭 실행 시 기존 친목섭 역할을 지우고 다시 만듭니다.
     # 아래 예쁜 구분 역할을 추가해서 역할 설정 화면이 깔끔하게 보이도록 합니다.
     role_groups = [
-        ("˚₊‧꒰ა 👑 운영진 ໒꒱ ‧₊˚", [
+        ("admin", "˚₊‧꒰ა 👑 운영진 ໒꒱ ‧₊˚", [
             "대표", "부대표", "총관리자", "부관리자", "운영진", "관리자",
         ]),
-        ("˚₊‧꒰ა 🛡️ 담당팀 ໒꒱ ‧₊˚", [
+        ("team", "˚₊‧꒰ა 🛡️ 담당팀 ໒꒱ ‧₊˚", [
             "적응팀", "보안팀", "뉴관팀", "이벤트팀", "홍보팀", "내전팀", "팀장", "부팀장",
         ]),
-        ("˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚", [
+        ("special", "˚₊‧꒰ა ✨ 특수역할 ໒꒱ ‧₊˚", [
             "VIP", "VVIP", "귀빈", "우수회원", "단골", "서버부스터", "후원자",
         ]),
-        ("˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚", [
+        ("creator", "˚₊‧꒰ა 🎬 크리에이터 ໒꒱ ‧₊˚", [
             "스트리머", "유튜버", "디자이너", "개발자",
         ]),
-        ("˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚", [
+        ("member", "˚₊‧꒰ა 🌸 멤버등급 ໒꒱ ‧₊˚", [
             "뉴페이스", "미인증",
         ]),
-        ("˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚", [
+        ("profile", "˚₊‧꒰ა 💗 프로필 ໒꒱ ‧₊˚", [
             "남성", "여성", "20대", "10대",
         ]),
-        ("˚₊‧꒰ა 🤝 친구구하기 ໒꒱ ‧₊˚", [
+        ("friend", "˚₊‧꒰ა 🤝 친구구하기 ໒꒱ ‧₊˚", [
             "친구할사람?", "우프할사람?", "게임할사람?",
         ]),
-        ("˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚", [
+        ("game", "˚₊‧꒰ა 🎮 게임역할 ໒꒱ ‧₊˚", [
             "롤", "발로란트", "배틀그라운드", "이터널리턴", "마인크래프트", "로블록스",
             "오버워치", "서든어택", "피파", "스타크래프트", "종합게임",
         ]),
     ]
 
-    separator_names = [group_name for group_name, _ in role_groups]
+    role_scope_labels = {
+        "all": "전체",
+        "admin": "관리자",
+        "team": "담당팀",
+        "special": "특수역할",
+        "creator": "크리에이터",
+        "member": "멤버등급",
+        "profile": "프로필",
+        "friend": "친구구하기",
+        "game": "게임",
+    }
+    valid_role_scopes = {key for key, _, _ in role_groups} | {"all"}
+    scope = (scope or "all").lower()
+    if scope not in valid_role_scopes:
+        scope = "all"
 
-    # 구분선 역할은 항상 기본 색상, 멘션 불가로 맞춥니다.
-    for divider_name in DIVIDER_ROLE_NAMES:
+    selected_role_groups = role_groups if scope == "all" else [group for group in role_groups if group[0] == scope]
+    separator_names = [group_name for _, group_name, _ in selected_role_groups]
+
+    # 구분선 역할은 선택한 범위만 기본 색상, 멘션 불가로 맞춥니다.
+    for divider_name in separator_names:
         divider_role = discord.utils.get(guild.roles, name=divider_name)
         if divider_role:
             try:
@@ -7360,7 +8718,7 @@ async def create_friend_roles(guild: discord.Guild):
             except discord.HTTPException:
                 pass
     pretty_role_order = []
-    for group_name, names in role_groups:
+    for _, group_name, names in selected_role_groups:
         pretty_role_order.append(group_name)
         pretty_role_order.extend(names)
 
@@ -7546,7 +8904,11 @@ async def create_friend_roles(guild: discord.Guild):
     bot_member = guild.me or guild.get_member(bot.user.id)
     old_friend_role_names = globals().get("OLD_FRIEND_WANTED_ROLE_NAMES", [])
     old_team_role_names = globals().get("OLD_TEAM_ROLE_NAMES", [])
-    target_role_names = set(pretty_role_order + old_separator_names + old_friend_role_names + old_team_role_names)
+    if scope == "all":
+        target_role_names = set(pretty_role_order + old_separator_names + old_friend_role_names + old_team_role_names)
+    else:
+        # 부분 생성범위에서는 선택한 묶음만 삭제/재생성해서 다른 역할 묶음은 건드리지 않습니다.
+        target_role_names = set(pretty_role_order)
 
     # 기존 친목섭 역할을 먼저 삭제합니다.
     # 봇보다 높은 역할, 봇/연동 서비스 관리 역할, @everyone은 삭제하지 않습니다.
@@ -7651,12 +9013,10 @@ async def create_friend_server_layout(guild: discord.Guild):
     requested_voice_layout = await create_requested_voice_layout(guild)
     voice_category = requested_voice_layout.get("voice_category")
 
-    game_category = await get_or_create_category(guild, "🎮 게임방")
-    await apply_member_category_permissions(guild, game_category)
-    await get_or_create_text_channel(guild, "🎮-게임채팅", game_category)
-    game_role_channel = await get_or_create_text_channel(guild, "🎮-게임역할선택", game_category)
-    game_role_panel_sent = await send_game_role_panel_to_channel(game_role_channel)
-    await get_or_create_voice_channel(guild, "🎮 게임 음성 1", game_category)
+    game_layout = await create_game_category_channels(guild)
+    game_category = game_layout.get("game_category")
+    game_role_channel = game_layout.get("game_role_channel")
+    game_role_panel_sent = game_layout.get("game_role_panel_sent")
 
     bot_command_layout = await create_bot_command_category_channels(guild, send_guides=True)
 
@@ -7664,12 +9024,15 @@ async def create_friend_server_layout(guild: discord.Guild):
     music_command_channel = music_layout.get("music_command_channel")
     bot_command_channel = bot_command_layout.get("bot_command_channel")
     attendance_channel = bot_command_layout.get("attendance_channel")
-    enhance_channel = bot_command_layout.get("enhance_channel")
+    enhance_layout = await create_enhance_category_channels(guild, send_guide=True)
+    enhance_channel = enhance_layout.get("enhance_channel")
     shop_category = bot_command_layout.get("shop_category")
     shop_channel = bot_command_layout.get("shop_channel")
     point_channel = bot_command_layout.get("point_channel")
 
     tts_category, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
+
+    gambling_layout = await create_gambling_category_channels(guild, send_guide=True)
 
     # 요청한 내전방/버스킹/수위방/이벤트/2인실/개인방/잠수방은 create_requested_voice_layout에서 생성됩니다.
     birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
@@ -7686,8 +9049,14 @@ async def create_friend_server_layout(guild: discord.Guild):
         "goodbye_channel": goodbye_channel,
         "boost_channel": boost_channel,
         "rule_channel": rule_channel,
+        "game_category": game_layout.get("game_category"),
+        "game_chat_channel": game_layout.get("game_chat_channel"),
         "game_role_channel": game_role_channel,
         "game_role_panel_sent": game_role_panel_sent,
+        "valorant_tier_channel": game_layout.get("valorant_tier_channel"),
+        "lol_tier_channel": game_layout.get("lol_tier_channel"),
+        "valorant_voice_channels": game_layout.get("valorant_voice_channels"),
+        "lol_voice_channels": game_layout.get("lol_voice_channels"),
         "ticket_panel_channel": ticket_panel_channel,
         "ticket_log_channel": ticket_log_channel,
         "ticket_panel_sent": ticket_panel_sent,
@@ -7714,9 +9083,16 @@ async def create_friend_server_layout(guild: discord.Guild):
         "shop_channel": bot_command_layout.get("shop_channel"),
         "shop_category": bot_command_layout.get("shop_category"),
         "level_channel": bot_command_layout.get("level_channel"),
-        "enhance_channel": bot_command_layout.get("enhance_channel"),
+        "enhance_category": enhance_layout.get("enhance_category"),
+        "enhance_channel": enhance_channel,
         "attendance_guide_sent": bot_command_layout.get("attendance_guide_sent"),
-        "enhance_guide_sent": bot_command_layout.get("enhance_guide_sent"),
+        "enhance_guide_sent": enhance_layout.get("enhance_guide_sent"),
+        "gambling_category": gambling_layout.get("gambling_category"),
+        "dice_channel": gambling_layout.get("dice_channel"),
+        "roulette_channel": gambling_layout.get("roulette_channel"),
+        "mark_channel": gambling_layout.get("mark_channel"),
+        "dating_channel": gambling_layout.get("dating_channel"),
+        "gambling_guide_sent": gambling_layout.get("gambling_guide_sent"),
         "point_guide_sent": bot_command_layout.get("point_guide_sent"),
         "shop_guide_sent": bot_command_layout.get("shop_guide_sent"),
         "level_guide_sent": bot_command_layout.get("level_guide_sent"),
@@ -8462,8 +9838,759 @@ async def server_start_command(interaction: discord.Interaction, 방식: app_com
     await send_log(guild, f"🚀 서버시작 실행\n방식: `{방식.name}`\n관리자: {interaction.user.mention}", "general")
 
 
+
+# =========================
+# vNext /친목섭 박스형 선택 패널
+# =========================
+FRIEND_ROLE_SCOPE_LABELS = {
+    "all": "전체 역할",
+    "admin": "관리자",
+    "team": "담당팀",
+    "special": "특수역할",
+    "creator": "크리에이터",
+    "member": "멤버등급",
+    "profile": "프로필",
+    "friend": "친구구하기",
+    "game": "게임",
+}
+
+FRIEND_BASIC_SCOPE_LABELS = {
+    "all": "전체 기본카테고리",
+    "rule": "필독/인증",
+    "chat": "채팅방",
+    "voice": "음성방",
+    "event": "이벤트",
+    "recruit": "구인구직",
+}
+
+
+def _panel_channel_text(channel):
+    return channel.mention if channel else "미설정"
+
+
+def build_friend_setup_panel_embed(guild: discord.Guild):
+    embed = create_embed(
+        "🌸 만능봇 친목섭 전체 생성 패널",
+        "`/친목섭`에서 사용하던 생성범위를 전부 박스형 버튼으로 정리했습니다.\n"
+        "원하는 박스만 눌러서 필요한 카테고리/채널/역할을 생성하세요.\n"
+        "`역할만`과 `기본카테고리`는 세부 선택 패널이 열립니다.\n\n"
+        "이미 있는 항목은 중복 생성하지 않고 생성/복구 결과만 안내합니다.",
+        FRIEND_SERVER_COLORS.get("main", BOT_COLOR),
+    )
+    embed.add_field(
+        name="🧭 서버맞춤 / 🌸 전체",
+        value="서버맞춤은 현재 서버에 필요한 핵심 구조만 만들고, 전체는 친목섭 전체 기본 구조를 한 번에 생성/복구합니다.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎭 역할만 / 📦 기본카테고리",
+        value="원하는 역할 묶음 또는 채팅방·음성방·이벤트·구인구직 같은 기본 카테고리만 골라서 생성합니다.",
+        inline=False,
+    )
+    embed.add_field(
+        name="⚡ 바로 생성 박스",
+        value="게임방, 내전방, 도박방, 강화방, 생일방, 봇명령어/상점, 뮤직, TTS, 티켓, 서버부스트, 로그, 서버스텟, 개발로그를 바로 생성합니다.",
+        inline=False,
+    )
+    embed.set_footer(text="🌸 만능봇 | 친목섭 박스형 전체 생성센터")
+    return embed
+
+
+def build_friend_role_scope_panel_embed(guild: discord.Guild):
+    embed = create_embed(
+        "🎭 만능봇 역할 생성 패널",
+        "생성하고 싶은 역할 카테고리만 선택하세요.\n"
+        "부분 생성을 누르면 해당 묶음 역할만 정리/재생성하고 다른 역할 묶음은 건드리지 않습니다.",
+        FRIEND_SERVER_COLORS.get("role", BOT_COLOR),
+    )
+    embed.add_field(name="👑 관리자", value="대표, 부대표, 총관리자, 부관리자, 운영진, 관리자", inline=False)
+    embed.add_field(name="🛡️ 담당팀", value="내전팀, 적응팀, 보안팀, 뉴관팀, 이벤트팀, 홍보팀, 팀장, 부팀장", inline=False)
+    embed.add_field(name="✨ 특수역할", value="VIP, VVIP, 귀빈, 우수회원, 단골, 서버부스터, 후원자", inline=False)
+    embed.add_field(name="🎮 게임", value="롤, 발로란트, 배그, 이터널리턴, 마크, 로블록스, 오버워치, 서든, 피파, 스타, 종합게임", inline=False)
+    embed.set_footer(text="🎭 만능봇 | 역할 박스형 생성센터")
+    return embed
+
+
+def build_friend_basic_scope_panel_embed(guild: discord.Guild):
+    embed = create_embed(
+        "📦 만능봇 기본카테고리 생성 패널",
+        "원하는 기본 카테고리를 박스로 눌러 생성하세요.\n"
+        "예: `채팅방`만 누르면 채팅방 카테고리와 채널만 생성됩니다.",
+        FRIEND_SERVER_COLORS.get("main", BOT_COLOR),
+    )
+    embed.add_field(name="💬 채팅방", value="자유채팅, 사진, 남/여 얼공방, 반응요청방, 음악추천, 별명변경방, 친구구하기", inline=False)
+    embed.add_field(name="🔊 음성방", value="뉴페 적응방, 뉴페 통화방, 서버 적응방", inline=False)
+    embed.add_field(name="🎉 이벤트", value="이벤트공지, 이벤트목록, 이벤트 통화방", inline=False)
+    embed.add_field(name="📋 구인구직", value="구인구직 안내 채널, 면접대기실, 면접실", inline=False)
+    embed.set_footer(text="📦 만능봇 | 기본카테고리 박스형 생성센터")
+    return embed
+
+
+async def create_friend_rule_basic_channels(guild: discord.Guild):
+    default_category = await get_or_create_category(guild, DEFAULT_SERVER_CATEGORY_NAME)
+    welcome_channel = await get_or_create_text_channel(guild, "👋-인사-퇴장", default_category)
+    intro_channel, intro_message_sent = await create_intro_channel(guild, default_category)
+    verify_channel, verify_panel_sent = await create_verify_channel(guild, default_category)
+    await apply_default_server_permissions(guild, default_category)
+
+    rule_category, rule_channel, rules_channel, rules_message_sent = await create_rule_category_channels(guild)
+    save_guild_settings(guild, welcome_channel=welcome_channel, goodbye_channel=welcome_channel, rule_channel=rule_channel)
+    return {
+        "default_category": default_category,
+        "welcome_channel": welcome_channel,
+        "intro_channel": intro_channel,
+        "intro_message_sent": intro_message_sent,
+        "verify_channel": verify_channel,
+        "verify_panel_sent": verify_panel_sent,
+        "rule_category": rule_category,
+        "rule_channel": rule_channel,
+        "rules_channel": rules_channel,
+        "rules_message_sent": rules_message_sent,
+    }
+
+
+async def create_friend_chat_basic_channels(guild: discord.Guild):
+    chat_category = await get_or_create_category(guild, "💬 채팅방")
+    chat_channels = await create_chat_extra_channels(guild, chat_category)
+    bot_command_channel = await get_or_create_text_channel(guild, "🤖-봇명령어", chat_category)
+    return {"chat_category": chat_category, "chat_channels": chat_channels, "bot_command_channel": bot_command_channel}
+
+
+async def create_friend_voice_basic_channels(guild: discord.Guild):
+    voice_category = await get_or_create_category(guild, "🔊 음성방")
+    await apply_member_category_permissions(guild, voice_category)
+    voice_channels = []
+    for idx in range(1, 3):
+        voice_channels.append(await get_or_create_voice_channel(guild, f"🌱 뉴페 적응방 {idx}", voice_category, user_limit=7))
+    for idx in range(1, 4):
+        voice_channels.append(await get_or_create_voice_channel(guild, f"🌸 뉴페 통화방 {idx}", voice_category, user_limit=10))
+    for idx in range(1, 3):
+        voice_channels.append(await get_or_create_voice_channel(guild, f"🌿 서버 적응방 {idx}", voice_category, user_limit=10))
+    for idx in range(3, 5):
+        voice_channels.append(await get_or_create_voice_channel(guild, f"🌳 서버 적응방 {idx}", voice_category, user_limit=15))
+    return {"voice_category": voice_category, "voice_channels": voice_channels}
+
+
+async def create_friend_event_basic_channels(guild: discord.Guild):
+    event_category = await get_or_create_category(guild, "🎉 이벤트")
+    await apply_member_category_permissions(guild, event_category)
+    notice_channel = await get_or_create_text_channel(guild, "🎉-이벤트공지", event_category)
+    list_channel = await get_or_create_text_channel(guild, "📋-이벤트목록", event_category)
+    voice_channel = await get_or_create_voice_channel(guild, "🎉 이벤트 통화방", event_category)
+    return {"event_category": event_category, "notice_channel": notice_channel, "list_channel": list_channel, "voice_channel": voice_channel}
+
+
+async def create_friend_basic_scope(guild: discord.Guild, scope: str):
+    scope = scope or "all"
+    lines = []
+
+    if scope in {"all", "rule"}:
+        rule_layout = await create_friend_rule_basic_channels(guild)
+        lines.append(
+            f"📌 필독/인증: 필독 {_panel_channel_text(rule_layout.get('rule_channel'))} / "
+            f"규칙 {_panel_channel_text(rule_layout.get('rules_channel'))} / "
+            f"인증 {_panel_channel_text(rule_layout.get('verify_channel'))} / "
+            f"자기소개 {_panel_channel_text(rule_layout.get('intro_channel'))}"
+        )
+
+    if scope in {"all", "chat"}:
+        chat_layout = await create_friend_chat_basic_channels(guild)
+        lines.append(
+            f"💬 채팅방: {_panel_channel_text(chat_layout.get('chat_category'))} / "
+            f"텍스트 채널 `{len(chat_layout.get('chat_channels') or {}) + 1}`개 확인"
+        )
+
+    if scope in {"all", "voice"}:
+        voice_layout = await create_friend_voice_basic_channels(guild)
+        lines.append(
+            f"🔊 음성방: {_panel_channel_text(voice_layout.get('voice_category'))} / "
+            f"통화방 `{len(voice_layout.get('voice_channels') or [])}`개 확인"
+        )
+
+    if scope in {"all", "event"}:
+        event_layout = await create_friend_event_basic_channels(guild)
+        lines.append(
+            f"🎉 이벤트: {_panel_channel_text(event_layout.get('event_category'))} / "
+            f"공지 {_panel_channel_text(event_layout.get('notice_channel'))} / "
+            f"목록 {_panel_channel_text(event_layout.get('list_channel'))} / "
+            f"통방 {_panel_channel_text(event_layout.get('voice_channel'))}"
+        )
+
+    if scope in {"all", "recruit"}:
+        recruit_category, created = await create_recruit_category_channels(guild)
+        lines.append(f"📋 구인구직: {_panel_channel_text(recruit_category)} / 생성·수정 `{len(created)}`개")
+
+    save_detected_guild_channels(guild)
+    return lines
+
+
+def build_friend_scope_result_embed(title: str, scope_label: str, lines: list, color: int = BOT_COLOR):
+    description = f"선택한 박스: **{scope_label}**\n\n" + ("\n".join(lines) if lines else "처리된 항목이 없습니다.")
+    embed = create_embed(title, description, color)
+    embed.set_footer(text="✅ 만능봇 | 박스형 생성 결과")
+    return embed
+
+
+async def open_friend_setup_panel(interaction: discord.Interaction):
+    return await safe_interaction_send(
+        interaction,
+        embed=build_friend_setup_panel_embed(interaction.guild),
+        view=FriendSetupPanelView(),
+        ephemeral=True,
+    )
+
+
+async def open_friend_role_scope_panel(interaction: discord.Interaction):
+    return await safe_interaction_send(
+        interaction,
+        embed=build_friend_role_scope_panel_embed(interaction.guild),
+        view=FriendRoleScopePanelView(),
+        ephemeral=True,
+    )
+
+
+async def open_friend_basic_category_panel(interaction: discord.Interaction):
+    return await safe_interaction_send(
+        interaction,
+        embed=build_friend_basic_scope_panel_embed(interaction.guild),
+        view=FriendBasicCategoryPanelView(),
+        ephemeral=True,
+    )
+
+
+async def _friend_panel_require_manager(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return False
+    if await reject_if_not_bot_manager(interaction):
+        return False
+    if interaction.guild is None:
+        await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return False
+    return True
+
+
+class FriendRoleScopePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    async def _run_scope(self, interaction: discord.Interaction, scope: str):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_defer(interaction, ephemeral=True)
+        created, deleted, skipped_delete, updated = await create_friend_roles(interaction.guild, scope=scope)
+        label = FRIEND_ROLE_SCOPE_LABELS.get(scope, scope)
+        lines = [
+            f"기존 삭제 `{len(deleted)}`개",
+            f"새로 생성 `{len(created)}`개",
+            f"삭제 못함 `{len(skipped_delete)}`개",
+            f"권한 정리 `{len(updated)}`개",
+        ]
+        embed = build_friend_scope_result_embed("🎭 역할 생성 완료", label, lines, FRIEND_SERVER_COLORS.get("role", BOT_COLOR))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_log(interaction.guild, f"🎭 역할 박스 생성\n범위: {label}\n관리자: {interaction.user.mention}", "general")
+
+    @discord.ui.button(label="전체 역할", emoji="🌸", style=discord.ButtonStyle.green, row=0)
+    async def all_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "all")
+
+    @discord.ui.button(label="관리자", emoji="👑", style=discord.ButtonStyle.blurple, row=0)
+    async def admin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "admin")
+
+    @discord.ui.button(label="담당팀", emoji="🛡️", style=discord.ButtonStyle.blurple, row=0)
+    async def team_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "team")
+
+    @discord.ui.button(label="특수역할", emoji="✨", style=discord.ButtonStyle.blurple, row=0)
+    async def special_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "special")
+
+    @discord.ui.button(label="크리에이터", emoji="🎬", style=discord.ButtonStyle.blurple, row=1)
+    async def creator_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "creator")
+
+    @discord.ui.button(label="멤버등급", emoji="🌸", style=discord.ButtonStyle.blurple, row=1)
+    async def member_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "member")
+
+    @discord.ui.button(label="프로필", emoji="💗", style=discord.ButtonStyle.blurple, row=1)
+    async def profile_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "profile")
+
+    @discord.ui.button(label="친구구하기", emoji="🤝", style=discord.ButtonStyle.blurple, row=1)
+    async def friend_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "friend")
+
+    @discord.ui.button(label="게임", emoji="🎮", style=discord.ButtonStyle.blurple, row=2)
+    async def game_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "game")
+
+    @discord.ui.button(label="친목섭 패널로", emoji="⬅️", style=discord.ButtonStyle.gray, row=4)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_edit(interaction, embed=build_friend_setup_panel_embed(interaction.guild), view=FriendSetupPanelView())
+
+
+class FriendBasicCategoryPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    async def _run_scope(self, interaction: discord.Interaction, scope: str):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_defer(interaction, ephemeral=True)
+        lines = await create_friend_basic_scope(interaction.guild, scope)
+        label = FRIEND_BASIC_SCOPE_LABELS.get(scope, scope)
+        embed = build_friend_scope_result_embed("📦 기본카테고리 생성 완료", label, lines, FRIEND_SERVER_COLORS.get("main", BOT_COLOR))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_log(interaction.guild, f"📦 기본카테고리 박스 생성\n범위: {label}\n관리자: {interaction.user.mention}", "general")
+
+    @discord.ui.button(label="전체 기본", emoji="📦", style=discord.ButtonStyle.green, row=0)
+    async def all_basic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "all")
+
+    @discord.ui.button(label="필독/인증", emoji="📌", style=discord.ButtonStyle.blurple, row=0)
+    async def rule_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "rule")
+
+    @discord.ui.button(label="채팅방", emoji="💬", style=discord.ButtonStyle.blurple, row=0)
+    async def chat_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "chat")
+
+    @discord.ui.button(label="음성방", emoji="🔊", style=discord.ButtonStyle.blurple, row=1)
+    async def voice_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "voice")
+
+    @discord.ui.button(label="이벤트", emoji="🎉", style=discord.ButtonStyle.blurple, row=1)
+    async def event_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "event")
+
+    @discord.ui.button(label="구인구직", emoji="📋", style=discord.ButtonStyle.blurple, row=1)
+    async def recruit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run_scope(interaction, "recruit")
+
+    @discord.ui.button(label="친목섭 패널로", emoji="⬅️", style=discord.ButtonStyle.gray, row=4)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_edit(interaction, embed=build_friend_setup_panel_embed(interaction.guild), view=FriendSetupPanelView())
+
+
+
+def _guild_setup_text_blob(guild: discord.Guild):
+    if guild is None:
+        return ""
+    parts = []
+    try:
+        parts.extend([ch.name for ch in guild.text_channels])
+        parts.extend([ch.name for ch in guild.voice_channels])
+        parts.extend([cat.name for cat in guild.categories])
+        parts.extend([role.name for role in guild.roles])
+        parts.append(guild.name or "")
+    except Exception:
+        pass
+    return " ".join(parts).lower()
+
+
+def _guild_has_keywords(guild: discord.Guild, keywords):
+    blob = _guild_setup_text_blob(guild)
+    return any(str(keyword).lower() in blob for keyword in keywords)
+
+
+def detect_friend_server_auto_profile(guild: discord.Guild):
+    """현재 서버 상태를 보고 /친목섭 서버맞춤 생성 범위를 고릅니다.
+
+    핵심 채널/역할은 만들고, 도박/TTS/뮤직/개발로그 같은 선택 기능은
+    서버에 관련 흔적이 있거나 공식 지원 서버일 때만 생성합니다.
+    """
+    text_count = len(getattr(guild, "text_channels", []) or [])
+    voice_count = len(getattr(guild, "voice_channels", []) or [])
+    category_count = len(getattr(guild, "categories", []) or [])
+    is_small_or_new = text_count <= 5 and category_count <= 3
+
+    profile = {
+        "core": True,
+        "roles": True,
+        "chat": True,
+        "voice": is_small_or_new or voice_count > 0 or _guild_has_keywords(guild, ["음성", "통방", "voice", "잠수"]),
+        "event": _guild_has_keywords(guild, ["이벤트", "event", "공지", "추첨", "투표"]),
+        "recruit": _guild_has_keywords(guild, ["구인", "구직", "면접", "모집", "recruit"]),
+        "game": is_small_or_new or _guild_has_keywords(guild, ["게임", "롤", "발로", "배그", "오버워치", "피파", "마크", "로블록스", "game"]),
+        "scrim": _guild_has_keywords(guild, ["내전", "스크림", "scrim"]),
+        "enhance": _guild_has_keywords(guild, ["강화", "enhance"]),
+        "gambling": _guild_has_keywords(guild, ["도박", "주사위", "룰렛", "소개팅", "gambling"]),
+        "birthday": _guild_has_keywords(guild, ["생일", "birthday"]),
+        "boost": bool(getattr(guild, "premium_subscription_count", 0) or getattr(guild, "premium_tier", 0)) or _guild_has_keywords(guild, ["부스트", "boost"]),
+        "logs": True,
+        "stats": True,
+        "ticket": True,
+        # 자유 채널 모드에서는 상점/뮤직/TTS 전용 채널이 없어도 쓸 수 있으니,
+        # 서버에 흔적이 있을 때만 자동 생성합니다.
+        "bot_shop": _guild_has_keywords(guild, ["상점", "포인트", "주식", "shop", "point"]),
+        "music": _guild_has_keywords(guild, ["뮤직", "음악", "노래", "music", "song"]),
+        "tts": _guild_has_keywords(guild, ["tts", "티티에스", "읽어줘", "목소리"]),
+        "devlog": is_official_support_guild(guild),
+    }
+    return profile
+
+
+async def create_friend_server_auto_profile(guild: discord.Guild):
+    """서버에 맞는 범위만 골라 생성하고 결과 라인을 반환합니다."""
+    profile = detect_friend_server_auto_profile(guild)
+    lines = []
+    picked = []
+
+    if profile.get("roles"):
+        created, deleted, skipped_delete, updated = await create_friend_roles(guild)
+        picked.append("역할")
+        lines.append(
+            f"🎭 역할: 새로 생성 `{len(created)}`개 / 권한 정리 `{len(updated)}`개 / 삭제 못함 `{len(skipped_delete)}`개"
+        )
+
+    if profile.get("core"):
+        rule_layout = await create_friend_rule_basic_channels(guild)
+        picked.append("필독/인증")
+        lines.append(
+            f"📌 필독/인증: 필독 {_panel_channel_text(rule_layout.get('rule_channel'))} / "
+            f"규칙 {_panel_channel_text(rule_layout.get('rules_channel'))} / "
+            f"인증 {_panel_channel_text(rule_layout.get('verify_channel'))} / "
+            f"자기소개 {_panel_channel_text(rule_layout.get('intro_channel'))}"
+        )
+
+    if profile.get("chat"):
+        chat_layout = await create_friend_chat_basic_channels(guild)
+        picked.append("채팅방")
+        lines.append(f"💬 채팅방: {_panel_channel_text(chat_layout.get('chat_category'))} / 텍스트 채널 `{len(chat_layout.get('chat_channels') or [])}`개")
+
+    if profile.get("voice"):
+        voice_layout = await create_friend_voice_basic_channels(guild)
+        picked.append("음성방")
+        lines.append(f"🔊 음성방: {_panel_channel_text(voice_layout.get('voice_category'))} / 음성 채널 `{len(voice_layout.get('voice_channels') or [])}`개")
+
+    if profile.get("event"):
+        event_layout = await create_friend_event_basic_channels(guild)
+        picked.append("이벤트")
+        lines.append(f"🎉 이벤트: {_panel_channel_text(event_layout.get('event_category'))} / 공지 {_panel_channel_text(event_layout.get('notice_channel'))}")
+
+    if profile.get("recruit"):
+        recruit_category, created_recruit = await create_recruit_category_channels(guild)
+        picked.append("구인구직")
+        lines.append(f"📋 구인구직: {_panel_channel_text(recruit_category)} / 생성·수정 `{len(created_recruit or [])}`개")
+
+    if profile.get("game"):
+        game_layout = await create_game_category_channels(guild)
+        picked.append("게임방")
+        lines.append(
+            f"🎮 게임방: {_panel_channel_text(game_layout.get('game_category'))} / "
+            f"게임채팅 {_panel_channel_text(game_layout.get('game_chat_channel'))} / 패널 {'새로 전송됨' if game_layout.get('game_role_panel_sent') else '이미 있음'}"
+        )
+
+    if profile.get("scrim"):
+        scrim_layout = await create_scrim_category_channels(guild)
+        picked.append("내전방")
+        lines.append(f"⚔️ 내전방: {_panel_channel_text(scrim_layout.get('scrim_category'))} / 내전채널 {_panel_channel_text(scrim_layout.get('scrim_text_channel'))}")
+
+    if profile.get("enhance"):
+        enhance_layout = await create_enhance_category_channels(guild, send_guide=True)
+        picked.append("강화방")
+        lines.append(f"⚒️ 강화방: {_panel_channel_text(enhance_layout.get('enhance_category'))} / 강화채널 {_panel_channel_text(enhance_layout.get('enhance_channel'))}")
+
+    if profile.get("gambling"):
+        gambling_layout = await create_gambling_category_channels(guild, send_guide=True)
+        picked.append("도박방")
+        lines.append(f"🎲 도박방: {_panel_channel_text(gambling_layout.get('gambling_category'))} / 주사위 {_panel_channel_text(gambling_layout.get('dice_channel'))}")
+
+    if profile.get("birthday"):
+        birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
+        picked.append("생일")
+        lines.append(f"🎂 생일: {_panel_channel_text(birthday_category)} / 등록 {_panel_channel_text(birthday_register_channel)} / 기록 {_panel_channel_text(birthday_record_channel)}")
+
+    if profile.get("boost"):
+        rule_category = await get_or_create_category(guild, "📌 필독")
+        boost_channel = await get_or_create_text_channel(guild, "🚀-서버부스트", rule_category)
+        await apply_rule_category_permissions(guild, rule_category)
+        save_guild_channel_ids(guild, boost_channel_id=boost_channel, welcome_category_id=rule_category, rule_category_id=rule_category)
+        picked.append("서버부스트")
+        lines.append(f"🚀 서버부스트: {_panel_channel_text(boost_channel)}")
+
+    if profile.get("logs"):
+        _, created_log_channels = await ensure_log_category_channels(guild)
+        picked.append("로그")
+        lines.append(f"📁 로그: 새 로그 채널 `{len(created_log_channels)}`개 확인")
+
+    if profile.get("stats"):
+        _, created_stats_channels = await ensure_server_stats_channels(guild)
+        picked.append("서버스텟")
+        lines.append(f"📊 서버스텟: 스텟 채널 `{created_stats_channels}`개 확인")
+
+    if profile.get("ticket"):
+        ticket_category, ticket_panel_channel, ticket_log_channel, panel_sent = await create_ticket_category_channels(guild, send_panel=True)
+        await apply_member_category_permissions(guild, ticket_category)
+        picked.append("티켓")
+        lines.append(f"🎫 티켓: 패널 {_panel_channel_text(ticket_panel_channel)} / 로그 {_panel_channel_text(ticket_log_channel)} / {'새로 전송됨' if panel_sent else '이미 있음'}")
+
+    if profile.get("bot_shop"):
+        bot_command_layout = await create_bot_command_category_channels(guild, send_guides=True)
+        picked.append("봇명령어/상점")
+        lines.append(
+            f"🤖 봇명령어/상점: 명령어 {_panel_channel_text(bot_command_layout.get('bot_command_channel'))} / "
+            f"상점 {_panel_channel_text(bot_command_layout.get('shop_channel'))}"
+        )
+
+    if profile.get("music"):
+        music_layout = await create_music_category_channels(guild, send_panel=True)
+        picked.append("뮤직")
+        lines.append(f"🎵 뮤직: {_panel_channel_text(music_layout.get('music_command_channel'))} / 패널 {'새로 전송됨' if music_layout.get('music_panel_sent') else '이미 있음'}")
+
+    if profile.get("tts"):
+        _, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
+        picked.append("TTS")
+        lines.append(f"🔊 TTS: {_panel_channel_text(tts_text_channel)} / 음성 {_panel_channel_text(tts_voice_channel)} / 안내 {'새로 전송됨' if tts_guide_sent else '이미 있음'}")
+
+    if profile.get("devlog"):
+        devlog_result = await ensure_development_log_channels(guild)
+        await send_development_log_intro_embeds(guild)
+        picked.append("개발로그")
+        lines.append(f"📈 개발로그: 새로 생성 `{len(devlog_result.get('created', []))}`개 / 안내패널 준비")
+
+    save_detected_guild_channels(guild)
+    return picked, lines
+
+class FriendSetupPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    async def _quick_create(self, interaction: discord.Interaction, scope: str):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_defer(interaction, ephemeral=True)
+        guild = interaction.guild
+        label = scope
+        lines = []
+
+        if scope == "auto":
+            label = "서버맞춤 자동"
+            picked_scopes, auto_lines = await create_friend_server_auto_profile(guild)
+            lines.append("선택된 범위: " + (", ".join(picked_scopes) if picked_scopes else "기본"))
+            lines.extend(auto_lines)
+        elif scope == "all":
+            label = "전체"
+            created_roles, deleted_roles, skipped_delete_roles, updated_roles = await create_friend_roles(guild)
+            _, created_log_channels = await ensure_log_category_channels(guild)
+            layout = await create_friend_server_layout(guild)
+            _, created_stats_channels = await ensure_server_stats_channels(guild)
+            lines.append(
+                f"🎭 역할: 기존 삭제 `{len(deleted_roles)}`개 / 새로 생성 `{len(created_roles)}`개 / "
+                f"삭제 못함 `{len(skipped_delete_roles)}`개 / 권한 정리 `{len(updated_roles)}`개"
+            )
+            lines.append(
+                f"📦 기본카테고리: 필독 {_panel_channel_text(layout.get('rule_category') if layout else None)} / "
+                f"인사-퇴장 {_panel_channel_text(layout.get('welcome_channel') if layout else None)} / "
+                f"인증 {_panel_channel_text(layout.get('verify_channel') if layout else None)} / "
+                f"자기소개 {_panel_channel_text(layout.get('intro_channel') if layout else None)}"
+            )
+            lines.append(f"📁 로그: 새 로그 채널 `{len(created_log_channels)}`개 확인")
+            lines.append(f"📊 서버스텟: 스텟 채널 `{created_stats_channels}`개 확인")
+            lines.append(
+                f"🎫 티켓: {_panel_channel_text(layout.get('ticket_panel_channel') if layout else None)} / "
+                f"🎵 뮤직: {_panel_channel_text(layout.get('music_command_channel') if layout else None)} / "
+                f"🔊 TTS: {_panel_channel_text(layout.get('tts_text_channel') if layout else None)}"
+            )
+        elif scope == "game":
+            label = "게임방"
+            game_layout = await create_game_category_channels(guild)
+            lines.append(
+                f"🎮 게임방: {_panel_channel_text(game_layout.get('game_category'))} / "
+                f"게임채팅 {_panel_channel_text(game_layout.get('game_chat_channel'))} / "
+                f"발로란트 티어표 {_panel_channel_text(game_layout.get('valorant_tier_channel'))} / "
+                f"롤 티어표 {_panel_channel_text(game_layout.get('lol_tier_channel'))} / "
+                f"발로란트 통방 `{len(game_layout.get('valorant_voice_channels') or [])}`개 / "
+                f"롤 통방 `{len(game_layout.get('lol_voice_channels') or [])}`개 / "
+                f"패널 {'새로 전송됨' if game_layout.get('game_role_panel_sent') else '이미 있음'}"
+            )
+        elif scope == "scrim":
+            label = "내전방"
+            scrim_layout = await create_scrim_category_channels(guild)
+            lines.append(
+                f"⚔️ 내전방: {_panel_channel_text(scrim_layout.get('scrim_category'))} / "
+                f"내전채널 {_panel_channel_text(scrim_layout.get('scrim_text_channel'))} / "
+                "대기실·팀 음성 생성/복구 완료"
+            )
+        elif scope == "gambling":
+            label = "도박방"
+            gambling_layout = await create_gambling_category_channels(guild, send_guide=True)
+            lines.append(
+                f"🎲 도박방: {_panel_channel_text(gambling_layout.get('gambling_category'))} / "
+                f"주사위 {_panel_channel_text(gambling_layout.get('dice_channel'))} / "
+                f"룰렛 {_panel_channel_text(gambling_layout.get('roulette_channel'))} / "
+                f"마크 {_panel_channel_text(gambling_layout.get('mark_channel'))} / "
+                f"소개팅 {_panel_channel_text(gambling_layout.get('dating_channel'))}"
+            )
+        elif scope == "enhance":
+            label = "강화방"
+            enhance_layout = await create_enhance_category_channels(guild, send_guide=True)
+            lines.append(
+                f"⚒️ 강화방: {_panel_channel_text(enhance_layout.get('enhance_category'))} / "
+                f"강화채널 {_panel_channel_text(enhance_layout.get('enhance_channel'))} / "
+                f"안내 {'새로 전송됨' if enhance_layout.get('enhance_guide_sent') else '이미 있음'}"
+            )
+        elif scope == "birthday":
+            label = "생일방"
+            birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
+            lines.append(
+                f"🎂 생일방: {_panel_channel_text(birthday_category)} / "
+                f"생일등록 {_panel_channel_text(birthday_register_channel)} / "
+                f"생일기록 {_panel_channel_text(birthday_record_channel)} / 패널·기록 새로고침 완료"
+            )
+        elif scope == "bot_shop":
+            label = "봇명령어/상점"
+            bot_command_layout = await create_bot_command_category_channels(guild, send_guides=True)
+            lines.append(
+                f"🤖 봇명령어: {_panel_channel_text(bot_command_layout.get('bot_command_channel'))} / "
+                f"🛒 상점: {_panel_channel_text(bot_command_layout.get('shop_channel'))} / "
+                f"💰 포인트: {_panel_channel_text(bot_command_layout.get('point_channel'))} / "
+                f"📈 주식: {_panel_channel_text(bot_command_layout.get('stock_channel'))}"
+            )
+        elif scope == "music":
+            label = "뮤직"
+            music_layout = await create_music_category_channels(guild, send_panel=True)
+            lines.append(
+                f"🎵 뮤직: {_panel_channel_text(music_layout.get('music_command_channel'))} / "
+                f"현재재생 {_panel_channel_text(music_layout.get('music_now_playing_channel'))} / "
+                f"대기열 {_panel_channel_text(music_layout.get('music_queue_channel'))} / "
+                f"패널 {'새로 전송됨' if music_layout.get('music_panel_sent') else '이미 있음'}"
+            )
+        elif scope == "tts":
+            label = "TTS"
+            _, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
+            lines.append(
+                f"🔊 TTS: {_panel_channel_text(tts_text_channel)} / "
+                f"음성 {_panel_channel_text(tts_voice_channel)} / "
+                f"안내 {'새로 전송됨' if tts_guide_sent else '이미 있음'}"
+            )
+        elif scope == "ticket":
+            label = "티켓"
+            ticket_category, ticket_panel_channel, ticket_log_channel, panel_sent = await create_ticket_category_channels(guild, send_panel=True)
+            await apply_member_category_permissions(guild, ticket_category)
+            lines.append(
+                f"🎫 티켓: 카테고리 {_panel_channel_text(ticket_category)} / "
+                f"패널 {_panel_channel_text(ticket_panel_channel)} / "
+                f"로그 {_panel_channel_text(ticket_log_channel)} / "
+                f"패널 {'새로 전송됨' if panel_sent else '이미 있음'}"
+            )
+        elif scope == "boost":
+            label = "서버부스트"
+            rule_category = await get_or_create_category(guild, "📌 필독")
+            boost_channel = await get_or_create_text_channel(guild, "🚀-서버부스트", rule_category)
+            await apply_rule_category_permissions(guild, rule_category)
+            save_guild_channel_ids(guild, boost_channel_id=boost_channel, welcome_category_id=rule_category, rule_category_id=rule_category)
+            lines.append(f"🚀 서버부스트: {_panel_channel_text(boost_channel)} 채널 생성/복구 완료")
+        elif scope == "logs":
+            label = "로그"
+            _, created_log_channels = await ensure_log_category_channels(guild)
+            lines.append(f"📁 로그 카테고리: 새 로그 채널 `{len(created_log_channels)}`개")
+        elif scope == "stats":
+            label = "서버스텟"
+            _, created_stats_channels = await ensure_server_stats_channels(guild)
+            lines.append(f"📊 서버스텟: 스텟 채널 `{created_stats_channels}`개 확인")
+        elif scope == "devlog":
+            label = "개발로그"
+            if is_official_support_guild(guild):
+                devlog_result = await ensure_development_log_channels(guild)
+                await send_development_log_intro_embeds(guild)
+                lines.append(f"📈 개발로그: 공식 지원 서버 확인 / 새로 생성 `{len(devlog_result.get('created', []))}`개 / 안내패널 준비")
+            else:
+                lines.append("📈 개발로그: 공식 지원 서버에서만 생성됩니다. `OFFICIAL_SUPPORT_GUILD_ID`를 공식 지원 서버 ID로 설정해주세요.")
+        else:
+            label = "기본카테고리"
+            layout = await create_friend_server_layout(guild)
+            lines.append(
+                f"📦 기본카테고리: 필독 {_panel_channel_text(layout.get('rule_category') if layout else None)} / "
+                f"인사-퇴장 {_panel_channel_text(layout.get('welcome_channel') if layout else None)} / "
+                f"부스트알림 {_panel_channel_text(layout.get('boost_channel') if layout else None)} / "
+                f"인증 {_panel_channel_text(layout.get('verify_channel') if layout else None)}"
+            )
+
+        save_detected_guild_channels(guild)
+        embed = build_friend_scope_result_embed("🌸 친목섭 박스 생성 완료", label, lines, FRIEND_SERVER_COLORS.get("main", BOT_COLOR))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_log(guild, f"🌸 친목섭 박스 생성\n범위: {label}\n관리자: {interaction.user.mention}", "general")
+
+    @discord.ui.button(label="전체", emoji="🌸", style=discord.ButtonStyle.green, row=0)
+    async def all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "all")
+
+    @discord.ui.button(label="역할만", emoji="🎭", style=discord.ButtonStyle.green, row=0)
+    async def roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_edit(interaction, embed=build_friend_role_scope_panel_embed(interaction.guild), view=FriendRoleScopePanelView())
+
+    @discord.ui.button(label="기본카테고리", emoji="📦", style=discord.ButtonStyle.green, row=0)
+    async def basic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _friend_panel_require_manager(interaction):
+            return
+        await safe_interaction_edit(interaction, embed=build_friend_basic_scope_panel_embed(interaction.guild), view=FriendBasicCategoryPanelView())
+
+    @discord.ui.button(label="게임방", emoji="🎮", style=discord.ButtonStyle.blurple, row=1)
+    async def game_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "game")
+
+    @discord.ui.button(label="내전방", emoji="⚔️", style=discord.ButtonStyle.blurple, row=1)
+    async def scrim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "scrim")
+
+    @discord.ui.button(label="도박방", emoji="🎲", style=discord.ButtonStyle.blurple, row=1)
+    async def gambling_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "gambling")
+
+    @discord.ui.button(label="강화방", emoji="⚒️", style=discord.ButtonStyle.blurple, row=1)
+    async def enhance_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "enhance")
+
+    @discord.ui.button(label="생일방", emoji="🎂", style=discord.ButtonStyle.blurple, row=1)
+    async def birthday_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "birthday")
+
+    @discord.ui.button(label="봇명령어/상점", emoji="🤖", style=discord.ButtonStyle.blurple, row=2)
+    async def bot_shop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "bot_shop")
+
+    @discord.ui.button(label="뮤직", emoji="🎵", style=discord.ButtonStyle.blurple, row=2)
+    async def music_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "music")
+
+    @discord.ui.button(label="TTS", emoji="🔊", style=discord.ButtonStyle.blurple, row=2)
+    async def tts_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "tts")
+
+    @discord.ui.button(label="티켓", emoji="🎫", style=discord.ButtonStyle.gray, row=2)
+    async def ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "ticket")
+
+    @discord.ui.button(label="서버부스트", emoji="🚀", style=discord.ButtonStyle.gray, row=2)
+    async def boost_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "boost")
+
+    @discord.ui.button(label="로그", emoji="📁", style=discord.ButtonStyle.gray, row=3)
+    async def logs_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "logs")
+
+    @discord.ui.button(label="서버스텟", emoji="📊", style=discord.ButtonStyle.gray, row=3)
+    async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "stats")
+
+    @discord.ui.button(label="개발로그", emoji="📈", style=discord.ButtonStyle.gray, row=3)
+    async def devlog_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "devlog")
+
+    @discord.ui.button(label="서버맞춤", emoji="🧭", style=discord.ButtonStyle.green, row=4)
+    async def auto_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._quick_create(interaction, "auto")
+
 # 통합 하위명령어로 이동됨: @bot.tree.command(name="역할자동생성", description="친목섭 기본 역할을 자동으로 생성합니다.")
-async def create_friend_roles_command(interaction: discord.Interaction):
+async def create_friend_roles_command(interaction: discord.Interaction, 생성범위: app_commands.Choice[str] = None):
     if await reject_if_not_setup_manager(interaction):
         return
     if await reject_if_not_bot_manager(interaction):
@@ -8473,27 +10600,40 @@ async def create_friend_roles_command(interaction: discord.Interaction):
     if guild is None:
         return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
 
+    if 생성범위 is None:
+        return await open_friend_role_scope_panel(interaction)
+
     await safe_interaction_defer(interaction, ephemeral=True)
-    created, deleted, skipped_delete, updated = await create_friend_roles(guild)
+    scope = 생성범위.value
+    role_scope_labels = FRIEND_ROLE_SCOPE_LABELS
+    created, deleted, skipped_delete, updated = await create_friend_roles(guild, scope=scope)
+    scope_label = role_scope_labels.get(scope, "전체")
 
     await interaction.followup.send(
         f"✅ 역할 자동 생성을 완료했습니다.\n"
+        f"생성범위: **{scope_label}**\n"
         f"기존 삭제: **{len(deleted)}개**\n"
         f"새로 생성: **{len(created)}개**\n"
         f"삭제 못한 역할: **{len(skipped_delete)}개**\n"
         f"권한 정리: **{len(updated)}개**",
         ephemeral=True
     )
-    await send_log(guild, f"🎭 역할 자동 생성/확인\n관리자: {interaction.user.mention}\n기존 삭제: {len(deleted)}개\n새로 생성: {len(created)}개\n삭제 못한 역할: {len(skipped_delete)}개\n권한 정리: {len(updated)}개", "general")
+    await send_log(guild, f"🎭 역할 자동 생성/확인\n범위: {scope_label}\n관리자: {interaction.user.mention}\n기존 삭제: {len(deleted)}개\n새로 생성: {len(created)}개\n삭제 못한 역할: {len(skipped_delete)}개\n권한 정리: {len(updated)}개", "general")
 
 
 
 # 통합 하위명령어로 이동됨: @bot.tree.command(name="친목섭", description="친목섭 역할/카테고리/채널을 선택해서 자동 생성합니다.")
 @app_commands.describe(생성범위="생성할 친목섭 묶음을 선택하세요.")
 @app_commands.choices(생성범위=[
+    app_commands.Choice(name="서버맞춤 자동", value="auto"),
     app_commands.Choice(name="전체", value="all"),
-    app_commands.Choice(name="역할만", value="roles"),
-    app_commands.Choice(name="기본카테고리", value="basic"),
+    app_commands.Choice(name="역할만 패널", value="roles"),
+    app_commands.Choice(name="기본카테고리 패널", value="basic"),
+    app_commands.Choice(name="게임방", value="game"),
+    app_commands.Choice(name="내전방", value="scrim"),
+    app_commands.Choice(name="강화방", value="enhance"),
+    app_commands.Choice(name="도박방", value="gambling"),
+    app_commands.Choice(name="생일", value="birthday"),
     app_commands.Choice(name="서버부스트", value="boost"),
     app_commands.Choice(name="로그", value="logs"),
     app_commands.Choice(name="서버스텟", value="stats"),
@@ -8513,12 +10653,26 @@ async def create_friend_server(interaction: discord.Interaction, 생성범위: a
     if guild is None:
         return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
 
+    if 생성범위 is None:
+        return await open_friend_setup_panel(interaction)
+
+    scope = 생성범위.value
+    if scope == "roles":
+        return await open_friend_role_scope_panel(interaction)
+    if scope == "basic":
+        return await open_friend_basic_category_panel(interaction)
+
     await safe_interaction_defer(interaction, ephemeral=True)
-    scope = 생성범위.value if 생성범위 else "all"
     scope_labels = {
+        "auto": "서버맞춤 자동",
         "all": "전체",
         "roles": "역할만",
         "basic": "기본카테고리",
+        "game": "게임방",
+        "scrim": "내전방",
+        "enhance": "강화방",
+        "gambling": "도박방",
+        "birthday": "생일",
         "boost": "서버부스트",
         "logs": "로그",
         "stats": "서버스텟",
@@ -8529,11 +10683,67 @@ async def create_friend_server(interaction: discord.Interaction, 생성범위: a
         "devlog": "개발로그",
     }
 
+    if scope == "auto":
+        picked_scopes, result_lines = await create_friend_server_auto_profile(guild)
+        embed = build_friend_scope_result_embed(
+            "🌸 친목섭 서버맞춤 생성 완료",
+            "서버맞춤 자동",
+            [
+                "선택된 범위: " + (", ".join(picked_scopes) if picked_scopes else "기본"),
+                *result_lines,
+            ],
+            FRIEND_SERVER_COLORS.get("main", BOT_COLOR),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_log(guild, f"🌸 친목섭 서버맞춤 생성\n범위: {', '.join(picked_scopes)}\n관리자: {interaction.user.mention}", "general")
+        return
+
     if scope != "all":
         result_lines = []
         if scope == "roles":
             created, deleted, skipped_delete, updated = await create_friend_roles(guild)
             result_lines.append(f"🎭 역할: 새로 생성 `{len(created)}`개 / 정리 `{len(updated)}`개 / 삭제 못함 `{len(skipped_delete)}`개")
+        elif scope == "game":
+            game_layout = await create_game_category_channels(guild)
+            result_lines.append(
+                f"🎮 게임방: {game_layout.get('game_category').mention if game_layout.get('game_category') else '미설정'} / "
+                f"게임채팅 {game_layout.get('game_chat_channel').mention if game_layout.get('game_chat_channel') else '미설정'} / "
+                f"발로란트 티어표 {game_layout.get('valorant_tier_channel').mention if game_layout.get('valorant_tier_channel') else '미설정'} / "
+                f"롤 티어표 {game_layout.get('lol_tier_channel').mention if game_layout.get('lol_tier_channel') else '미설정'} / "
+                f"발로란트 통방 `{len(game_layout.get('valorant_voice_channels') or [])}`개 / "
+                f"롤 통방 `{len(game_layout.get('lol_voice_channels') or [])}`개 / "
+                f"패널 {'새로 전송됨' if game_layout.get('game_role_panel_sent') else '이미 있음'}"
+            )
+        elif scope == "scrim":
+            scrim_layout = await create_scrim_category_channels(guild)
+            result_lines.append(
+                f"⚔️ 내전방: {scrim_layout.get('scrim_category').mention if scrim_layout.get('scrim_category') else '미설정'} / "
+                f"내전채널 {scrim_layout.get('scrim_text_channel').mention if scrim_layout.get('scrim_text_channel') else '미설정'} / "
+                "대기실·팀 음성 생성/복구 완료"
+            )
+        elif scope == "enhance":
+            enhance_layout = await create_enhance_category_channels(guild, send_guide=True)
+            result_lines.append(
+                f"⚒️ 강화방: {enhance_layout.get('enhance_category').mention if enhance_layout.get('enhance_category') else '미설정'} / "
+                f"강화채널 {enhance_layout.get('enhance_channel').mention if enhance_layout.get('enhance_channel') else '미설정'} / "
+                f"안내 {'새로 전송됨' if enhance_layout.get('enhance_guide_sent') else '이미 있음'}"
+            )
+        elif scope == "gambling":
+            gambling_layout = await create_gambling_category_channels(guild, send_guide=True)
+            result_lines.append(
+                f"🎲 도박방: {gambling_layout.get('gambling_category').mention if gambling_layout.get('gambling_category') else '미설정'} / "
+                f"주사위 {gambling_layout.get('dice_channel').mention if gambling_layout.get('dice_channel') else '미설정'} / "
+                f"룰렛 {gambling_layout.get('roulette_channel').mention if gambling_layout.get('roulette_channel') else '미설정'} / "
+                f"마크 {gambling_layout.get('mark_channel').mention if gambling_layout.get('mark_channel') else '미설정'} / "
+                f"소개팅 {gambling_layout.get('dating_channel').mention if gambling_layout.get('dating_channel') else '미설정'}"
+            )
+        elif scope == "birthday":
+            birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
+            result_lines.append(
+                f"🎂 생일방: {birthday_category.mention if birthday_category else '미설정'} / "
+                f"생일등록 {birthday_register_channel.mention if birthday_register_channel else '미설정'} / "
+                f"생일기록 {birthday_record_channel.mention if birthday_record_channel else '미설정'} / 패널·기록 새로고침 완료"
+            )
         elif scope == "boost":
             rule_category = await get_or_create_category(guild, "📌 필독")
             boost_channel = await get_or_create_text_channel(guild, "🚀-서버부스트", rule_category)
@@ -8619,7 +10829,7 @@ async def create_friend_server(interaction: discord.Interaction, 생성범위: a
     await send_log(guild, f"🌸 친목섭 자동 세팅 완료\n관리자: {interaction.user.mention}\n역할 생성: {len(created_roles)}개\n권한 정리: {len(updated_roles)}개", "general")
 
 
-# 통합 하위명령어로 이동됨: @bot.tree.command(name="기본카테고리생성", description="인사/퇴장, 필독, 상점, 채팅, 음성, 게임, 뮤직, 봇명령어, 내전, 버스킹, 수위, 잠수방을 생성합니다.")
+# 통합 하위명령어로 이동됨: @bot.tree.command(name="기본카테고리생성", description="인사/퇴장, 필독, 상점, 채팅, 음성, 게임, 도박, 강화, 뮤직, 봇명령어, 내전, 잠수방을 생성합니다.")
 async def create_default_server_categories(interaction: discord.Interaction):
     if await reject_if_not_setup_manager(interaction):
         return
@@ -8669,12 +10879,10 @@ async def create_default_server_categories(interaction: discord.Interaction):
     requested_voice_layout = await create_requested_voice_layout(guild)
     voice_category = requested_voice_layout.get("voice_category")
 
-    game_category = await get_or_create_category(guild, "🎮 게임방")
-    await apply_member_category_permissions(guild, game_category)
-    await get_or_create_text_channel(guild, "🎮-게임채팅", game_category)
-    game_role_channel = await get_or_create_text_channel(guild, "🎮-게임역할선택", game_category)
-    game_role_panel_sent = await send_game_role_panel_to_channel(game_role_channel)
-    await get_or_create_voice_channel(guild, "🎮 게임 음성 1", game_category)
+    game_layout = await create_game_category_channels(guild)
+    game_category = game_layout.get("game_category")
+    game_role_channel = game_layout.get("game_role_channel")
+    game_role_panel_sent = game_layout.get("game_role_panel_sent")
 
     bot_command_layout = await create_bot_command_category_channels(guild, send_guides=True)
 
@@ -8682,12 +10890,15 @@ async def create_default_server_categories(interaction: discord.Interaction):
     music_command_channel = music_layout.get("music_command_channel")
     bot_command_channel = bot_command_layout.get("bot_command_channel")
     attendance_channel = bot_command_layout.get("attendance_channel")
-    enhance_channel = bot_command_layout.get("enhance_channel")
+    enhance_layout = await create_enhance_category_channels(guild, send_guide=True)
+    enhance_channel = enhance_layout.get("enhance_channel")
     shop_category = bot_command_layout.get("shop_category")
     shop_channel = bot_command_layout.get("shop_channel")
     point_channel = bot_command_layout.get("point_channel")
 
     tts_category, tts_text_channel, tts_voice_channel, tts_guide_sent = await create_tts_category_channels(guild)
+
+    gambling_layout = await create_gambling_category_channels(guild, send_guide=True)
 
     # 요청한 내전방/버스킹/수위방/이벤트/2인실/개인방/잠수방은 create_requested_voice_layout에서 생성됩니다.
     birthday_category, birthday_register_channel, birthday_record_channel = await create_birthday_channels(guild)
@@ -8862,7 +11073,7 @@ def get_or_create_voice_level_user(user_id: int):
 
 
 async def add_voice_level_exp(member: discord.Member, seconds: int):
-    """음성방에 머문 시간만큼 음성 EXP를 지급하고 레벨업은 레벨로그에 기록합니다."""
+    """음성방에 머문 시간만큼 음성 EXP를 지급하고, 채팅 레벨업과 같은 레벨업 채널에 표시합니다."""
     if member.bot or member.guild is None:
         return
 
@@ -8892,10 +11103,10 @@ async def add_voice_level_exp(member: discord.Member, seconds: int):
     conn.commit()
 
     if leveled:
-        await send_log(
-            member.guild,
-            f"🎉 음성 레벨업!\n유저: {member.mention}\n음성 레벨: Lv.{old_level} → Lv.{level}\n획득 EXP: +{exp_gain}",
-            "level"
+        await send_public_levelup_announcement(
+            member,
+            "🎉 음성 레벨업!",
+            f"{member.mention} 님의 음성 레벨이 **Lv.{old_level} → Lv.{level}** 로 올랐어요!\n획득 EXP: `+{exp_gain}`",
         )
 
 
@@ -9503,6 +11714,7 @@ async def on_ready():
                 BirthdayPanelCompatView,
                 UltimateCenterView,
                 ShopView,
+                MNBAlertPanelView,
                 DevAlertRoleView,
             ]:
                 try:
@@ -9537,7 +11749,7 @@ async def on_ready():
 
         for guild in list(bot.guilds):
             try:
-                shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=True)
+                shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=not (MNB_FREE_CHANNEL_MODE and MNB_SHOP_CURRENT_CHANNEL_MODE))
                 if shop_result.get("panel_changed"):
                     channel = shop_result.get("channel")
                     channel_name = getattr(channel, "name", "미확인")
@@ -9862,8 +12074,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         elif before.channel is not None and after.channel is not None:
             await send_log(member.guild, f"🔁 음성 이동\n유저: {member.mention}\n이전: {before.channel.mention}\n이후: {after.channel.mention}", "voice")
 
-        # TTS 통방 자동 입장: 유저가 TTS 통방에 들어오면 TTS 서브봇을 조용히 입장시킵니다.
-        if not member.bot and after.channel and after.channel.name in TTS_VOICE_CHANNEL_NAMES:
+        # TTS 자동 입장: 자유 채널 모드에서는 유저가 들어간 음성 채널로 바로 입장할 수 있습니다.
+        # 단, 실제 읽기는 채팅 입력 또는 /입장으로 시작되므로 여기서는 기존 TTS 통방 자동 입장만 유지합니다.
+        if not member.bot and after.channel and (after.channel.name in TTS_VOICE_CHANNEL_NAMES):
             try:
                 await ensure_tts_subbot_join_voice(member.guild, after.channel)
             except Exception as e:
@@ -10029,26 +12242,49 @@ async def enhance_biweekly_reset_checker():
             pass
 
 def get_enhance_rates(level: int, success_bonus: int = 0, destroy_reduction: int = 0):
-    """강화 단계별 확률을 계산합니다."""
+    """강화 단계별 확률을 계산합니다.
+
+    v216 밸런스 상향:
+    - 최대 +150강 기준이라 초중반 성공률을 크게 올렸습니다.
+    - 기존에는 +10강 근처가 강화확률업권(+15%)을 써도 45%라 너무 빡셌습니다.
+    - 이제 +6~+10 구간은 기본 70%, 확률업권 사용 시 85%로 적용됩니다.
+    - 고강 구간도 10% 고정이 아니라 단계별로 천천히 낮아집니다.
+    """
     level = max(0, int(level or 0))
 
-    if level <= 2:
-        base_success, base_fail, base_down, base_destroy = 80, 20, 0, 0
-    elif level <= 5:
-        base_success, base_fail, base_down, base_destroy = 60, 30, 10, 0
-    elif level <= 8:
-        base_success, base_fail, base_down, base_destroy = 45, 30, 20, 5
-    elif level <= 11:
-        base_success, base_fail, base_down, base_destroy = 30, 35, 25, 10
-    elif level <= 14:
-        base_success, base_fail, base_down, base_destroy = 20, 35, 30, 15
-    else:
-        base_success, base_fail, base_down, base_destroy = 10, 30, 35, 25
+    # 현재 강화 단계 기준 확률입니다. 예: level 10이면 +10 -> +11 시도 확률.
+    # 형식: (최대 현재 단계, 성공, 실패, 하락, 파괴)
+    rate_tiers = [
+        (2, 95, 5, 0, 0),
+        (5, 88, 10, 2, 0),
+        (10, 70, 20, 10, 0),
+        (20, 62, 22, 14, 2),
+        (30, 55, 25, 17, 3),
+        (40, 48, 27, 20, 5),
+        (50, 42, 30, 22, 6),
+        (60, 36, 32, 24, 8),
+        (70, 31, 34, 25, 10),
+        (80, 27, 35, 26, 12),
+        (90, 23, 36, 27, 14),
+        (100, 20, 38, 27, 15),
+        (110, 17, 39, 28, 16),
+        (120, 14, 40, 29, 17),
+        (130, 12, 41, 29, 18),
+        (140, 10, 42, 29, 19),
+        (ENHANCE_MAX_LEVEL, 8, 43, 29, 20),
+    ]
+
+    base_success, base_fail, base_down, base_destroy = rate_tiers[-1][1:]
+    for max_level, tier_success, tier_fail, tier_down, tier_destroy in rate_tiers:
+        if level <= max_level:
+            base_success, base_fail, base_down, base_destroy = tier_success, tier_fail, tier_down, tier_destroy
+            break
 
     success = min(95, base_success + max(0, int(success_bonus or 0)))
     destroy = max(0, base_destroy - max(0, int(destroy_reduction or 0)))
 
-    # 성공/파괴 보정 후 남은 확률을 실패와 하락에 분배
+    # 성공/파괴 보정 후 남은 확률을 실패와 하락에 분배합니다.
+    # 이렇게 해야 역할 부스트/확률업권을 써도 전체 합계가 항상 100%로 맞습니다.
     remain = max(0, 100 - success - destroy)
     down_ratio = base_down / max(1, base_fail + base_down)
     down = int(round(remain * down_ratio))
@@ -10359,7 +12595,7 @@ async def speak_tts_in_voice(member: discord.Member, text: str, text_channel: di
 
     voice_channel = find_auto_tts_voice_channel(member, text_channel)
     if voice_channel is None:
-        return False, "❌ TTS 통방을 찾을 수 없습니다. 먼저 `/tts카테고리생성`을 실행해주세요."
+        return False, "❌ 먼저 원하는 음성 채널에 들어간 뒤 채팅을 치거나 `/입장`을 사용해주세요."
 
     text = (text or "").strip()
     if not text:
@@ -10634,40 +12870,10 @@ async def create_enhance_channel_command(interaction: discord.Interaction):
     await safe_interaction_defer(interaction, ephemeral=True)
     guild = interaction.guild
 
-    category = await get_or_create_category(guild, ENHANCE_CATEGORY_NAME)
-
-    # 강화방은 일반 유저가 보고 사용할 수 있게 열어두고, 봇은 메시지/임베드/버튼을 사용할 수 있게 합니다.
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            use_application_commands=True
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_channels=True,
-            embed_links=True,
-            attach_files=True
-        ),
-    }
-    try:
-        await category.edit(overwrites=overwrites)
-    except discord.HTTPException:
-        pass
-
-    channel = await get_or_create_text_channel(guild, ENHANCE_CHANNEL_NAME, category)
-    try:
-        await channel.edit(
-            topic="⚒️ 강화 전용 채널입니다. /강화 아이템 또는 !강화 명령어로 아이템을 강화하세요.",
-            overwrites=overwrites
-        )
-    except discord.HTTPException:
-        pass
-
-    guide_sent = await send_enhance_guide_to_channel(channel)
+    enhance_layout = await create_enhance_category_channels(guild, send_guide=True)
+    category = enhance_layout.get("enhance_category")
+    channel = enhance_layout.get("enhance_channel")
+    guide_sent = enhance_layout.get("enhance_guide_sent")
 
     await interaction.followup.send(
         f"✅ 강화 채널 생성/정리 완료!\n"
@@ -10700,7 +12906,7 @@ async def create_tts_category_command(interaction: discord.Interaction):
         f"채팅방: {tts_text_channel.mention}\n"
         f"통방 3개: {' / '.join(voice_mentions) if voice_mentions else '미설정'}\n"
         f"안내메시지: {'새로 전송됨' if guide_sent else '이미 있음'}\n\n"
-        "이제 TTS 통방에 들어간 뒤 `🔊-tts` 채팅방에 글을 쓰면 봇이 자동으로 들어와서 읽어줍니다.",
+        "이제 원하는 음성 채널에 들어간 뒤 아무 텍스트 채널에서나 채팅을 치면 봇이 자동으로 들어와서 읽어줍니다. `/입장`과 `/퇴장`도 바로 사용할 수 있어요.",
         ephemeral=True
     )
     await send_log(interaction.guild, f"🔊 TTS 카테고리 생성\n관리자: {interaction.user.mention}\n채팅방: {tts_text_channel.mention}", "voice")
@@ -10731,6 +12937,8 @@ async def tts_join_command(interaction: discord.Interaction):
     try:
         voice_client, connect_error = await connect_tts_voice_client(interaction.guild, voice_channel)
         if connect_error:
+            if mnb_should_hide_tts_error(connect_error):
+                return await safe_interaction_send(interaction, "✅ TTS 서브봇이 서버에 없어서 조용히 무시했어요.", ephemeral=True)
             return await safe_interaction_send(interaction, connect_error, ephemeral=True)
         bot_label = "TTS 서브봇" if TTS_BOT_TOKEN else "메인 봇"
         await safe_interaction_send(interaction, f"✅ {bot_label}이 {voice_channel.mention} 채널에 입장했습니다.", ephemeral=True)
@@ -10765,6 +12973,18 @@ async def tts_leave_command(interaction: discord.Interaction):
         await send_log(interaction.guild, f"👋 TTS 퇴장\n봇: {bot_label}\n유저: {interaction.user.mention}\n채널: `{channel_name}`", "voice")
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 퇴장 실패: `{e}`", ephemeral=True)
+
+
+# 유저 편의용 최상위 TTS 명령어 별칭입니다.
+# /음성 입장·/음성 퇴장도 유지하고, /입장·/퇴장으로 바로 사용할 수 있게 합니다.
+@bot.tree.command(name="입장", description="TTS 봇을 내가 있는 음성 채널로 부릅니다.")
+async def tts_join_top_alias(interaction: discord.Interaction):
+    await tts_join_command(interaction)
+
+
+@bot.tree.command(name="퇴장", description="TTS 봇을 음성 채널에서 내보냅니다.")
+async def tts_leave_top_alias(interaction: discord.Interaction):
+    await tts_leave_command(interaction)
 
 
 # 통합 하위명령어로 이동됨: # v192 슬래시 100개 제한 안정화: 통합 그룹 명령어로만 등록됨
@@ -10855,6 +13075,10 @@ def parse_music_chat_request(content: str):
     - 1번 사클: 제목
     - 2 유튜브: 제목
     - 제목만 입력하면 기본값은 SoundCloud 제목 검색
+
+    v218: 원하는 채널 사용 모드에서는 일반 대화가 노래로 오인되지 않도록
+    `사클:` / `유튜브:` / `1번 사클:` 같은 명확한 접두어가 있을 때만
+    모든 채널에서 바로 재생합니다.
     """
     raw = (content or "").strip()
     if not raw or raw.startswith(("!", ".", "/")):
@@ -10866,15 +13090,19 @@ def parse_music_chat_request(content: str):
     if normalize_music_chat_name(lowered) in {normalize_music_chat_name(w) for w in MUSIC_CHAT_SKIP_WORDS}:
         return None
 
+    explicit_prefix = False
     requested_slot = None
     slot_match = re.match(r"^\s*(?:커스텀\s*)?([123])\s*(?:번)?\s*[:：\-]?\s+(.+)$", raw)
     if slot_match:
         requested_slot = int(slot_match.group(1))
         raw = slot_match.group(2).strip()
         lowered = raw.lower().strip()
+        explicit_prefix = True
 
     # parse_music_source_prefix는 `사클:` / `유튜브:` 접두어를 처리합니다.
     source, query = parse_music_source_prefix(raw)
+    if source:
+        explicit_prefix = True
 
     if not source:
         source_words = [
@@ -10886,6 +13114,7 @@ def parse_music_chat_request(content: str):
                 if lowered.startswith(prefix):
                     source = source_name
                     query = raw[len(prefix):].strip()
+                    explicit_prefix = True
                     break
             if source:
                 break
@@ -10898,7 +13127,7 @@ def parse_music_chat_request(content: str):
     if not query or normalize_music_chat_name(query) in {normalize_music_chat_name(w) for w in MUSIC_CHAT_SKIP_WORDS}:
         return None
 
-    return {"slot": requested_slot, "source": source, "query": query}
+    return {"slot": requested_slot, "source": source, "query": query, "explicit": explicit_prefix}
 
 
 def is_main_music_chat_channel(guild: discord.Guild, channel):
@@ -10957,6 +13186,11 @@ def find_custom_music_slot_for_chat(message: discord.Message, requested_slot: in
         if not vc or not getattr(vc, "channel", None):
             continue
         if int(vc.channel.id) != int(author_voice.id):
+            continue
+        # 원하는 채널 사용 모드: 같은 통방에 들어가 있기만 하면
+        # `1번 사클: 제목` 같은 명령을 어느 텍스트 채널에서나 사용할 수 있습니다.
+        if MNB_FREE_CHANNEL_MODE and MNB_MUSIC_EXPLICIT_ANY_CHANNEL:
+            matched.append(int(slot))
             continue
         if is_channel_for_custom_music_chat(message.guild, int(slot), message.channel, vc.channel):
             matched.append(int(slot))
@@ -11064,6 +13298,7 @@ async def maybe_play_music_from_chat_message(message: discord.Message):
     requested_slot = parsed["slot"]
     source = parsed["source"]
     query = parsed["query"]
+    explicit_prefix = bool(parsed.get("explicit"))
 
     # 1순위: 커스텀 봇 패널/통방 채팅채널
     slot, slot_error = find_custom_music_slot_for_chat(message, requested_slot)
@@ -11074,7 +13309,9 @@ async def maybe_play_music_from_chat_message(message: discord.Message):
         return True
 
     # 2순위: 메인 뮤직 채널
-    if is_main_music_chat_channel(message.guild, message.channel):
+    # `사클: 제목`, `유튜브: 제목`처럼 명확한 접두어가 있으면
+    # 뮤직 전용 채널을 만들지 않아도 현재 채널에서 바로 사용할 수 있습니다.
+    if is_main_music_chat_channel(message.guild, message.channel) or (MNB_FREE_CHANNEL_MODE and MNB_MUSIC_EXPLICIT_ANY_CHANNEL and explicit_prefix):
         return await play_main_music_from_chat(message, query, source)
 
     return False
@@ -11154,21 +13391,38 @@ async def on_message(message: discord.Message):
         await mnb_v212_process_commands_once(message)
         return
 
-    if message.channel.name in TTS_CHANNEL_NAMES and not message.content.startswith(("!", ".", "/")):
-        ok, tts_message = await speak_tts_in_voice(message.author, message.content, message.channel)
-        if not ok:
-            try:
-                await message.channel.send(tts_message, delete_after=6)
-            except discord.HTTPException:
-                pass
-        else:
-            await send_log(message.guild, f"🔊 TTS 채널 자동 재생\n유저: {message.author.mention}\n채널: {message.channel.mention}", "voice")
-        return
-
     # 뮤직패널 채팅채널에서는 버튼을 누르지 않아도 채팅 입력만으로 재생합니다.
     # 예: 사클: 제목 / 유튜브: 제목 / 1번 사클: 제목
+    # 음악 요청은 TTS보다 먼저 처리해서 `사클: 제목` 같은 문장이 읽히지 않게 합니다.
     if await maybe_play_music_from_chat_message(message):
         return
+
+    # TTS 자유 채널 모드:
+    # 유저가 음성 채널에 들어간 상태에서 일반 채팅을 치면,
+    # TTS 전용 채널이 아니어도 그 음성 채널로 자동 입장해서 읽습니다.
+    if should_auto_tts_message(message) and not should_skip_tts_by_cooldown(message):
+        # v233: TTS 서브봇이 이 서버에 없으면 오류 메시지를 보내지 않고 조용히 무시합니다.
+        try:
+            if TTS_BOT_TOKEN and tts_sub_bot.is_ready() and tts_sub_bot.get_guild(message.guild.id) is None:
+                await mnb_v212_process_commands_once(message)
+                return
+        except Exception:
+            pass
+        ok, tts_message = await speak_tts_in_voice(message.author, message.content, message.channel)
+        if not ok:
+            # TTS 서브봇이 서버에 없거나 로그인 전인 상태는 채팅창에 오류를 띄우지 않습니다.
+            # 채팅할 때마다 같은 오류가 올라와서 불편한 문제를 막습니다.
+            if not mnb_should_hide_tts_error(tts_message):
+                try:
+                    await message.channel.send(tts_message, delete_after=6)
+                except discord.HTTPException:
+                    pass
+        else:
+            await send_log(
+                message.guild,
+                f"🔊 TTS 자동 재생\n유저: {message.author.mention}\n텍스트채널: {message.channel.mention}\n음성채널: {message.author.voice.channel.mention if getattr(message.author, 'voice', None) and message.author.voice.channel else '자동 선택'}",
+                "voice"
+            )
 
     user_id = message.author.id
     now = datetime.datetime.now().timestamp()
@@ -11371,10 +13625,11 @@ async def on_message(message: discord.Message):
             old_level = level
             level += 1
             exp -= need_exp
-            await send_log(
-                message.guild,
-                f"🎉 채팅 레벨업!\n유저: {message.author.mention}\n채팅 레벨: Lv.{old_level} → Lv.{level}",
-                "level"
+            await send_public_levelup_announcement(
+                message.author,
+                "🎉 채팅 레벨업!",
+                f"{message.author.mention} 님의 채팅 레벨이 **Lv.{old_level} → Lv.{level}** 로 올랐어요!",
+                preferred_channel=message.channel,
             )
         c.execute("UPDATE levels SET exp=?, level=? WHERE user_id=?", (exp, level, user_id))
         conn.commit()
@@ -13469,6 +15724,35 @@ def clean_music_title(title: str):
     return re.sub(r"\s+", " ", title).strip() or "제목 없음"
 
 
+def compact_music_url(url: str):
+    """임베드에 긴 URL이 크게 보이지 않도록 짧은 표시용 링크를 만듭니다."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    match = re.search(r"(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([A-Za-z0-9_-]{6,})", url, re.I)
+    if match:
+        return f"https://youtu.be/{match.group(1)}"
+    return url
+
+
+def music_tiny_link(track: dict, label: str = "링크 열기"):
+    """Discord 임베드에서 URL을 작게 보이게 하는 마크다운 링크입니다."""
+    url = compact_music_url((track or {}).get("webpage_url") or (track or {}).get("original_url") or "")
+    if not url:
+        return ""
+    safe_label = str(label or "링크 열기").replace("[", "").replace("]", "")
+    return f"[{safe_label}]({url})"
+
+
+def normalize_youtube_exact_keyword(title: str):
+    """YouTube 제목 검색용: 사용자가 붙여넣은 제목을 최대한 그대로 검색합니다."""
+    keyword = html.unescape(title or "").strip()
+    keyword = re.sub(r"https?://\S+", "", keyword).strip()
+    keyword = re.sub(r"^(?:유튜브|youtube|yt)\s*[:：-]?\s*", "", keyword, flags=re.I).strip()
+    keyword = re.sub(r"\s+", " ", keyword).strip()
+    return keyword or clean_music_title(title)
+
+
 def normalize_youtube_title_keyword(title: str):
     """YouTube 영상 제목을 그대로 붙여넣어도 검색이 잘 되게 정리합니다."""
     keyword = clean_music_title(title)
@@ -13543,9 +15827,10 @@ def build_music_search_query(query: str, preferred_source: str = None):
     service, _emoji = detect_music_service(query)
     lower = query.lower()
 
-    # YouTube 직접 링크는 Render에서 계속 막힐 수 있어서 직접 재생은 차단합니다.
-    if re.search(r"https?://(www\.)?(youtube\.com|youtu\.be)/", query or "", re.I):
-        return "__YOUTUBE_DIRECT_LINK_BLOCKED__", "YouTube", query
+    # YouTube 직접 링크도 받습니다.
+    # 긴 URL은 임베드에서 작게 보이도록 표시만 줄이고, 재생은 yt-dlp가 실제 영상 정보를 가져옵니다.
+    if re.search(r"https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/", query or "", re.I):
+        return query, "YouTube", query
 
     # SoundCloud 직접 링크는 그대로 재생합니다.
     if "soundcloud.com" in lower:
@@ -13558,16 +15843,17 @@ def build_music_search_query(query: str, preferred_source: str = None):
         # 멜론/지니는 직접 재생이 어려워 사클 기준으로 검색합니다.
         return f"scsearch1:{keyword}", service, keyword
 
-    keyword = normalize_youtube_title_keyword(query)
+    youtube_keyword = normalize_youtube_exact_keyword(query)
+    fallback_keyword = normalize_youtube_title_keyword(query)
 
     # 검색 기준을 버튼/접두어로 완전히 분리합니다.
     if preferred_source in {"youtube", "yt", "youtube_title"}:
-        return f"ytsearch1:{keyword}", "YouTube 제목 검색", keyword
+        return f"ytsearch1:{youtube_keyword}", "YouTube 제목 검색", youtube_keyword
     if preferred_source in {"soundcloud", "sc", "soundcloud_title"}:
-        return f"scsearch1:{keyword}", "SoundCloud 제목 검색", keyword
+        return f"scsearch1:{fallback_keyword}", "SoundCloud 제목 검색", fallback_keyword
 
     # 기본값은 Render에서 더 안정적인 SoundCloud 제목 검색입니다.
-    return f"scsearch1:{keyword}", "SoundCloud 제목 검색", keyword
+    return f"scsearch1:{fallback_keyword}", "SoundCloud 제목 검색", fallback_keyword
 
 async def extract_music_info(query: str, preferred_source: str = None):
     loop = asyncio.get_running_loop()
@@ -13703,10 +15989,12 @@ async def extract_music_info(query: str, preferred_source: str = None):
                 )
             raise ValueError("재생 가능한 오디오 포맷을 찾지 못했어요. `사클 제목`으로 다시 검색해보세요.")
 
+        webpage_url = info.get("webpage_url") or _youtube_url_from_info(info) or original_query
         return {
             "title": clean_music_title(info.get("title", "제목 없음")),
             "url": stream_url,
-            "webpage_url": info.get("webpage_url", original_query),
+            "webpage_url": webpage_url,
+            "display_url": compact_music_url(webpage_url),
             "duration": info.get("duration", 0),
             "thumbnail": info.get("thumbnail"),
             "service": detected_service,
@@ -13721,13 +16009,18 @@ async def extract_music_info(query: str, preferred_source: str = None):
         local_ytdl = yt_dlp.YoutubeDL(options)
         info = local_ytdl.extract_info(search_query, download=False)
 
-        # ytsearch 결과가 얕은 항목으로 들어오면 실제 영상 페이지를 한 번 더 추출합니다.
+        # YouTube 검색 결과는 실제 영상 페이지를 한 번 더 추출해서
+        # YouTube에 표시된 제목/썸네일/링크가 그대로 나오게 합니다.
         if _is_youtube_service(requested_service):
             first = _first_entry(info)
             stream_url, _ = _pick_audio_stream(first, requested_service)
             video_url = _youtube_url_from_info(first)
-            if video_url and (not stream_url or _is_youtube_webpage_url(stream_url)):
-                info = local_ytdl.extract_info(video_url, download=False)
+            if video_url:
+                try:
+                    info = local_ytdl.extract_info(video_url, download=False)
+                except Exception:
+                    if not stream_url or _is_youtube_webpage_url(stream_url):
+                        raise
 
         return _normalize_info(info, original_query, requested_service, searched_keyword)
 
@@ -13791,11 +16084,14 @@ def build_now_playing_embed(track: dict, *, queued: bool = False):
     status = "대기열 추가" if queued else "현재 재생 중"
     service = track.get("service", "검색")
     service_emoji = track.get("service_emoji", "🎧")
+    small_link = music_tiny_link(track, "YouTube 열기" if "YouTube" in str(service) else "원본 열기")
+    description = f"**{track.get('title', '제목 없음')}**"
+    if small_link:
+        description += f"\n🔗 {small_link}"
     embed = discord.Embed(
         title=f"{service_emoji} {status} · {service}",
-        description=f"**{track.get('title', '제목 없음')}**",
+        description=description,
         color=BOT_COLOR,
-        url=track.get("webpage_url") or None,
     )
     embed.add_field(name="⏱️ 길이", value=f"`{format_duration(track.get('duration'))}`", inline=True)
     embed.add_field(name="🎤 업로더", value=str(track.get("uploader", "알 수 없음"))[:100], inline=True)
@@ -13976,6 +16272,212 @@ class PlayMusicModal(discord.ui.Modal):
         await interaction.followup.send(msg, ephemeral=True)
 
 
+
+# =========================
+# 만능봇 뮤직 대기열 관리 패널
+# =========================
+# 이미지처럼 대기열을 임베드로 보여주고, 선택 메뉴/버튼으로 제거·맨위로 이동·뒤집기·셔플·새로고침을 처리합니다.
+
+
+def _music_queue_title(track: dict, limit: int = 90):
+    title = str((track or {}).get("title") or "제목 없음")
+    title = re.sub(r"\s+", " ", title).strip()
+    return title if len(title) <= limit else title[:limit - 3] + "..."
+
+
+def _music_queue_line(track: dict, index: int):
+    emoji = (track or {}).get("service_emoji", "🎧")
+    title = _music_queue_title(track, 72)
+    duration = format_duration((track or {}).get("duration"))
+    tiny = music_tiny_link(track, "↗")
+    tiny_text = f" {tiny}" if tiny else ""
+    return f"**{index}.** {emoji} **{title}** `({duration})`{tiny_text}"
+
+
+def _music_queue_select_options(queue):
+    options = []
+    for i, track in enumerate(list(queue)[:25], start=1):
+        title = _music_queue_title(track, 76)
+        duration = format_duration((track or {}).get("duration"))
+        service = str((track or {}).get("service") or "검색")[:35]
+        options.append(
+            discord.SelectOption(
+                label=f"{i}. {title}"[:100],
+                description=f"{service} · {duration}"[:100],
+                value=str(i - 1),
+                emoji=(track or {}).get("service_emoji", "🎧"),
+            )
+        )
+    return options
+
+
+def _get_music_queue_state(guild_id: int, slot: int | None = None):
+    if slot is None:
+        return get_music_queue(guild_id), now_playing.get(guild_id)
+    key = custom_music_key(int(slot), int(guild_id))
+    return get_custom_music_queue(int(slot), int(guild_id)), CUSTOM_MUSIC_NOW_PLAYING.get(key)
+
+
+def build_music_queue_manage_embed(guild_id: int, *, slot: int | None = None):
+    queue, current = _get_music_queue_state(guild_id, slot)
+    queue_list = list(queue)
+    bot_label = "만능봇 뮤직"
+    color = BOT_COLOR
+    if slot is not None:
+        bot_label = f"{slot}번 · {get_custom_music_bot_label(guild_id, int(slot))}"
+        color = 0x9B7CFF
+
+    embed = discord.Embed(
+        title=f"📜 대기열 - {len(queue_list)}개의 곡",
+        color=color,
+    )
+
+    if current:
+        title = _music_queue_title(current, 130)
+        duration = format_duration(current.get("duration"))
+        requester = current.get("requester") or current.get("requested_by") or ""
+        requester_text = f" - {requester}" if requester else ""
+        small_link = music_tiny_link(current, "↗")
+        link_text = f" {small_link}" if small_link else ""
+        embed.description = f"**재생 중.** {current.get('service_emoji', '🎧')} **{title}** `({duration})`{requester_text}{link_text}\n\n"
+        if current.get("thumbnail"):
+            embed.set_thumbnail(url=current.get("thumbnail"))
+    else:
+        embed.description = "**재생 중인 곡이 없어요.**\n\n"
+
+    if queue_list:
+        lines = [_music_queue_line(track, i) for i, track in enumerate(queue_list[:10], start=1)]
+        if len(queue_list) > 10:
+            lines.append(f"… 외 **{len(queue_list) - 10}곡**")
+        embed.description += "\n".join(lines)
+    else:
+        embed.description += "대기 중인 곡이 없어요."
+
+    embed.add_field(
+        name="🎛️ 대기열 조작",
+        value=(
+            "아래 선택 메뉴로 곡을 **제거**하거나 **맨 위로 이동**할 수 있어요.\n"
+            "버튼으로 대기열을 뒤집거나 섞고, 최신 상태로 새로고침할 수 있어요."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"만능봇 뮤직 대기열 관리 | {bot_label}")
+    return embed
+
+
+async def _edit_music_queue_manage_message(interaction: discord.Interaction, view: discord.ui.View, *, notice: str | None = None):
+    embed = build_music_queue_manage_embed(view.guild_id, slot=getattr(view, "slot", None))
+    if notice:
+        embed.add_field(name="✅ 처리 결과", value=notice[:1000], inline=False)
+    new_view = MusicQueueManageView(view.guild_id, slot=getattr(view, "slot", None))
+    try:
+        if interaction.response.is_done():
+            return await interaction.edit_original_response(embed=embed, view=new_view)
+        return await interaction.response.edit_message(embed=embed, view=new_view)
+    except discord.NotFound:
+        return None
+    except discord.HTTPException:
+        try:
+            return await safe_interaction_send(interaction, embed=embed, view=new_view, ephemeral=True)
+        except Exception:
+            return None
+
+
+class MusicQueueRemoveSelect(discord.ui.Select):
+    def __init__(self, manager_view):
+        self.manager_view = manager_view
+        super().__init__(
+            placeholder="대기열에서 곡을 제거하려면 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=_music_queue_select_options(manager_view.queue),
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        queue = self.manager_view.queue
+        items = list(queue)
+        try:
+            index = int(self.values[0])
+        except (ValueError, IndexError):
+            return await safe_interaction_send(interaction, "❌ 선택값을 읽지 못했어요.", ephemeral=True)
+        if index < 0 or index >= len(items):
+            return await _edit_music_queue_manage_message(interaction, self.manager_view, notice="이미 변경된 대기열이에요. 새로고침했어요.")
+        removed = items.pop(index)
+        queue.clear()
+        queue.extend(items)
+        await _edit_music_queue_manage_message(interaction, self.manager_view, notice=f"🗑️ **{_music_queue_title(removed, 80)}** 곡을 대기열에서 제거했어요.")
+
+
+class MusicQueueMoveSelect(discord.ui.Select):
+    def __init__(self, manager_view):
+        self.manager_view = manager_view
+        super().__init__(
+            placeholder="대기열에서 곡을 맨 위로 옮기려면 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=_music_queue_select_options(manager_view.queue),
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        queue = self.manager_view.queue
+        items = list(queue)
+        try:
+            index = int(self.values[0])
+        except (ValueError, IndexError):
+            return await safe_interaction_send(interaction, "❌ 선택값을 읽지 못했어요.", ephemeral=True)
+        if index < 0 or index >= len(items):
+            return await _edit_music_queue_manage_message(interaction, self.manager_view, notice="이미 변경된 대기열이에요. 새로고침했어요.")
+        moved = items.pop(index)
+        items.insert(0, moved)
+        queue.clear()
+        queue.extend(items)
+        await _edit_music_queue_manage_message(interaction, self.manager_view, notice=f"⬆️ **{_music_queue_title(moved, 80)}** 곡을 대기열 맨 위로 옮겼어요.")
+
+
+class MusicQueueManageView(discord.ui.View):
+    def __init__(self, guild_id: int, *, slot: int | None = None):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.slot = int(slot) if slot is not None else None
+        self.queue, self.current = _get_music_queue_state(self.guild_id, self.slot)
+
+        if len(self.queue) > 0:
+            self.add_item(MusicQueueRemoveSelect(self))
+            self.add_item(MusicQueueMoveSelect(self))
+
+        reverse_button = discord.ui.Button(label="대기열 뒤집기", emoji="🔃", style=discord.ButtonStyle.gray, row=2, disabled=len(self.queue) < 2)
+        shuffle_button = discord.ui.Button(label="대기열 섞기", emoji="🔀", style=discord.ButtonStyle.gray, row=2, disabled=len(self.queue) < 2)
+        refresh_button = discord.ui.Button(label="대기열 새로고침", emoji="🔄", style=discord.ButtonStyle.green, row=2)
+        reverse_button.callback = self.reverse_queue
+        shuffle_button.callback = self.shuffle_queue
+        refresh_button.callback = self.refresh_queue
+        self.add_item(reverse_button)
+        self.add_item(shuffle_button)
+        self.add_item(refresh_button)
+
+    async def reverse_queue(self, interaction: discord.Interaction):
+        items = list(self.queue)
+        if len(items) < 2:
+            return await _edit_music_queue_manage_message(interaction, self, notice="뒤집을 곡이 부족해요.")
+        items.reverse()
+        self.queue.clear()
+        self.queue.extend(items)
+        await _edit_music_queue_manage_message(interaction, self, notice=f"🔃 대기열 **{len(items)}곡** 순서를 뒤집었어요.")
+
+    async def shuffle_queue(self, interaction: discord.Interaction):
+        items = list(self.queue)
+        if len(items) < 2:
+            return await _edit_music_queue_manage_message(interaction, self, notice="섞을 곡이 부족해요.")
+        random.shuffle(items)
+        self.queue.clear()
+        self.queue.extend(items)
+        await _edit_music_queue_manage_message(interaction, self, notice=f"🔀 대기열 **{len(items)}곡**을 랜덤으로 섞었어요.")
+
+    async def refresh_queue(self, interaction: discord.Interaction):
+        await _edit_music_queue_manage_message(interaction, self, notice="🔄 대기열을 최신 상태로 새로고침했어요.")
+
 class MusicVolumeModal(discord.ui.Modal, title="🔊 볼륨 설정"):
     volume = discord.ui.TextInput(
         label="볼륨 1~100",
@@ -14068,23 +16570,13 @@ class MusicPanelView(discord.ui.View):
 
     @discord.ui.button(label="대기열", emoji="📜", style=discord.ButtonStyle.gray, custom_id="music_queue")
     async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = interaction.guild.id
-        queue = get_music_queue(guild_id)
-        current = now_playing.get(guild_id)
-
-        text = ""
-        if current:
-            text += f"🎵 **현재 재생 중**\n{current.get('service_emoji', '🎧')} {current['title']} `[{format_duration(current['duration'])}]`\n\n"
-
-        if queue:
-            text += "📜 **대기열**\n"
-            for i, track in enumerate(list(queue)[:10], start=1):
-                text += f"{i}. {track.get('service_emoji', '🎧')} {track['title']} `[{format_duration(track['duration'])}]`\n"
-        else:
-            text += "대기 중인 곡이 없어요."
-
-        embed = create_embed("📜 만능 봇 뮤직 대기열", text[:4000])
-        await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+        embed = build_music_queue_manage_embed(interaction.guild.id)
+        await safe_interaction_send(
+            interaction,
+            embed=embed,
+            view=MusicQueueManageView(interaction.guild.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="반복", emoji="🔁", style=discord.ButtonStyle.green, custom_id="music_loop")
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -14121,31 +16613,17 @@ class MusicPanelView(discord.ui.View):
         await safe_interaction_send(interaction, "❌ 봇이 음성 채널에 없어요.", ephemeral=True)
 
 
-# Slash command disabled to stay under Discord's 100-command global limit. Use /패널 instead.
-# @bot.tree.command(name="뮤직", description="뮤직 카테고리/채널과 뮤직 패널을 자동 생성합니다.")
+# v233: legacy music_panel도 카테고리를 만들지 않고 설정된 음악 채널/현재 채널에 패널만 보냅니다.
 async def music_panel(interaction: discord.Interaction):
     if interaction.guild is None:
         return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
-
-    # 관리자나 봇 세팅 권한자는 뮤직방 전체를 자동 생성합니다.
-    if interaction.user.guild_permissions.administrator and not await reject_if_not_setup_manager(interaction):
-        await safe_interaction_defer(interaction, ephemeral=True)
-        layout = await create_music_category_channels(interaction.guild, send_panel=True)
-        await interaction.followup.send(
-            "✅ 뮤직 카테고리 자동 생성을 완료했습니다.\n"
-            f"🎵 카테고리: {layout.get('music_category').mention if layout.get('music_category') else '미설정'}\n"
-            f"🎵 명령어 채널: {layout.get('music_command_channel').mention if layout.get('music_command_channel') else '미설정'}\n"
-            f"🎶 현재재생 채널: {layout.get('music_now_playing_channel').mention if layout.get('music_now_playing_channel') else '미설정'}\n"
-            f"📜 재생목록 채널: {layout.get('music_queue_channel').mention if layout.get('music_queue_channel') else '미설정'}\n"
-            f"🔊 음악감상 음성: {layout.get('music_voice_channel').mention if layout.get('music_voice_channel') else '미설정'}\n"
-            f"🎛️ 뮤직 패널: {'새로 전송됨' if layout.get('music_panel_sent') else '이미 있음'}",
-            ephemeral=True
-        )
-        await send_log(interaction.guild, f"🎵 뮤직 카테고리 생성/확인\n관리자: {interaction.user.mention}", "general")
+    if await reject_if_not_setup_manager(interaction):
         return
-
-    # 일반 유저는 현재 채널에서 뮤직 패널만 열 수 있습니다.
-    await safe_interaction_send(interaction, embed=await build_music_panel_embed(), view=MusicPanelView())
+    target_channel = get_configured_music_text_channel(interaction.guild) or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널만 사용할 수 있습니다.", ephemeral=True)
+    await send_music_panel_here(target_channel, force_new=True)
+    await safe_interaction_send(interaction, f"✅ 뮤직패널을 {target_channel.mention} 에 생성했어요.", ephemeral=True)
 
 
 # =========================
@@ -16321,6 +18799,691 @@ async def help_panel(interaction: discord.Interaction):
     )
 
 
+
+# =========================
+# 알림 역할 박스형 패널
+# =========================
+# Discord 앱 자체 알림을 끄는 기능은 아니고, 서버 알림 멘션용 역할을
+# 유저가 직접 켜고 끌 수 있게 해주는 기능입니다.
+# v215: 자동 멘션 알림은 만들지 않습니다. 실제 역할 멘션은 관리자가 /알림 보내기를 실행할 때만 나갑니다.
+MNB_ALERT_ROLE_CONFIGS = {
+    "notice": {
+        "role_name": "공지알림",
+        "label": "공지",
+        "emoji": "📢",
+        "desc": "중요 공지, 서버 안내, 필독 소식",
+    },
+    "event": {
+        "role_name": "이벤트알림",
+        "label": "이벤트",
+        "emoji": "🎉",
+        "desc": "이벤트 오픈, 보상, 추첨 안내",
+    },
+    "scrim": {
+        "role_name": "내전알림",
+        "label": "내전",
+        "emoji": "⚔️",
+        "desc": "내전 모집, 팀 모집, 경기 진행 안내",
+    },
+    "game": {
+        "role_name": "게임알림",
+        "label": "게임",
+        "emoji": "🎮",
+        "desc": "파티 모집, 게임방 소식, 같이할 사람 찾기",
+    },
+    "update": {
+        "role_name": "업데이트알림",
+        "label": "업데이트",
+        "emoji": "🚀",
+        "desc": "봇 업데이트, 패치노트, 서버 변경사항",
+    },
+}
+MNB_ALERT_ALL_KEY = "all"
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS notification_toggle_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    user_id INTEGER,
+    action TEXT,
+    role_name TEXT,
+    created_at TEXT
+)
+""")
+
+# v215 알림 기본 정책
+# 1 = 수동 알림 전용: /알림 보내기 명령으로만 역할 멘션을 전송합니다.
+# 버튼 클릭, 역할 생성, 패널 생성은 조용히 처리하고 DB 로그에만 남깁니다.
+c.execute("""
+CREATE TABLE IF NOT EXISTS notification_settings (
+    guild_id INTEGER PRIMARY KEY,
+    manual_only INTEGER DEFAULT 1,
+    quiet_toggle_logs INTEGER DEFAULT 1,
+    updated_at TEXT
+)
+""")
+conn.commit()
+
+
+def mnb_alert_box(title: str, lines, emoji: str = "☁️"):
+    text_lines = [str(line) for line in lines if str(line).strip()]
+    body = "\n".join(f"│ {line}" for line in text_lines) or "│ 내용 없음"
+    return f"```text\n╭──────── {emoji} {title} ────────╮\n{body}\n╰────────────────────╯\n```"
+
+
+def get_mnb_alert_config(key: str):
+    return MNB_ALERT_ROLE_CONFIGS.get(str(key or "").strip())
+
+
+def get_mnb_alert_role(guild: discord.Guild, key: str):
+    config = get_mnb_alert_config(key)
+    if guild is None or not config:
+        return None
+    return discord.utils.get(guild.roles, name=config["role_name"])
+
+
+async def get_or_create_mnb_alert_role(guild: discord.Guild, key: str):
+    config = get_mnb_alert_config(key)
+    if guild is None or not config:
+        return None
+
+    role = discord.utils.get(guild.roles, name=config["role_name"])
+    if role:
+        return role
+
+    try:
+        return await guild.create_role(
+            name=config["role_name"],
+            mentionable=True,
+            reason="만능 봇 알림 역할 자동 생성",
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+
+def add_mnb_alert_log(guild_id: int, user_id: int, action: str, role_name: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with DB_MUTEX:
+            c.execute(
+                """
+                INSERT INTO notification_toggle_logs(guild_id, user_id, action, role_name, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(guild_id or 0), int(user_id or 0), str(action or ""), str(role_name or ""), now),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def ensure_mnb_notification_settings(guild_id: int):
+    """알림 시스템 기본값을 수동 알림 전용으로 유지합니다."""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with DB_MUTEX:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO notification_settings(guild_id, manual_only, quiet_toggle_logs, updated_at)
+                VALUES (?, 1, 1, ?)
+                """,
+                (int(guild_id or 0), now),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_mnb_notification_settings(guild_id: int):
+    ensure_mnb_notification_settings(guild_id)
+    try:
+        with DB_MUTEX:
+            c.execute(
+                """
+                SELECT manual_only, quiet_toggle_logs
+                FROM notification_settings
+                WHERE guild_id=?
+                """,
+                (int(guild_id or 0),),
+            )
+            row = c.fetchone()
+        if row:
+            return {"manual_only": bool(row[0]), "quiet_toggle_logs": bool(row[1])}
+    except Exception:
+        pass
+    return {"manual_only": True, "quiet_toggle_logs": True}
+
+
+def set_mnb_notification_manual_only(guild_id: int, enabled: bool):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ensure_mnb_notification_settings(guild_id)
+    try:
+        with DB_MUTEX:
+            c.execute(
+                """
+                UPDATE notification_settings
+                SET manual_only=?, quiet_toggle_logs=1, updated_at=?
+                WHERE guild_id=?
+                """,
+                (1 if enabled else 0, now, int(guild_id or 0)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+async def send_mnb_alert_admin_log(guild: discord.Guild, message: str, *, force: bool = False):
+    """알림 시스템 내부 로그는 기본적으로 조용히 처리합니다.
+
+    force=True인 /알림 보내기 같은 실제 수동 알림 전송 기록만 서버 로그 채널에 남깁니다.
+    """
+    if guild is None:
+        return
+    settings = get_mnb_notification_settings(guild.id)
+    if not force and settings.get("quiet_toggle_logs", True):
+        return
+    try:
+        await send_log(guild, message, "general")
+    except Exception:
+        pass
+
+
+def build_mnb_alert_panel_embed(guild: discord.Guild = None):
+    embed = discord.Embed(
+        title="🔔 만능 친목방 알림 설정",
+        description=(
+            "받고 싶은 알림만 직접 켜고 끌 수 있는 박스형 패널이에요.\n"
+            "버튼을 누르면 해당 알림 역할이 지급되고, 다시 누르면 제거돼요.\n"
+            "실제 멘션 알림은 관리자가 `/알림 보내기`를 실행할 때만 전송돼요.\n\n"
+            "━━━━━━━━━━━━━━━━━━"
+        ),
+        color=COLOR_SOFT_SKY if 'COLOR_SOFT_SKY' in globals() else BOT_COLOR,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    embed.add_field(
+        name="☁️ 사용 방법",
+        value=mnb_alert_box("이용 안내", [
+            "원하는 알림 버튼을 눌러 역할을 받아요",
+            "같은 버튼을 다시 누르면 알림이 꺼져요",
+            "공지/이벤트/내전/게임/업데이트를 따로 선택 가능",
+            "버튼 클릭만으로는 전체 알림 멘션이 나가지 않아요",
+        ], "☁️"),
+        inline=False,
+    )
+
+    for key, config in MNB_ALERT_ROLE_CONFIGS.items():
+        role = get_mnb_alert_role(guild, key) if guild else None
+        role_text = role.mention if role else config["role_name"]
+        embed.add_field(
+            name=f"{config['emoji']} {config['label']} 알림",
+            value=mnb_alert_box(config["label"], [
+                f"역할: {role_text}",
+                config["desc"],
+            ], config["emoji"]),
+            inline=True,
+        )
+
+    embed.add_field(
+        name="📌 관리자 안내",
+        value=mnb_alert_box("보내기", [
+            "/알림 보내기 로 선택한 알림 역할에게만 멘션 전송",
+            "/알림 로그 로 알림 변경 기록 확인 가능",
+            "켜기/끄기 기록은 조용히 DB 로그에만 저장",
+        ], "📌"),
+        inline=False,
+    )
+    embed.set_footer(text="☁️ 만능 봇 | 박스형 알림 패널")
+    return embed
+
+
+def build_mnb_alert_status_embed(member: discord.Member):
+    embed = discord.Embed(
+        title="🔔 내 알림 상태",
+        description="현재 내가 받고 있는 알림 역할을 확인할 수 있어요.",
+        color=COLOR_MINT if 'COLOR_MINT' in globals() else BOT_COLOR,
+    )
+    lines = []
+    for key, config in MNB_ALERT_ROLE_CONFIGS.items():
+        role = get_mnb_alert_role(member.guild, key)
+        enabled = bool(role and role in member.roles)
+        lines.append(f"{config['emoji']} {config['label']}: {'켜짐 ✅' if enabled else '꺼짐 ❌'}")
+    embed.add_field(name="☁️ 알림 목록", value=mnb_alert_box("상태", lines, "🔔"), inline=False)
+    embed.set_footer(text="알림 멘션은 관리자가 /알림 보내기를 실행할 때만 전송돼요.")
+    return embed
+
+
+def build_mnb_alert_log_embed(guild: discord.Guild, rows):
+    embed = discord.Embed(
+        title="📋 알림 변경 로그",
+        description="최근 알림 역할 변경 기록이에요.",
+        color=COLOR_GRAY if 'COLOR_GRAY' in globals() else BOT_COLOR,
+    )
+    if not rows:
+        embed.add_field(
+            name="기록 없음",
+            value=mnb_alert_box("로그", ["아직 알림 변경 기록이 없어요."], "📋"),
+            inline=False,
+        )
+    else:
+        lines = []
+        for user_id, action, role_name, created_at in rows:
+            user_text = f"<@{user_id}>" if user_id else "알 수 없음"
+            lines.append(f"{created_at} | {user_text} | {role_name} | {action}")
+        # 임베드 필드 1024자 제한을 넘기지 않도록 자릅니다.
+        value = mnb_alert_box("최근 기록", lines, "📋")
+        embed.add_field(name="최근 15개", value=value[:1024], inline=False)
+    embed.set_footer(text=f"서버: {guild.name if guild else '알 수 없음'}")
+    return embed
+
+
+async def set_mnb_alert_role_state(interaction: discord.Interaction, key: str, enabled=None):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+
+    config = get_mnb_alert_config(key)
+    if not config:
+        return await safe_interaction_send(interaction, "❌ 알 수 없는 알림 종류입니다.", ephemeral=True)
+
+    role = await get_or_create_mnb_alert_role(interaction.guild, key)
+    if role is None:
+        return await safe_interaction_send(
+            interaction,
+            "❌ 알림 역할을 만들거나 지급할 수 없어요. 봇에게 `역할 관리` 권한이 있는지 확인해 주세요.",
+            ephemeral=True,
+        )
+
+    member = interaction.user
+    currently_enabled = role in member.roles
+    target_enabled = (not currently_enabled) if enabled is None else bool(enabled)
+
+    if target_enabled == currently_enabled:
+        state_text = "이미 켜져 있어요 ✅" if target_enabled else "이미 꺼져 있어요 ❌"
+        return await safe_interaction_send(
+            interaction,
+            f"{config['emoji']} `{config['role_name']}` 알림은 {state_text}",
+            ephemeral=True,
+        )
+
+    try:
+        if target_enabled:
+            await member.add_roles(role, reason="만능 봇 알림 켜기")
+            action_text = "켜기"
+            result_text = f"✅ {config['emoji']} `{config['role_name']}` 알림을 켰어요."
+        else:
+            await member.remove_roles(role, reason="만능 봇 알림 끄기")
+            action_text = "끄기"
+            result_text = f"🔕 {config['emoji']} `{config['role_name']}` 알림을 껐어요."
+    except (discord.Forbidden, discord.HTTPException):
+        return await safe_interaction_send(
+            interaction,
+            "❌ 역할을 변경할 수 없어요. 봇 역할이 알림 역할보다 위에 있는지 확인해 주세요.",
+            ephemeral=True,
+        )
+
+    add_mnb_alert_log(interaction.guild.id, member.id, action_text, config["role_name"])
+    await send_mnb_alert_admin_log(
+        interaction.guild,
+        f"🔔 알림 역할 변경\n유저: {member.mention}\n알림: `{config['role_name']}`\n상태: `{action_text}`",
+        force=False,
+    )
+
+    return await safe_interaction_send(interaction, result_text, ephemeral=True)
+
+
+async def set_all_mnb_alert_roles(interaction: discord.Interaction, enabled: bool):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+
+    member = interaction.user
+    changed = []
+    failed = []
+    for key, config in MNB_ALERT_ROLE_CONFIGS.items():
+        role = await get_or_create_mnb_alert_role(interaction.guild, key)
+        if role is None:
+            failed.append(config["role_name"])
+            continue
+        try:
+            if enabled and role not in member.roles:
+                await member.add_roles(role, reason="만능 봇 알림 전체 켜기")
+                changed.append(config["role_name"])
+            elif not enabled and role in member.roles:
+                await member.remove_roles(role, reason="만능 봇 알림 전체 끄기")
+                changed.append(config["role_name"])
+        except (discord.Forbidden, discord.HTTPException):
+            failed.append(config["role_name"])
+
+    action_text = "전체켜기" if enabled else "전체끄기"
+    for role_name in changed:
+        add_mnb_alert_log(interaction.guild.id, member.id, action_text, role_name)
+    await send_mnb_alert_admin_log(
+        interaction.guild,
+        f"🔔 알림 역할 {action_text}\n유저: {member.mention}\n변경: `{len(changed)}`개\n실패: `{len(failed)}`개",
+        force=False,
+    )
+
+    embed = discord.Embed(
+        title="🔔 알림 전체 설정 완료",
+        description=mnb_alert_box("결과", [
+            f"상태: {'전체 켜기 ✅' if enabled else '전체 끄기 🔕'}",
+            f"변경된 알림: {', '.join(changed) if changed else '없음'}",
+            f"실패한 알림: {', '.join(failed) if failed else '없음'}",
+        ], "🔔"),
+        color=COLOR_GREEN if enabled and 'COLOR_GREEN' in globals() else BOT_COLOR,
+    )
+    return await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+
+
+class MNBAlertToggleButton(discord.ui.Button):
+    def __init__(self, key: str, row: int = 0):
+        config = get_mnb_alert_config(key)
+        super().__init__(
+            label=config["label"] if config else key,
+            emoji=config["emoji"] if config else "🔔",
+            style=discord.ButtonStyle.secondary,
+            row=row,
+            custom_id=f"mnb_alert_toggle:{key}",
+        )
+        self.alert_key = key
+
+    async def callback(self, interaction: discord.Interaction):
+        await set_mnb_alert_role_state(interaction, self.alert_key, enabled=None)
+
+
+class MNBAlertStatusButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="내 상태", emoji="📋", style=discord.ButtonStyle.blurple, row=1, custom_id="mnb_alert_status")
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+        await safe_interaction_send(interaction, embed=build_mnb_alert_status_embed(interaction.user), ephemeral=True)
+
+
+class MNBAlertAllOnButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="전체 켜기", emoji="🔔", style=discord.ButtonStyle.green, row=1, custom_id="mnb_alert_all_on")
+
+    async def callback(self, interaction: discord.Interaction):
+        await set_all_mnb_alert_roles(interaction, True)
+
+
+class MNBAlertAllOffButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="전체 끄기", emoji="🔕", style=discord.ButtonStyle.red, row=1, custom_id="mnb_alert_all_off")
+
+    async def callback(self, interaction: discord.Interaction):
+        await set_all_mnb_alert_roles(interaction, False)
+
+
+class MNBAlertPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(MNBAlertToggleButton("notice", row=0))
+        self.add_item(MNBAlertToggleButton("event", row=0))
+        self.add_item(MNBAlertToggleButton("scrim", row=0))
+        self.add_item(MNBAlertToggleButton("game", row=0))
+        self.add_item(MNBAlertToggleButton("update", row=0))
+        self.add_item(MNBAlertStatusButton())
+        self.add_item(MNBAlertAllOnButton())
+        self.add_item(MNBAlertAllOffButton())
+
+
+mnb_alert_group = app_commands.Group(name="알림", description="서버 알림을 켜고 끄는 박스형 패널입니다.")
+
+
+@mnb_alert_group.command(name="패널", description="현재 채널에 알림 선택 박스형 임베드 패널을 보냅니다. 관리자 전용입니다.")
+async def mnb_alert_panel_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    await interaction.channel.send(embed=build_mnb_alert_panel_embed(interaction.guild), view=MNBAlertPanelView())
+    add_mnb_alert_log(interaction.guild.id, interaction.user.id, "패널생성", "알림패널")
+    await send_mnb_alert_admin_log(
+        interaction.guild,
+        f"🔔 알림 패널 생성\n채널: {interaction.channel.mention}\n관리자: {interaction.user.mention}",
+        force=False,
+    )
+    await safe_interaction_send(interaction, "✅ 알림 박스형 패널을 현재 채널에 생성했어요. 이 패널은 멘션 알림을 자동으로 보내지 않아요.", ephemeral=True)
+
+
+@mnb_alert_group.command(name="상태", description="내 알림 상태를 확인합니다.")
+async def mnb_alert_status_command(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    await safe_interaction_send(interaction, embed=build_mnb_alert_status_embed(interaction.user), ephemeral=True)
+
+
+@mnb_alert_group.command(name="켜기", description="선택한 알림을 켭니다.")
+@app_commands.describe(종류="켤 알림 종류")
+@app_commands.choices(종류=[
+    app_commands.Choice(name="전체 알림", value=MNB_ALERT_ALL_KEY),
+    app_commands.Choice(name="공지알림", value="notice"),
+    app_commands.Choice(name="이벤트알림", value="event"),
+    app_commands.Choice(name="내전알림", value="scrim"),
+    app_commands.Choice(name="게임알림", value="game"),
+    app_commands.Choice(name="업데이트알림", value="update"),
+])
+async def mnb_alert_on_command(interaction: discord.Interaction, 종류: app_commands.Choice[str]):
+    if 종류.value == MNB_ALERT_ALL_KEY:
+        return await set_all_mnb_alert_roles(interaction, True)
+    return await set_mnb_alert_role_state(interaction, 종류.value, enabled=True)
+
+
+@mnb_alert_group.command(name="끄기", description="선택한 알림을 끕니다.")
+@app_commands.describe(종류="끌 알림 종류")
+@app_commands.choices(종류=[
+    app_commands.Choice(name="전체 알림", value=MNB_ALERT_ALL_KEY),
+    app_commands.Choice(name="공지알림", value="notice"),
+    app_commands.Choice(name="이벤트알림", value="event"),
+    app_commands.Choice(name="내전알림", value="scrim"),
+    app_commands.Choice(name="게임알림", value="game"),
+    app_commands.Choice(name="업데이트알림", value="update"),
+])
+async def mnb_alert_off_command(interaction: discord.Interaction, 종류: app_commands.Choice[str]):
+    if 종류.value == MNB_ALERT_ALL_KEY:
+        return await set_all_mnb_alert_roles(interaction, False)
+    return await set_mnb_alert_role_state(interaction, 종류.value, enabled=False)
+
+
+@mnb_alert_group.command(name="보내기", description="선택한 알림 역할을 멘션해서 박스형 알림을 보냅니다. 관리자 전용입니다.")
+@app_commands.describe(종류="멘션할 알림 종류", 제목="알림 제목", 내용="알림 내용", 채널="알림을 보낼 채널. 비우면 현재 채널")
+@app_commands.choices(종류=[
+    app_commands.Choice(name="공지알림", value="notice"),
+    app_commands.Choice(name="이벤트알림", value="event"),
+    app_commands.Choice(name="내전알림", value="scrim"),
+    app_commands.Choice(name="게임알림", value="game"),
+    app_commands.Choice(name="업데이트알림", value="update"),
+])
+async def mnb_alert_send_command(
+    interaction: discord.Interaction,
+    종류: app_commands.Choice[str],
+    제목: str,
+    내용: str,
+    채널: discord.TextChannel = None,
+):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+
+    config = get_mnb_alert_config(종류.value)
+    role = await get_or_create_mnb_alert_role(interaction.guild, 종류.value)
+    if role is None or config is None:
+        return await safe_interaction_send(interaction, "❌ 알림 역할을 준비할 수 없어요.", ephemeral=True)
+
+    target_channel = 채널 or interaction.channel
+    embed = discord.Embed(
+        title=f"{config['emoji']} {제목}",
+        description=mnb_alert_box(config["label"], [내용], config["emoji"]),
+        color=COLOR_SOFT_SKY if 'COLOR_SOFT_SKY' in globals() else BOT_COLOR,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text=f"☁️ 만능 봇 | {config['role_name']}")
+
+    try:
+        await target_channel.send(
+            content=role.mention,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        return await safe_interaction_send(interaction, f"❌ 알림 전송 실패: `{e}`", ephemeral=True)
+
+    add_mnb_alert_log(interaction.guild.id, interaction.user.id, "알림전송", config["role_name"])
+    await send_mnb_alert_admin_log(
+        interaction.guild,
+        f"🔔 알림 전송\n종류: `{config['role_name']}`\n채널: {target_channel.mention}\n관리자: {interaction.user.mention}\n제목: `{제목}`",
+        force=True,
+    )
+    await safe_interaction_send(interaction, f"✅ {target_channel.mention} 에 `{config['role_name']}` 알림을 보냈어요. 수동 명령으로만 전송됐어요.", ephemeral=True)
+
+
+@mnb_alert_group.command(name="미리보기", description="알림을 보내기 전에 나에게만 박스형 임베드로 미리 봅니다. 관리자 전용입니다.")
+@app_commands.describe(종류="미리볼 알림 종류", 제목="알림 제목", 내용="알림 내용")
+@app_commands.choices(종류=[
+    app_commands.Choice(name="공지알림", value="notice"),
+    app_commands.Choice(name="이벤트알림", value="event"),
+    app_commands.Choice(name="내전알림", value="scrim"),
+    app_commands.Choice(name="게임알림", value="game"),
+    app_commands.Choice(name="업데이트알림", value="update"),
+])
+async def mnb_alert_preview_command(
+    interaction: discord.Interaction,
+    종류: app_commands.Choice[str],
+    제목: str,
+    내용: str,
+):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    config = get_mnb_alert_config(종류.value)
+    if config is None:
+        return await safe_interaction_send(interaction, "❌ 알 수 없는 알림 종류입니다.", ephemeral=True)
+    embed = discord.Embed(
+        title=f"{config['emoji']} {제목}",
+        description=mnb_alert_box(config["label"], [내용], config["emoji"]),
+        color=COLOR_SOFT_SKY if 'COLOR_SOFT_SKY' in globals() else BOT_COLOR,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text=f"☁️ 미리보기 | 실제 전송 아님 | {config['role_name']}")
+    await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+
+
+@mnb_alert_group.command(name="설정", description="알림 정책을 확인합니다. 기본은 수동 알림 전용입니다. 관리자 전용입니다.")
+async def mnb_alert_policy_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    set_mnb_notification_manual_only(interaction.guild.id, True)
+    settings = get_mnb_notification_settings(interaction.guild.id)
+    embed = discord.Embed(
+        title="🔕 알림 정책 설정",
+        description=mnb_alert_box("현재 정책", [
+            "멘션 알림: 관리자 /알림 보내기 명령에서만 전송",
+            f"수동 전용 모드: {'켜짐 ✅' if settings.get('manual_only', True) else '꺼짐 ❌'}",
+            f"켜기/끄기 서버로그 숨김: {'켜짐 ✅' if settings.get('quiet_toggle_logs', True) else '꺼짐 ❌'}",
+            "버튼 클릭, 역할 생성, 패널 생성은 멘션 알림을 보내지 않음",
+        ], "🔕"),
+        color=COLOR_GRAY if 'COLOR_GRAY' in globals() else BOT_COLOR,
+    )
+    embed.set_footer(text="만능 봇 | 알림은 수동 명령으로만 전송")
+    await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+
+
+@mnb_alert_group.command(name="역할생성", description="알림 역할 5개를 미리 생성합니다. 관리자 전용입니다.")
+async def mnb_alert_create_roles_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    await safe_interaction_defer(interaction, ephemeral=True)
+    created = []
+    existed = []
+    failed = []
+    for key, config in MNB_ALERT_ROLE_CONFIGS.items():
+        before = get_mnb_alert_role(interaction.guild, key)
+        role = await get_or_create_mnb_alert_role(interaction.guild, key)
+        if role is None:
+            failed.append(config["role_name"])
+        elif before:
+            existed.append(config["role_name"])
+        else:
+            created.append(config["role_name"])
+    add_mnb_alert_log(interaction.guild.id, interaction.user.id, "역할생성", "알림역할")
+    await send_mnb_alert_admin_log(
+        interaction.guild,
+        f"🔔 알림 역할 생성/확인\n관리자: {interaction.user.mention}\n생성: `{len(created)}`개\n기존: `{len(existed)}`개\n실패: `{len(failed)}`개",
+        force=False,
+    )
+    embed = discord.Embed(
+        title="🔔 알림 역할 생성 완료",
+        description=mnb_alert_box("결과", [
+            f"새로 생성: {', '.join(created) if created else '없음'}",
+            f"이미 있음: {', '.join(existed) if existed else '없음'}",
+            f"실패: {', '.join(failed) if failed else '없음'}",
+        ], "🔔"),
+        color=COLOR_GREEN if 'COLOR_GREEN' in globals() else BOT_COLOR,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@mnb_alert_group.command(name="로그초기화", description="알림 변경 로그를 비웁니다. 관리자 전용입니다.")
+async def mnb_alert_log_clear_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    deleted = 0
+    try:
+        with DB_MUTEX:
+            c.execute("DELETE FROM notification_toggle_logs WHERE guild_id=?", (interaction.guild.id,))
+            deleted = c.rowcount
+            conn.commit()
+    except Exception:
+        deleted = 0
+    await safe_interaction_send(interaction, f"🧹 알림 로그 `{deleted}`개를 정리했어요.", ephemeral=True)
+
+
+@mnb_alert_group.command(name="로그", description="최근 알림 켜기/끄기 기록을 확인합니다. 관리자 전용입니다.")
+async def mnb_alert_log_command(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    rows = []
+    try:
+        with DB_MUTEX:
+            c.execute(
+                """
+                SELECT user_id, action, role_name, created_at
+                FROM notification_toggle_logs
+                WHERE guild_id=?
+                ORDER BY log_id DESC
+                LIMIT 15
+                """,
+                (interaction.guild.id,),
+            )
+            rows = c.fetchall()
+    except Exception:
+        rows = []
+    await safe_interaction_send(interaction, embed=build_mnb_alert_log_embed(interaction.guild, rows), ephemeral=True)
+
+
+try:
+    bot.tree.add_command(mnb_alert_group)
+except app_commands.CommandAlreadyRegistered:
+    pass
+except Exception:
+    pass
+
+
 # =========================
 # 로그 시스템
 # =========================
@@ -16532,15 +19695,428 @@ class GameRoleView(discord.ui.View):
         await self.toggle_role(interaction, "종합게임")
 
 
-def build_game_role_embed():
-    role_lines = "\n".join(f"{GAME_ROLE_EMOJIS.get(name, '🎮')} **{name}**" for name in GAME_ROLE_NAMES)
-    return create_embed(
-        "🎮 게임 역할 선택",
-        "아래 버튼을 눌러 원하는 게임 역할을 받아가세요.\n"
-        "다시 누르면 역할이 제거됩니다.\n\n"
-        f"**지원 역할**\n{role_lines}"
+class GameRoleSingleButton(discord.ui.Button):
+    def __init__(self, game_key: str, row: int = 0):
+        spec = GAME_ROLE_BUTTON_BY_KEY[game_key]
+        super().__init__(
+            label=spec["role_name"],
+            emoji=spec["emoji"],
+            style=spec["style"],
+            custom_id=game_key,
+            row=row,
+        )
+        self.game_key = game_key
+        self.role_name = spec["role_name"]
+
+    async def callback(self, interaction: discord.Interaction):
+        helper = GameRoleView()
+        await helper.toggle_role(interaction, self.role_name)
+
+
+class GameRoleIndividualView(discord.ui.View):
+    """/임베드 버튼붙이기에서 게임 역할을 1개씩 추가할 때 쓰는 View입니다."""
+    def __init__(self, game_keys):
+        super().__init__(timeout=None)
+        clean_keys = []
+        for key in game_keys or []:
+            game_key = get_game_role_button_key(key)
+            if game_key and game_key not in clean_keys:
+                clean_keys.append(game_key)
+        for index, game_key in enumerate(clean_keys[:25]):
+            self.add_item(GameRoleSingleButton(game_key, row=index // 5))
+
+
+def extract_game_role_button_keys_from_message(message: discord.Message):
+    """메시지에 붙어있는 게임 역할 버튼만 뽑아냅니다. 다른 버튼이 섞여 있으면 True로 표시합니다."""
+    keys = []
+    has_non_game_component = False
+    for row in getattr(message, "components", []) or []:
+        for component in getattr(row, "children", []) or []:
+            custom_id = getattr(component, "custom_id", "") or ""
+            game_key = get_game_role_button_key(custom_id)
+            if game_key:
+                if game_key not in keys:
+                    keys.append(game_key)
+            else:
+                has_non_game_component = True
+    return keys, has_non_game_component
+
+
+async def edit_message_with_game_role_buttons(message: discord.Message, game_keys):
+    clean_keys = []
+    for key in game_keys or []:
+        game_key = get_game_role_button_key(key)
+        if game_key and game_key not in clean_keys:
+            clean_keys.append(game_key)
+    await message.edit(view=GameRoleIndividualView(clean_keys) if clean_keys else None)
+
+
+# =========================
+# 자유 역할 버튼 시스템 v219
+# =========================
+# 관리자가 직접 만든 역할도 최근 봇 임베드에 버튼으로 붙일 수 있습니다.
+# 버튼 custom_id는 역할 ID 기반이라 역할 이름을 바꿔도 계속 작동합니다.
+CUSTOM_ROLE_BUTTON_PREFIX = "mnb_custom_role_"
+
+CUSTOM_ROLE_BUTTON_STYLE_MAP = {
+    "primary": discord.ButtonStyle.blurple,
+    "blurple": discord.ButtonStyle.blurple,
+    "blue": discord.ButtonStyle.blurple,
+    "파랑": discord.ButtonStyle.blurple,
+    "secondary": discord.ButtonStyle.gray,
+    "gray": discord.ButtonStyle.gray,
+    "grey": discord.ButtonStyle.gray,
+    "회색": discord.ButtonStyle.gray,
+    "success": discord.ButtonStyle.green,
+    "green": discord.ButtonStyle.green,
+    "초록": discord.ButtonStyle.green,
+    "danger": discord.ButtonStyle.red,
+    "red": discord.ButtonStyle.red,
+    "빨강": discord.ButtonStyle.red,
+}
+
+
+def custom_role_button_custom_id(role_id: int):
+    return f"{CUSTOM_ROLE_BUTTON_PREFIX}{int(role_id)}"
+
+
+def custom_role_id_from_custom_id(custom_id: str):
+    raw = (custom_id or "").strip()
+    if not raw.startswith(CUSTOM_ROLE_BUTTON_PREFIX):
+        return 0
+    try:
+        return int(raw[len(CUSTOM_ROLE_BUTTON_PREFIX):])
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_custom_role_button_style(style: str):
+    return CUSTOM_ROLE_BUTTON_STYLE_MAP.get((style or "secondary").strip().lower(), discord.ButtonStyle.gray)
+
+
+def custom_role_button_style_name(style):
+    if style == discord.ButtonStyle.blurple:
+        return "primary"
+    if style == discord.ButtonStyle.green:
+        return "success"
+    if style == discord.ButtonStyle.red:
+        return "danger"
+    return "secondary"
+
+
+def save_custom_role_button(guild_id: int, role_id: int, label: str = "", emoji: str = "", style: str = "secondary", created_by: int = 0):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    style_value = custom_role_button_style_name(normalize_custom_role_button_style(style))
+    c.execute(
+        """
+        INSERT INTO custom_role_buttons(guild_id, role_id, label, emoji, style, created_by, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, role_id) DO UPDATE SET
+            label=excluded.label,
+            emoji=excluded.emoji,
+            style=excluded.style,
+            created_by=excluded.created_by,
+            updated_at=excluded.updated_at
+        """,
+        (int(guild_id or 0), int(role_id or 0), (label or "")[:80], (emoji or "")[:40], style_value, int(created_by or 0), now)
+    )
+    conn.commit()
+
+
+def delete_custom_role_button(guild_id: int, role_id: int):
+    c.execute("DELETE FROM custom_role_buttons WHERE guild_id=? AND role_id=?", (int(guild_id or 0), int(role_id or 0)))
+    conn.commit()
+
+
+def get_custom_role_button_saved(guild_id: int, role_id: int):
+    c.execute(
+        "SELECT label, emoji, style FROM custom_role_buttons WHERE guild_id=? AND role_id=?",
+        (int(guild_id or 0), int(role_id or 0)),
+    )
+    row = c.fetchone()
+    if not row:
+        return None
+    return {"role_id": int(role_id), "label": row[0] or "", "emoji": row[1] or "", "style": row[2] or "secondary"}
+
+
+def list_custom_role_button_saved_specs(guild_id: int = 0):
+    if guild_id:
+        c.execute("SELECT guild_id, role_id, label, emoji, style FROM custom_role_buttons WHERE guild_id=?", (int(guild_id),))
+    else:
+        c.execute("SELECT guild_id, role_id, label, emoji, style FROM custom_role_buttons")
+    rows = c.fetchall()
+    return [
+        {"guild_id": int(gid or 0), "role_id": int(rid or 0), "label": label or "", "emoji": emoji or "", "style": style or "secondary"}
+        for gid, rid, label, emoji, style in rows
+    ]
+
+
+def can_bot_manage_custom_role(guild: discord.Guild, role: discord.Role):
+    if guild is None or role is None:
+        return False, "역할을 찾을 수 없어요."
+    if role.is_default():
+        return False, "`@everyone` 역할은 버튼으로 지급할 수 없어요."
+    if role.managed:
+        return False, "봇/연동 서비스가 관리하는 역할은 직접 지급할 수 없어요."
+    bot_member = guild.me or guild.get_member(bot.user.id if bot.user else 0)
+    if not bot_member or not bot_member.guild_permissions.manage_roles:
+        return False, "봇에게 `역할 관리` 권한이 없어요."
+    if role >= bot_member.top_role:
+        return False, f"`{role.name}` 역할이 봇 역할보다 위에 있어 지급/회수할 수 없어요."
+    return True, ""
+
+
+class CustomRoleSingleButton(discord.ui.Button):
+    def __init__(self, role_id: int, label: str = "", emoji: str = "", style: str = "secondary", row: int = 0):
+        self.role_id = int(role_id)
+        self.saved_label = (label or "").strip()
+        self.saved_emoji = (emoji or "").strip()
+        super().__init__(
+            label=(self.saved_label or "역할 선택")[:80],
+            emoji=self.saved_emoji or "🎭",
+            style=normalize_custom_role_button_style(style),
+            custom_id=custom_role_button_custom_id(self.role_id),
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+
+        role = interaction.guild.get_role(self.role_id)
+        if role is None:
+            return await safe_interaction_send(interaction, "❌ 이 역할은 서버에서 삭제되었어요.", ephemeral=True)
+
+        ok, reason = can_bot_manage_custom_role(interaction.guild, role)
+        if not ok:
+            return await safe_interaction_send(interaction, f"❌ {reason}", ephemeral=True)
+
+        try:
+            if role in interaction.user.roles:
+                await interaction.user.remove_roles(role, reason="자유 역할 버튼 클릭")
+                await safe_interaction_send(interaction, f"✅ `{role.name}` 역할을 제거했어요.", ephemeral=True)
+            else:
+                await interaction.user.add_roles(role, reason="자유 역할 버튼 클릭")
+                await safe_interaction_send(interaction, f"✅ `{role.name}` 역할을 받았어요.", ephemeral=True)
+        except discord.Forbidden:
+            await safe_interaction_send(interaction, "❌ 역할을 지급/회수할 권한이 부족해요. 봇 역할 위치를 확인해주세요.", ephemeral=True)
+        except discord.HTTPException as e:
+            await safe_interaction_send(interaction, f"❌ 역할 처리 중 오류가 발생했어요: `{e}`", ephemeral=True)
+
+
+class CustomRoleButtonView(discord.ui.View):
+    def __init__(self, role_specs):
+        super().__init__(timeout=None)
+        clean_specs = []
+        seen = set()
+        for spec in role_specs or []:
+            try:
+                role_id = int(spec.get("role_id") if isinstance(spec, dict) else spec)
+            except (TypeError, ValueError):
+                continue
+            if not role_id or role_id in seen:
+                continue
+            seen.add(role_id)
+            clean_specs.append(spec if isinstance(spec, dict) else {"role_id": role_id})
+        for index, spec in enumerate(clean_specs[:25]):
+            self.add_item(CustomRoleSingleButton(
+                int(spec.get("role_id")),
+                label=spec.get("label") or "",
+                emoji=spec.get("emoji") or "",
+                style=spec.get("style") or "secondary",
+                row=index // 5,
+            ))
+
+
+def extract_custom_role_button_specs_from_message(message: discord.Message):
+    specs = []
+    has_non_custom_component = False
+    for row in getattr(message, "components", []) or []:
+        for component in getattr(row, "children", []) or []:
+            custom_id = getattr(component, "custom_id", "") or ""
+            role_id = custom_role_id_from_custom_id(custom_id)
+            if role_id:
+                if role_id not in [spec.get("role_id") for spec in specs]:
+                    specs.append({
+                        "role_id": int(role_id),
+                        "label": getattr(component, "label", "") or "",
+                        "emoji": str(getattr(component, "emoji", "") or ""),
+                        "style": custom_role_button_style_name(getattr(component, "style", discord.ButtonStyle.gray)),
+                    })
+            else:
+                has_non_custom_component = True
+    return specs, has_non_custom_component
+
+
+async def edit_message_with_custom_role_buttons(message: discord.Message, role_specs):
+    clean_specs = []
+    seen = set()
+    for spec in role_specs or []:
+        try:
+            role_id = int(spec.get("role_id") if isinstance(spec, dict) else spec)
+        except (TypeError, ValueError):
+            continue
+        if not role_id or role_id in seen:
+            continue
+        seen.add(role_id)
+        saved = get_custom_role_button_saved(message.guild.id, role_id) if getattr(message, "guild", None) else None
+        merged = dict(saved or {})
+        if isinstance(spec, dict):
+            merged.update({k: v for k, v in spec.items() if v is not None})
+        merged["role_id"] = role_id
+        clean_specs.append(merged)
+    await message.edit(view=CustomRoleButtonView(clean_specs) if clean_specs else None)
+
+
+async def attach_custom_role_button_to_recent_embed(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    label: str = "",
+    emoji: str = "🎭",
+    style: str = "secondary",
+    message_id: str = "",
+):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+
+    ok, reason = can_bot_manage_custom_role(interaction.guild, role)
+    if not ok:
+        return await safe_interaction_send(interaction, f"❌ {reason}", ephemeral=True)
+
+    await safe_interaction_defer(interaction, ephemeral=True)
+
+    message, error = await find_target_bot_embed_message(interaction.channel, message_id)
+    if error:
+        return await interaction.followup.send(f"❌ {error}", ephemeral=True)
+
+    existing_specs, has_non_custom_component = extract_custom_role_button_specs_from_message(message)
+    if has_non_custom_component:
+        return await interaction.followup.send(
+            "❌ 이 임베드에는 다른 종류의 버튼/선택창이 이미 붙어있어요.\n"
+            "자유 역할 버튼만 여러 개 붙이려면 먼저 `/임베드 버튼제거`로 기존 버튼을 제거해주세요.",
+            ephemeral=True,
+        )
+
+    button_label = (label or role.name)[:80]
+    button_emoji = (emoji or "🎭").strip()[:40]
+    style_name = custom_role_button_style_name(normalize_custom_role_button_style(style))
+    save_custom_role_button(interaction.guild.id, role.id, button_label, button_emoji, style_name, interaction.user.id)
+
+    new_spec = {"role_id": role.id, "label": button_label, "emoji": button_emoji, "style": style_name}
+    role_ids = [spec.get("role_id") for spec in existing_specs]
+    if role.id in role_ids:
+        existing_specs = [new_spec if spec.get("role_id") == role.id else spec for spec in existing_specs]
+    else:
+        if len(existing_specs) >= 25:
+            return await interaction.followup.send("❌ 한 메시지에는 역할 버튼을 최대 25개까지 붙일 수 있어요.", ephemeral=True)
+        existing_specs.append(new_spec)
+
+    try:
+        await edit_message_with_custom_role_buttons(message, existing_specs)
+    except discord.Forbidden:
+        return await interaction.followup.send("❌ 메시지를 수정할 권한이 없습니다.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"❌ 역할 버튼을 붙이는 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ 현재 채널의 최근 봇 임베드에 **{button_emoji} {button_label}** 역할 버튼을 붙였어요.\n"
+        "이제 서버 사람들이 그 버튼을 눌러 직접 역할을 받을 수 있습니다.",
+        ephemeral=True,
+    )
+    await send_log(
+        interaction.guild,
+        f"🧩 자유 역할 버튼 붙이기\n채널: {interaction.channel.mention}\n역할: {role.mention}\n관리자: {interaction.user.mention}",
+        "general",
     )
 
+
+async def remove_custom_role_button_from_recent_embed(interaction: discord.Interaction, role: discord.Role, message_id: str = ""):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있어요.", ephemeral=True)
+    await safe_interaction_defer(interaction, ephemeral=True)
+
+    message, error = await find_target_bot_embed_message(interaction.channel, message_id)
+    if error:
+        return await interaction.followup.send(f"❌ {error}", ephemeral=True)
+
+    existing_specs, has_non_custom_component = extract_custom_role_button_specs_from_message(message)
+    if has_non_custom_component:
+        return await interaction.followup.send(
+            "❌ 이 임베드에는 자유 역할 버튼 말고 다른 버튼/선택창도 섞여 있어 특정 역할 버튼만 제거할 수 없어요.\n"
+            "전체 버튼 제거를 사용해주세요.",
+            ephemeral=True,
+        )
+
+    if role.id not in [spec.get("role_id") for spec in existing_specs]:
+        return await interaction.followup.send(f"⚠️ 이 임베드에는 `{role.name}` 역할 버튼이 붙어있지 않아요.", ephemeral=True)
+
+    new_specs = [spec for spec in existing_specs if spec.get("role_id") != role.id]
+    try:
+        await edit_message_with_custom_role_buttons(message, new_specs)
+        delete_custom_role_button(interaction.guild.id, role.id)
+    except discord.Forbidden:
+        return await interaction.followup.send("❌ 메시지를 수정할 권한이 없습니다.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"❌ 역할 버튼을 제거하는 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+
+    await interaction.followup.send(f"✅ `{role.name}` 역할 버튼을 제거했어요.", ephemeral=True)
+
+
+def mnb_register_custom_role_button_views_once():
+    specs = list_custom_role_button_saved_specs()
+    if not specs:
+        return
+    # guild별로 저장된 역할 버튼을 25개씩 나눠 persistent view로 등록합니다.
+    for guild_id in sorted({spec["guild_id"] for spec in specs}):
+        guild_specs = [spec for spec in specs if spec["guild_id"] == guild_id]
+        for i in range(0, len(guild_specs), 25):
+            try:
+                bot.add_view(CustomRoleButtonView(guild_specs[i:i + 25]))
+            except Exception:
+                pass
+
+
+
+def build_game_role_embed():
+    """게임역할 버튼을 역할별 1개씩 보여주는 박스형 임베드입니다."""
+    embed = discord.Embed(
+        title="🎮 게임 역할 선택 패널",
+        description=(
+            "원하는 게임 버튼을 누르면 역할을 받을 수 있어요.\n"
+            "이미 받은 역할 버튼을 다시 누르면 역할이 제거됩니다.\n\n"
+            "```text\n"
+            "╭──────── 게임 역할 안내 ────────╮\n"
+            "│ 역할마다 버튼이 1개씩 따로 나옵니다 │\n"
+            "│ 여러 게임 역할을 동시에 선택 가능해요 │\n"
+            "│ 클릭: 역할 지급 / 다시 클릭: 역할 제거 │\n"
+            "╰────────────────────────────╯\n"
+            "```"
+        ),
+        color=COLOR_LAVENDER,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    for role_name in GAME_ROLE_NAMES:
+        emoji = GAME_ROLE_EMOJIS.get(role_name, "🎮")
+        embed.add_field(
+            name=f"{emoji} {role_name}",
+            value=(
+                "```text\n"
+                f"┌ {role_name}\n"
+                "│ 버튼 클릭 시 역할 지급 / 제거\n"
+                "└ 개별 선택 버튼\n"
+                "```"
+            ),
+            inline=True,
+        )
+
+    embed.set_footer(text="만능 봇 | 게임역할 버튼은 역할별 1개씩 따로 작동합니다")
+    return embed
 
 async def send_game_role_panel_to_channel(channel: discord.TextChannel):
     """게임 역할 선택 채널에 게임역할 패널을 전송합니다. 이미 있으면 중복 전송하지 않습니다."""
@@ -21789,12 +25365,44 @@ class UnifiedEmbedSettingView(discord.ui.View):
 # 서버별로 이름/입장 음성방을 설정해서 관리하는 방식으로 동작합니다.
 
 CUSTOM_BOT_TOKENS = {
-    1: os.getenv("CUSTOM_BOT_TOKEN_1", "").strip(),
-    2: os.getenv("CUSTOM_BOT_TOKEN_2", "").strip(),
-    3: os.getenv("CUSTOM_BOT_TOKEN_3", "").strip(),
+    1: read_discord_token("커스텀봇1", "CUSTOM_BOT_TOKEN_1", "CUSTOM_DISCORD_TOKEN_1", "MUSIC_BOT_TOKEN_1", "SUB_BOT_TOKEN_1"),
+    2: read_discord_token("커스텀봇2", "CUSTOM_BOT_TOKEN_2", "CUSTOM_DISCORD_TOKEN_2", "MUSIC_BOT_TOKEN_2", "SUB_BOT_TOKEN_2"),
+    3: read_discord_token("커스텀봇3", "CUSTOM_BOT_TOKEN_3", "CUSTOM_DISCORD_TOKEN_3", "MUSIC_BOT_TOKEN_3", "SUB_BOT_TOKEN_3"),
 }
 
-TTS_BOT_TOKEN = os.getenv("TTS_BOT_TOKEN", "").strip()
+TTS_BOT_TOKEN = read_discord_token(
+    "TTS봇",
+    "TTS_BOT_TOKEN",
+    "TTS_DISCORD_TOKEN",
+    "TTS_DISCORD_BOT_TOKEN",
+    "DISCORD_TTS_TOKEN",
+    "DISCORD_TTS_BOT_TOKEN",
+    "TTS_TOKEN",
+    "TTSBOT_TOKEN",
+    "TTS_BOT",
+    "TTS_BOT_DISCORD_TOKEN",
+    "CUSTOM_BOT_TOKEN_TTS",
+    "SUB_BOT_TOKEN_TTS",
+    "CUSTOM_BOT_TOKEN_4",
+    "SUB_BOT_TOKEN_4",
+    "MUSIC_BOT_TOKEN_4",
+)
+
+
+def warn_duplicate_bot_tokens():
+    seen = {}
+    token_pairs = [("메인봇", TOKEN), ("TTS봇", TTS_BOT_TOKEN)] + [(f"커스텀봇{slot}", token) for slot, token in CUSTOM_BOT_TOKENS.items()]
+    for label, token in token_pairs:
+        if not token:
+            continue
+        key = token[-12:]
+        if key in seen:
+            print(f"⚠️ 토큰 중복 의심: {seen[key]} 과 {label} 이 같은 봇 토큰일 수 있습니다. 서브봇은 각각 다른 Discord Bot 토큰이어야 합니다.")
+        else:
+            seen[key] = label
+
+
+warn_duplicate_bot_tokens()
 
 
 class TTSSubBotClient(discord.Client):
@@ -21841,7 +25449,7 @@ async def connect_tts_voice_client(guild: discord.Guild, voice_channel: discord.
             return None, "❌ TTS 서브봇이 아직 로그인 중입니다. 잠시 후 다시 시도해주세요."
         sub_guild = tts_sub_bot.get_guild(guild.id)
         if sub_guild is None:
-            return None, "❌ TTS 서브봇이 이 서버에 초대되어 있지 않습니다. TTS 서브봇을 서버에 초대해주세요."
+            return None, "__MNB_TTS_SUBBOT_NOT_IN_GUILD__"
         sub_channel = sub_guild.get_channel(voice_channel.id)
         if not isinstance(sub_channel, discord.VoiceChannel):
             return None, "❌ TTS 서브봇이 이 음성 채널을 찾지 못했습니다. 권한을 확인해주세요."
@@ -21868,7 +25476,8 @@ async def ensure_tts_subbot_join_voice(guild: discord.Guild, voice_channel: disc
         return False
     if guild is None or voice_channel is None:
         return False
-    if voice_channel.name not in TTS_VOICE_CHANNEL_NAMES:
+    # 자유 채널 모드에서는 TTS 전용 통방이 아니어도 유저가 있는 음성 채널로 바로 입장합니다.
+    if (not MNB_FREE_CHANNEL_MODE) and voice_channel.name not in TTS_VOICE_CHANNEL_NAMES:
         return False
     voice_client, error = await connect_tts_voice_client(guild, voice_channel)
     if error:
@@ -22337,9 +25946,12 @@ async def send_custom_music_panel_to_voice_channel(guild: discord.Guild, slot: i
     if connect:
         connect_result = await custom_bot_connect_slot(int(slot), guild.id, voice_channel.id, "")
 
-    panel_channel = resolve_custom_music_text_channel(guild, voice_channel, fallback_channel)
+    if MNB_FREE_CHANNEL_MODE and MNB_CUSTOM_MUSIC_PANEL_CURRENT_CHANNEL and fallback_channel and callable(getattr(fallback_channel, "send", None)):
+        panel_channel = fallback_channel
+    else:
+        panel_channel = resolve_custom_music_text_channel(guild, voice_channel, fallback_channel)
     if panel_channel is None:
-        return f"{connect_result}\n⚠️ 뮤직패널을 보낼 채팅채널을 찾지 못했어요.".strip()
+        return f"{connect_result}\n⚠️ 뮤직패널을 보낼 채팅채널을 찾지 못했어요. 원하는 텍스트 채널에서 다시 버튼을 눌러주세요.".strip()
 
     panel_identity_key = (int(slot), int(guild.id))
     old_info = CUSTOM_MUSIC_PANEL_MESSAGES.get(panel_identity_key)
@@ -22709,20 +26321,13 @@ class CustomMusicPanelView(discord.ui.View):
         await safe_interaction_send(interaction, f"⏭️ 스킵 투표 완료! 현재 **{vote_count}/{required_votes}**", ephemeral=True)
 
     async def queue_button(self, interaction: discord.Interaction):
-        key = custom_music_key(self.slot, interaction.guild.id)
-        queue = get_custom_music_queue(self.slot, interaction.guild.id)
-        current = CUSTOM_MUSIC_NOW_PLAYING.get(key)
-        text = ""
-        if current:
-            text += f"🎵 **현재 재생 중**\n{current.get('service_emoji', '🎧')} {current['title']} `[{format_duration(current.get('duration'))}]`\n\n"
-        if queue:
-            text += "📜 **대기열**\n"
-            for i, track in enumerate(list(queue)[:10], start=1):
-                text += f"{i}. {track.get('service_emoji', '🎧')} {track['title']} `[{format_duration(track.get('duration'))}]`\n"
-        else:
-            text += "대기 중인 곡이 없어요."
-        embed = create_embed(f"📜 {self.slot}번 커스텀 봇 대기열", text[:4000], color=0x9B7CFF)
-        await safe_interaction_send(interaction, embed=embed, ephemeral=True)
+        embed = build_music_queue_manage_embed(interaction.guild.id, slot=self.slot)
+        await safe_interaction_send(
+            interaction,
+            embed=embed,
+            view=MusicQueueManageView(interaction.guild.id, slot=self.slot),
+            ephemeral=True,
+        )
 
     async def loop_button(self, interaction: discord.Interaction):
         key = custom_music_key(self.slot, interaction.guild.id)
@@ -23142,9 +26747,15 @@ async def open_role_maker_modal(interaction: discord.Interaction):
 @bot.tree.command(name="친목섭", description="친목섭 역할/카테고리/채널을 선택해서 자동 생성합니다.")
 @app_commands.describe(생성범위="생성할 친목섭 묶음을 선택하세요.")
 @app_commands.choices(생성범위=[
+    app_commands.Choice(name="서버맞춤 자동", value="auto"),
     app_commands.Choice(name="전체", value="all"),
-    app_commands.Choice(name="역할만", value="roles"),
-    app_commands.Choice(name="기본카테고리", value="basic"),
+    app_commands.Choice(name="역할만 패널", value="roles"),
+    app_commands.Choice(name="기본카테고리 패널", value="basic"),
+    app_commands.Choice(name="게임방", value="game"),
+    app_commands.Choice(name="내전방", value="scrim"),
+    app_commands.Choice(name="강화방", value="enhance"),
+    app_commands.Choice(name="도박방", value="gambling"),
+    app_commands.Choice(name="생일", value="birthday"),
     app_commands.Choice(name="서버부스트", value="boost"),
     app_commands.Choice(name="로그", value="logs"),
     app_commands.Choice(name="서버스텟", value="stats"),
@@ -23179,6 +26790,267 @@ async def legacy_inventory_command(interaction: discord.Interaction):
 async def legacy_daily_mission_command(interaction: discord.Interaction):
     await daily_mission_command(interaction)
 
+# ----- 도박방/포인트 미니게임 최상위 명령어 -----
+# 실제 현금/상품 거래가 아닌 서버 내부 포인트용 미니게임입니다.
+MANEUNG_GAMBLE_MIN_BET = 10
+MANEUNG_GAMBLE_MAX_BET = 50000
+MANEUNG_GAMBLE_COOLDOWN_SECONDS = 5
+MANEUNG_GAMBLE_COOLDOWNS = {}
+
+
+def _maneung_split_roulette_items(raw_items: str):
+    items = []
+    for part in re.split(r"[,/|\n]+", raw_items or ""):
+        item = part.strip()
+        if item:
+            items.append(item[:40])
+    return items[:30]
+
+
+def _maneung_gamble_footer():
+    return "만능봇 미니게임 센터 | 서버 포인트 전용 · 실제 현금 거래 금지"
+
+
+def _maneung_gamble_profit_text(profit: int):
+    if profit > 0:
+        return f"+{profit:,}P"
+    if profit < 0:
+        return f"{profit:,}P"
+    return "±0P"
+
+
+def _maneung_gamble_cooldown_left(guild_id: int, user_id: int, game_key: str):
+    now = time.time()
+    key = (int(guild_id), int(user_id), str(game_key))
+    last = MANEUNG_GAMBLE_COOLDOWNS.get(key, 0)
+    left = MANEUNG_GAMBLE_COOLDOWN_SECONDS - (now - last)
+    if left > 0:
+        return int(left) + 1
+    MANEUNG_GAMBLE_COOLDOWNS[key] = now
+    return 0
+
+
+def _maneung_validate_bet(interaction: discord.Interaction, bet: int, game_key: str):
+    if interaction.guild is None:
+        return False, 0, "❌ 서버에서만 사용할 수 있습니다."
+
+    try:
+        bet = int(bet)
+    except (TypeError, ValueError):
+        return False, 0, "❌ 금액은 숫자로 입력해주세요."
+
+    if bet < MANEUNG_GAMBLE_MIN_BET:
+        return False, 0, f"❌ 최소 베팅 금액은 **{MANEUNG_GAMBLE_MIN_BET:,}P**입니다."
+    if bet > MANEUNG_GAMBLE_MAX_BET:
+        return False, 0, f"❌ 1회 최대 베팅 금액은 **{MANEUNG_GAMBLE_MAX_BET:,}P**입니다."
+
+    cooldown_left = _maneung_gamble_cooldown_left(interaction.guild.id, interaction.user.id, game_key)
+    if cooldown_left > 0:
+        return False, 0, f"⏳ 너무 빠르게 사용할 수 없습니다. **{cooldown_left}초** 뒤 다시 시도해주세요."
+
+    point = get_user_point(interaction.guild.id, interaction.user.id)
+    if point < bet:
+        return False, point, (
+            "❌ 포인트가 부족합니다.\n"
+            f"필요 포인트: **{bet:,}P**\n"
+            f"보유 포인트: **{point:,}P**"
+        )
+    return True, point, ""
+
+
+def _maneung_apply_bet(guild_id: int, user_id: int, before_point: int, bet: int, reward: int):
+    reward = max(0, int(reward or 0))
+    after_point = max(0, int(before_point) - int(bet) + reward)
+    set_user_point(guild_id, user_id, after_point)
+    profit = reward - int(bet)
+    return after_point, profit
+
+
+def _maneung_gamble_result_embed(title: str, interaction: discord.Interaction, bet: int, reward: int, before_point: int, after_point: int, result_text: str, color: int):
+    profit = reward - bet
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"{interaction.user.mention} 님의 포인트 미니게임 결과입니다.\n\n"
+            f"{result_text}"
+        ),
+        color=color,
+    )
+    embed.add_field(name="사용 포인트", value=f"**-{bet:,}P**", inline=True)
+    embed.add_field(name="획득 포인트", value=f"**+{reward:,}P**", inline=True)
+    embed.add_field(name="손익", value=f"**{_maneung_gamble_profit_text(profit)}**", inline=True)
+    embed.add_field(name="이전 포인트", value=f"{before_point:,}P", inline=True)
+    embed.add_field(name="현재 포인트", value=f"{after_point:,}P", inline=True)
+    embed.set_footer(text=_maneung_gamble_footer())
+    if getattr(interaction.user, "display_avatar", None):
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    return embed
+
+
+@bot.tree.command(name="주사위", description="포인트를 걸고 주사위 숫자를 맞춥니다.")
+@app_commands.describe(금액="사용할 서버 포인트", 예측="맞출 숫자 1~6")
+async def legacy_dice_top_command(
+    interaction: discord.Interaction,
+    금액: app_commands.Range[int, MANEUNG_GAMBLE_MIN_BET, MANEUNG_GAMBLE_MAX_BET],
+    예측: app_commands.Range[int, 1, 6],
+):
+    ok, before_point, error = _maneung_validate_bet(interaction, 금액, "dice")
+    if not ok:
+        return await safe_interaction_send(interaction, error, ephemeral=True)
+
+    roll = random.randint(1, 6)
+    win = int(예측) == roll
+    reward = int(금액) * 6 if win else 0
+    after_point, profit = _maneung_apply_bet(interaction.guild.id, interaction.user.id, before_point, int(금액), reward)
+    result_text = (
+        f"🎲 주사위 결과: **{roll}**\n"
+        f"🎯 내 예측: **{int(예측)}**\n"
+        f"{'✅ 숫자를 정확히 맞췄어요! 보상은 베팅금의 6배입니다.' if win else '💥 아쉽게도 빗나갔어요. 다음 기회를 노려보세요.'}"
+    )
+    color = COLOR_GOLD if win else COLOR_WARNING
+    embed = _maneung_gamble_result_embed("🎲 만능봇 주사위", interaction, int(금액), reward, before_point, after_point, result_text, color)
+    await safe_interaction_send(interaction, embed=embed)
+
+
+@bot.tree.command(name="룰렛", description="포인트를 걸고 룰렛 색상/홀짝을 맞춥니다.")
+@app_commands.describe(금액="사용할 서버 포인트", 선택="맞출 룰렛 결과")
+@app_commands.choices(선택=[
+    app_commands.Choice(name="빨강 x2", value="red"),
+    app_commands.Choice(name="검정 x2", value="black"),
+    app_commands.Choice(name="홀수 x2", value="odd"),
+    app_commands.Choice(name="짝수 x2", value="even"),
+    app_commands.Choice(name="초록 x14", value="green"),
+])
+async def legacy_roulette_top_command(
+    interaction: discord.Interaction,
+    금액: app_commands.Range[int, MANEUNG_GAMBLE_MIN_BET, MANEUNG_GAMBLE_MAX_BET],
+    선택: app_commands.Choice[str],
+):
+    ok, before_point, error = _maneung_validate_bet(interaction, 금액, "roulette")
+    if not ok:
+        return await safe_interaction_send(interaction, error, ephemeral=True)
+
+    number = random.randint(0, 36)
+    if number == 0:
+        result_key = "green"
+        result_label = "초록"
+    else:
+        result_key = random.choice(["red", "black"])
+        result_label = "빨강" if result_key == "red" else "검정"
+    parity_key = "none" if number == 0 else ("odd" if number % 2 else "even")
+    parity_label = "없음" if number == 0 else ("홀수" if parity_key == "odd" else "짝수")
+
+    selected_key = 선택.value
+    selected_label = 선택.name
+    win = selected_key == result_key or selected_key == parity_key
+    multiplier = 14 if selected_key == "green" else 2
+    reward = int(금액) * multiplier if win else 0
+
+    after_point, profit = _maneung_apply_bet(interaction.guild.id, interaction.user.id, before_point, int(금액), reward)
+    result_text = (
+        f"🎯 내 선택: **{selected_label}**\n"
+        f"🎡 룰렛 번호: **{number}**\n"
+        f"🎨 색상: **{result_label}** / 🔢 홀짝: **{parity_label}**\n"
+        f"{'✅ 적중! 선택 배율에 따라 보상이 지급됐어요.' if win else '💥 미적중! 포인트가 차감됐어요.'}"
+    )
+    color = COLOR_GOLD if win else COLOR_WARNING
+    embed = _maneung_gamble_result_embed("🎯 만능봇 룰렛", interaction, int(금액), reward, before_point, after_point, result_text, color)
+    embed.add_field(name="배율표", value="빨강/검정/홀수/짝수 x2 · 초록 x14", inline=False)
+    await safe_interaction_send(interaction, embed=embed)
+
+
+@bot.tree.command(name="마크", description="포인트를 걸고 마크 광산 보상을 뽑습니다.")
+@app_commands.describe(금액="사용할 서버 포인트")
+async def legacy_minecraft_top_command(
+    interaction: discord.Interaction,
+    금액: app_commands.Range[int, MANEUNG_GAMBLE_MIN_BET, MANEUNG_GAMBLE_MAX_BET],
+):
+    ok, before_point, error = _maneung_validate_bet(interaction, 금액, "minecraft")
+    if not ok:
+        return await safe_interaction_send(interaction, error, ephemeral=True)
+
+    table = [
+        (450, "🟫 흙 블록", 0, "흔한 블록만 나왔어요."),
+        (700, "⬛ 석탄", 0.5, "석탄을 캤어요. 절반 회수!"),
+        (870, "⚙️ 철", 1.2, "철을 발견했어요."),
+        (950, "🟨 금", 1.8, "금광맥 발견!"),
+        (990, "💎 다이아몬드", 3, "다이아몬드를 캤어요!"),
+        (1000, "🟪 네더라이트", 8, "초희귀 네더라이트 발견!"),
+    ]
+    roll = random.randint(1, 1000)
+    selected = table[-1]
+    for row in table:
+        if roll <= row[0]:
+            selected = row
+            break
+
+    _, item_name, multiplier, flavor = selected
+    reward = int(int(금액) * float(multiplier))
+    after_point, profit = _maneung_apply_bet(interaction.guild.id, interaction.user.id, before_point, int(금액), reward)
+    result_text = (
+        f"⛏️ 광산 결과: **{item_name}**\n"
+        f"📦 보상 배율: **x{multiplier}**\n"
+        f"💬 {flavor}"
+    )
+    color = COLOR_GOLD if reward > int(금액) else (COLOR_MINT if reward > 0 else COLOR_WARNING)
+    embed = _maneung_gamble_result_embed("⛏️ 만능봇 마크 광산", interaction, int(금액), reward, before_point, after_point, result_text, color)
+    embed.add_field(name="광산표", value="흙 x0 / 석탄 x0.5 / 철 x1.2 / 금 x1.8 / 다이아 x3 / 네더라이트 x8", inline=False)
+    await safe_interaction_send(interaction, embed=embed)
+
+
+@bot.tree.command(name="소개팅", description="포인트를 걸고 친구 케미 보상을 확인합니다.")
+@app_commands.describe(금액="사용할 서버 포인트", 상대="같이 케미를 볼 멤버")
+async def legacy_dating_top_command(
+    interaction: discord.Interaction,
+    금액: app_commands.Range[int, MANEUNG_GAMBLE_MIN_BET, MANEUNG_GAMBLE_MAX_BET],
+    상대: discord.Member = None,
+):
+    ok, before_point, error = _maneung_validate_bet(interaction, 금액, "dating")
+    if not ok:
+        return await safe_interaction_send(interaction, error, ephemeral=True)
+
+    if 상대 is not None:
+        if 상대.bot:
+            return await safe_interaction_send(interaction, "❌ 봇 말고 서버 멤버를 선택해주세요.", ephemeral=True)
+        if 상대.id == interaction.user.id:
+            return await safe_interaction_send(interaction, "❌ 자기 자신 말고 다른 멤버를 선택해주세요.", ephemeral=True)
+        target_text = 상대.mention
+    else:
+        target_text = "랜덤 소개 카드"
+
+    score = random.randint(1, 100)
+    if score >= 95:
+        grade, multiplier, comment = "💘 운명급 케미", 5, "서버 이벤트 듀오로 바로 나가도 될 정도예요!"
+    elif score >= 85:
+        grade, multiplier, comment = "💕 완전 좋은 케미", 2.5, "대화가 잘 통할 것 같은 조합이에요."
+    elif score >= 70:
+        grade, multiplier, comment = "💗 좋은 케미", 1.5, "같이 게임 한 판 하면 금방 친해질지도?"
+    elif score >= 50:
+        grade, multiplier, comment = "💬 무난한 케미", 1, "본전! 가볍게 대화부터 시작해보세요."
+    else:
+        grade, multiplier, comment = "💔 아쉬운 케미", 0, "이번 카드는 아쉽지만 다음 기회가 있어요."
+
+    questions = [
+        "처음 만나면 같이 할 게임은?",
+        "서버에서 제일 자주 가는 채널은?",
+        "롤/발로란트/마크 중 같이 하고 싶은 게임은?",
+        "친해지려면 어떤 대화 주제가 편해?",
+        "오늘 같이 할 미니 이벤트는?",
+    ]
+    reward = int(int(금액) * float(multiplier))
+    after_point, profit = _maneung_apply_bet(interaction.guild.id, interaction.user.id, before_point, int(금액), reward)
+    result_text = (
+        f"👥 매칭 대상: **{target_text}**\n"
+        f"📊 케미 점수: **{score}%**\n"
+        f"🏷️ 등급: **{grade}** / 배율 **x{multiplier}**\n"
+        f"💬 {comment}\n"
+        f"🗨️ 대화 질문: **{random.choice(questions)}**"
+    )
+    color = COLOR_PINK if reward >= int(금액) else COLOR_WARNING
+    embed = _maneung_gamble_result_embed("💕 만능봇 소개팅", interaction, int(금액), reward, before_point, after_point, result_text, color)
+    embed.add_field(name="등급표", value="95+ x5 / 85+ x2.5 / 70+ x1.5 / 50+ x1 / 49 이하 x0", inline=False)
+    await safe_interaction_send(interaction, embed=embed)
+
 
 # ----- 서버 그룹 -----
 @server_group.command(name="시작", description="서버 초기 세팅 방식을 선택해서 자동으로 시작합니다.")
@@ -23195,9 +27067,15 @@ async def server_group_start(interaction: discord.Interaction, 방식: app_comma
 @server_group.command(name="친목섭", description="친목섭 역할/카테고리/채널을 선택해서 자동 생성합니다.")
 @app_commands.describe(생성범위="생성할 친목섭 묶음을 선택하세요.")
 @app_commands.choices(생성범위=[
+    app_commands.Choice(name="서버맞춤 자동", value="auto"),
     app_commands.Choice(name="전체", value="all"),
-    app_commands.Choice(name="역할만", value="roles"),
-    app_commands.Choice(name="기본카테고리", value="basic"),
+    app_commands.Choice(name="역할만 패널", value="roles"),
+    app_commands.Choice(name="기본카테고리 패널", value="basic"),
+    app_commands.Choice(name="게임방", value="game"),
+    app_commands.Choice(name="내전방", value="scrim"),
+    app_commands.Choice(name="강화방", value="enhance"),
+    app_commands.Choice(name="도박방", value="gambling"),
+    app_commands.Choice(name="생일", value="birthday"),
     app_commands.Choice(name="서버부스트", value="boost"),
     app_commands.Choice(name="로그", value="logs"),
     app_commands.Choice(name="서버스텟", value="stats"),
@@ -23211,14 +27089,32 @@ async def server_group_friend(interaction: discord.Interaction, 생성범위: ap
     await create_friend_server(interaction, 생성범위)
 
 
-@server_group.command(name="기본카테고리", description="기본 카테고리와 채널을 자동 생성합니다.")
+@server_group.command(name="기본카테고리", description="박스형 패널에서 원하는 기본 카테고리만 생성합니다.")
 async def server_group_basic_categories(interaction: discord.Interaction):
-    await create_default_server_categories(interaction)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if await reject_if_not_bot_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    await open_friend_basic_category_panel(interaction)
 
 
-@server_group.command(name="역할자동생성", description="친목섭 기본 역할을 자동으로 생성합니다.")
-async def server_group_roles(interaction: discord.Interaction):
-    await create_friend_roles_command(interaction)
+@server_group.command(name="역할자동생성", description="친목섭 기본 역할을 범위별로 자동 생성합니다.")
+@app_commands.describe(생성범위="자동 생성할 역할 묶음을 선택하세요.")
+@app_commands.choices(생성범위=[
+    app_commands.Choice(name="전체", value="all"),
+    app_commands.Choice(name="관리자", value="admin"),
+    app_commands.Choice(name="담당팀", value="team"),
+    app_commands.Choice(name="특수역할", value="special"),
+    app_commands.Choice(name="크리에이터", value="creator"),
+    app_commands.Choice(name="멤버등급", value="member"),
+    app_commands.Choice(name="프로필", value="profile"),
+    app_commands.Choice(name="친구구하기", value="friend"),
+    app_commands.Choice(name="게임", value="game"),
+])
+async def server_group_roles(interaction: discord.Interaction, 생성범위: app_commands.Choice[str] = None):
+    await create_friend_roles_command(interaction, 생성범위)
 
 
 @server_group.command(name="역할선택생성", description="필독 카테고리에 역할 선택 패널을 생성합니다.")
@@ -23302,34 +27198,409 @@ async def server_group_support_ticket_restore(interaction: discord.Interaction):
     await restore_support_ticket_command(interaction)
 
 
+
+# =========================
+# /임베드 통합 박스형 패널
+# =========================
+# Discord 슬래시 명령 구조상 app_commands.Group인 /임베드는 단독 실행 콜백을 가질 수 없습니다.
+# 그래서 /임베드 패널 안에 기존 /임베드 하위 기능을 박스형 버튼 패널로 모았습니다.
+
+
+def build_embed_main_panel_embed(guild: discord.Guild | None = None):
+    guild_name = guild.name if guild else "현재 서버"
+    embed = discord.Embed(
+        title="🖼️ /임베드 통합 관리 패널",
+        description=(
+            f"**{guild_name}** 임베드 기능을 한 곳에서 관리합니다.\n\n"
+            "```text\n"
+            "╭──────── /임베드 통합 메뉴 ────────╮\n"
+            "│ 설정      : 임베드 디자인/문구 수정     │\n"
+            "│ 버튼붙이기 : 최근 봇 임베드에 버튼 연결   │\n"
+            "│ 역할버튼   : 내가 만든 역할도 버튼으로 연결   │\n"
+            "│ 인증문구   : 인증 완료 메시지 관리        │\n"
+            "╰────────────────────────────╯\n"
+            "```\n"
+            "아래 버튼을 눌러 기존 `/임베드 ㅇㅇ` 기능을 바로 열 수 있어요."
+        ),
+        color=BOT_COLOR,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(
+        name="📝 임베드 설정",
+        value="```text\n환영 / 규칙 / 자기소개 / 인증 / 패널 임베드 수정\n```",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧩 버튼 관리",
+        value="```text\n버튼붙이기 / 역할버튼붙이기 / 버튼제거 / 버튼목록\n```",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎮 게임역할",
+        value="```text\n/임베드 버튼붙이기·버튼제거 안에서 역할별 1개씩 관리\n```",
+        inline=False,
+    )
+    embed.set_footer(text="만능 봇 | /임베드 패널")
+    return embed
+
+
+class EmbedManualButtonAttachSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=choice.name[:100], value=choice.value, emoji=str(choice.name).split(" ", 1)[0] if str(choice.name).split(" ", 1)[0] else None)
+            for choice in AUTO_BUTTON_MANUAL_CHOICES
+        ]
+        super().__init__(
+            placeholder="일반 패널 버튼 붙이기",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await attach_embed_button_command(interaction, self.values[0], "")
+
+
+class EmbedManualGameRoleButtonAttachSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=f"{spec['role_name']} 버튼", value=spec["key"], emoji=spec["emoji"])
+            for spec in GAME_ROLE_BUTTON_SPECS
+        ]
+        super().__init__(
+            placeholder="게임역할 버튼 1개씩 붙이기",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await attach_embed_button_command(interaction, self.values[0], "")
+
+
+class EmbedManualButtonAttachView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(EmbedManualButtonAttachSelect())
+        self.add_item(EmbedManualGameRoleButtonAttachSelect())
+        self.add_item(EmbedBackToMainButton())
+
+
+class EmbedManualButtonRemoveSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label="전체 버튼 제거", value="__all__", emoji="🗑️")]
+        options.extend(
+            discord.SelectOption(label=choice.name[:100], value=choice.value, emoji=str(choice.name).split(" ", 1)[0] if str(choice.name).split(" ", 1)[0] else None)
+            for choice in AUTO_BUTTON_MANUAL_CHOICES
+        )
+        super().__init__(
+            placeholder="전체/일반 패널 버튼 제거",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await remove_embed_button_command(interaction, "", self.values[0])
+
+
+class EmbedManualGameRoleButtonRemoveSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=f"{spec['role_name']} 버튼 제거", value=spec["key"], emoji=spec["emoji"])
+            for spec in GAME_ROLE_BUTTON_SPECS
+        ]
+        super().__init__(
+            placeholder="게임역할 버튼 1개씩 제거",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await remove_embed_button_command(interaction, "", self.values[0])
+
+
+class EmbedManualButtonRemoveView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(EmbedManualButtonRemoveSelect())
+        self.add_item(EmbedManualGameRoleButtonRemoveSelect())
+        self.add_item(EmbedBackToMainButton())
+
+
+class EmbedAutoButtonTypeSelect(discord.ui.Select):
+    def __init__(self, parent_view: "EmbedAutoButtonSettingPanelView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=choice.name[:100], value=choice.value, emoji=str(choice.name).split(" ", 1)[0] if str(choice.name).split(" ", 1)[0] else None)
+            for choice in AUTO_BUTTON_MANUAL_CHOICES
+        ]
+        super().__init__(
+            placeholder="자동 연결을 설정할 버튼 종류를 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.selected_button_type = self.values[0]
+        embed = self.parent_view.build_embed(interaction.guild)
+        await safe_interaction_edit(interaction, embed=embed, view=self.parent_view)
+
+
+class EmbedAutoButtonSettingPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.selected_button_type = ""
+        self.add_item(EmbedAutoButtonTypeSelect(self))
+
+    def build_embed(self, guild: discord.Guild | None = None):
+        selected = self.selected_button_type or "아직 선택 안 됨"
+        if self.selected_button_type:
+            selected = get_auto_button_display_name(self.selected_button_type)
+        embed = discord.Embed(
+            title="🧩 임베드 버튼 자동설정",
+            description=(
+                "임베드 설정/전송 시 자동으로 붙일 버튼을 켜거나 끕니다.\n\n"
+                "```text\n"
+                "╭──── 버튼 자동연결 설정 ────╮\n"
+                f"│ 현재 선택: {selected}\n"
+                "│ 1) 버튼 종류 선택\n"
+                "│ 2) 켜기 또는 끄기 클릭\n"
+                "╰────────────────────╯\n"
+                "```"
+            ),
+            color=COLOR_SOFT_SKY,
+        )
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed.set_footer(text="만능 봇 | /임베드 버튼자동설정")
+        return embed
+
+    async def _set_enabled(self, interaction: discord.Interaction, enabled: bool):
+        if not self.selected_button_type:
+            return await safe_interaction_send(interaction, "❌ 먼저 버튼 종류를 선택해주세요.", ephemeral=True)
+        await auto_embed_button_setting_command(interaction, self.selected_button_type, "on" if enabled else "off")
+
+    @discord.ui.button(label="켜기", emoji="✅", style=discord.ButtonStyle.green, row=1)
+    async def enable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_enabled(interaction, True)
+
+    @discord.ui.button(label="끄기", emoji="❌", style=discord.ButtonStyle.red, row=1)
+    async def disable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_enabled(interaction, False)
+
+    @discord.ui.button(label="처음으로", emoji="⬅️", style=discord.ButtonStyle.gray, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_interaction_edit(
+            interaction,
+            embed=build_embed_main_panel_embed(interaction.guild),
+            view=EmbedMainPanelView(),
+        )
+
+
+class EmbedBackToMainButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="처음으로", emoji="⬅️", style=discord.ButtonStyle.gray, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        await safe_interaction_edit(
+            interaction,
+            embed=build_embed_main_panel_embed(interaction.guild),
+            view=EmbedMainPanelView(),
+        )
+
+
+class EmbedMainPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="임베드 설정", emoji="📝", style=discord.ButtonStyle.green, row=0)
+    async def setting_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await welcome_embed_setting(interaction, "")
+
+    @discord.ui.button(label="버튼붙이기", emoji="🧩", style=discord.ButtonStyle.blurple, row=0)
+    async def attach_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        embed = discord.Embed(
+            title="🧩 임베드 버튼붙이기",
+            description=(
+                "현재 채널의 최근 봇 임베드에 원하는 버튼을 붙입니다.\n"
+                "직접 만든 역할은 `/임베드 역할버튼붙이기`로 붙일 수 있어요.\n"
+                "특정 메시지를 지정해야 할 때는 기존 `/임베드 버튼붙이기 message_id:...` 명령을 사용하세요.\n\n"
+                "```text\n"
+                "╭──── 버튼붙이기 안내 ────╮\n"
+                "│ 아래 목록에서 버튼 종류를 선택 │\n"
+                "│ 최근 봇 임베드에 바로 적용      │\n"
+                "╰────────────────────╯\n"
+                "```"
+            ),
+            color=COLOR_LAVENDER,
+        )
+        await safe_interaction_edit(interaction, embed=embed, view=EmbedManualButtonAttachView())
+
+    @discord.ui.button(label="버튼제거", emoji="🗑️", style=discord.ButtonStyle.red, row=0)
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        embed = discord.Embed(
+            title="🗑️ 임베드 버튼제거",
+            description=(
+                "현재 채널의 최근 봇 임베드에서 버튼을 제거합니다.\n"
+                "게임역할은 `롤`, `발로란트`, `배그`처럼 1개씩 따로 제거할 수 있어요.\n"
+                "특정 메시지를 지정해야 할 때는 `/임베드 버튼제거 message_id:...` 명령을 사용하세요.\n\n"
+                "```text\n"
+                "╭──── 버튼제거 안내 ────╮\n"
+                "│ 전체 제거 또는 게임 역할 1개 선택 │\n"
+                "│ 개별 제거는 게임역할 버튼에 최적화 │\n"
+                "╰────────────────────╯\n"
+                "```"
+            ),
+            color=COLOR_WARNING,
+        )
+        await safe_interaction_edit(interaction, embed=embed, view=EmbedManualButtonRemoveView())
+
+    @discord.ui.button(label="버튼목록", emoji="📋", style=discord.ButtonStyle.gray, row=0)
+    async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await list_embed_button_settings_command(interaction)
+
+    @discord.ui.button(label="버튼자동설정", emoji="⚙️", style=discord.ButtonStyle.gray, row=1)
+    async def auto_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await reject_if_not_setup_manager(interaction):
+            return
+        view = EmbedAutoButtonSettingPanelView()
+        await safe_interaction_edit(interaction, embed=view.build_embed(interaction.guild), view=view)
+
+    @discord.ui.button(label="규칙", emoji="📜", style=discord.ButtonStyle.blurple, row=1)
+    async def rules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await rules_embed_setting(interaction)
+
+    @discord.ui.button(label="자기소개", emoji="📝", style=discord.ButtonStyle.blurple, row=1)
+    async def intro_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await intro_embed_setting(interaction)
+
+    @discord.ui.button(label="인증", emoji="✅", style=discord.ButtonStyle.green, row=1)
+    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await verify_embed_setting(interaction)
+
+    @discord.ui.button(label="인증문구 보기", emoji="👀", style=discord.ButtonStyle.gray, row=1)
+    async def verify_success_view_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await verify_success_message_view(interaction)
+
+    @discord.ui.button(label="인증문구 설정", emoji="💬", style=discord.ButtonStyle.green, row=2)
+    async def verify_success_set_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await verify_success_message_setting(interaction)
+
+    @discord.ui.button(label="인증문구 초기화", emoji="♻️", style=discord.ButtonStyle.red, row=2)
+    async def verify_success_reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await verify_success_message_reset(interaction)
+
+    @discord.ui.button(label="사용법", emoji="❔", style=discord.ButtonStyle.gray, row=2)
+    async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_interaction_send(
+            interaction,
+            "🖼️ **/임베드 통합 패널 사용법**\n\n"
+            "• `/임베드 패널` : 이 박스형 통합 메뉴를 엽니다.\n"
+            "• `/임베드 설정` : 환영/규칙/자기소개/인증/패널 임베드를 수정합니다.\n"
+            "• `/임베드 버튼붙이기` : 일반버튼 또는 게임역할버튼을 골라 붙입니다.\n"
+            "• `/임베드 버튼제거` : 전체 제거 또는 게임역할 버튼 1개 제거가 가능합니다.\n\n"
+            "참고: 디스코드 제한 때문에 그룹 명령인 `/임베드`는 단독 실행 콜백을 가질 수 없어 `/임베드 패널`로 열도록 구성했습니다.",
+            ephemeral=True,
+        )
+
+
+async def send_embed_main_panel(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    await safe_interaction_send(
+        interaction,
+        embed=build_embed_main_panel_embed(interaction.guild),
+        view=EmbedMainPanelView(),
+        ephemeral=True,
+    )
+
 # ----- 임베드 그룹 -----
+@embed_group.command(name="패널", description="기존 /임베드 기능을 박스형 버튼 패널로 엽니다.")
+async def embed_group_main_panel(interaction: discord.Interaction):
+    await send_embed_main_panel(interaction)
+
+
+# 요청 반영: 게임 역할은 별도 /임베드 게임역할패널이 아니라 /임베드 버튼붙이기·버튼제거 안에서 1개씩 관리합니다.
+# @embed_group.command(name="게임역할패널", description="역할별 1개 버튼으로 된 게임역할 박스형 패널을 현재 채널에 전송합니다.")
+async def embed_group_game_role_panel_send(interaction: discord.Interaction):
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        return await safe_interaction_send(interaction, "❌ 게임역할 패널은 관리자만 전송할 수 있습니다.", ephemeral=True)
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+
+    embed = apply_custom_panel_embed(interaction.guild, "game_role", build_game_role_embed())
+    await interaction.channel.send(embed=embed, view=GameRoleView())
+    await safe_interaction_send(
+        interaction,
+        "✅ 게임역할 박스형 패널을 현재 채널에 전송했습니다. 버튼은 역할별로 1개씩 따로 나옵니다.",
+        ephemeral=True,
+    )
+
+
 @embed_group.command(name="설정", description="채널 ID를 넣어 원하는 곳에 임베드를 설정/전송합니다.")
 async def embed_group_setting(interaction: discord.Interaction, 채널_id: str = ""):
     await welcome_embed_setting(interaction, 채널_id)
 
 
 @embed_group.command(name="버튼붙이기", description="현재 채널의 봇 임베드에 원하는 버튼을 붙입니다.")
-@app_commands.describe(button_type="붙일 버튼 종류", message_id="비우면 최근 봇 임베드에 붙입니다.")
-@app_commands.choices(button_type=[
-    app_commands.Choice(name="인증하기", value="verify"),
-    app_commands.Choice(name="티켓/문의/신고", value="ticket"),
-    app_commands.Choice(name="뮤직", value="music"),
-    app_commands.Choice(name="상점", value="shop"),
-    app_commands.Choice(name="게임역할", value="game_role"),
-    app_commands.Choice(name="보안", value="security"),
-    app_commands.Choice(name="경고", value="warning"),
-    app_commands.Choice(name="관리자", value="admin"),
-    app_commands.Choice(name="이벤트", value="event"),
-    app_commands.Choice(name="칭호", value="title"),
-    app_commands.Choice(name="개발로그", value="devlog"),
-])
-async def embed_group_attach_button(interaction: discord.Interaction, button_type: app_commands.Choice[str], message_id: str = ""):
-    await attach_embed_button_command(interaction, button_type.value, message_id)
+@app_commands.describe(
+    일반버튼="인증/티켓/상점 같은 일반 버튼을 붙입니다.",
+    게임역할버튼="롤/발로란트/배그처럼 게임 역할 버튼을 1개씩 붙입니다.",
+    message_id="비우면 최근 봇 임베드에 붙입니다."
+)
+@app_commands.choices(일반버튼=AUTO_BUTTON_MANUAL_CHOICES, 게임역할버튼=GAME_ROLE_BUTTON_CHOICES)
+async def embed_group_attach_button(
+    interaction: discord.Interaction,
+    일반버튼: app_commands.Choice[str] = None,
+    게임역할버튼: app_commands.Choice[str] = None,
+    message_id: str = "",
+):
+    if 일반버튼 and 게임역할버튼:
+        return await safe_interaction_send(
+            interaction,
+            "❌ 일반버튼과 게임역할버튼은 한 번에 하나만 선택해주세요.",
+            ephemeral=True,
+        )
+    button_type = 게임역할버튼.value if 게임역할버튼 else (일반버튼.value if 일반버튼 else "")
+    if not button_type:
+        return await safe_interaction_send(
+            interaction,
+            "❌ 붙일 버튼을 선택해주세요. `일반버튼` 또는 `게임역할버튼` 중 하나를 고르면 됩니다.",
+            ephemeral=True,
+        )
+    await attach_embed_button_command(interaction, button_type, message_id)
 
 
 @embed_group.command(name="버튼제거", description="현재 채널의 봇 임베드에서 버튼을 제거합니다.")
-async def embed_group_remove_button(interaction: discord.Interaction, message_id: str = ""):
-    await remove_embed_button_command(interaction, message_id)
+@app_commands.describe(
+    제거대상="전체 제거 또는 게임역할 버튼 1개를 선택합니다.",
+    message_id="비우면 최근 봇 임베드에서 제거합니다."
+)
+@app_commands.choices(제거대상=GAME_ROLE_BUTTON_REMOVE_CHOICES)
+async def embed_group_remove_button(
+    interaction: discord.Interaction,
+    제거대상: app_commands.Choice[str] = None,
+    message_id: str = "",
+):
+    button_type = 제거대상.value if 제거대상 else ""
+    await remove_embed_button_command(interaction, message_id, button_type)
 
 
 @embed_group.command(name="버튼자동설정", description="임베드 설정/전송 시 버튼 자동 연결을 켜거나 끕니다.")
@@ -23357,6 +27628,38 @@ async def embed_group_auto_button(interaction: discord.Interaction, button_type:
 @embed_group.command(name="버튼목록", description="현재 서버의 임베드 버튼 자동 연결 설정을 확인합니다.")
 async def embed_group_button_list(interaction: discord.Interaction):
     await list_embed_button_settings_command(interaction)
+
+@embed_group.command(name="역할버튼붙이기", description="현재 채널의 최근 봇 임베드에 직접 만든 역할 버튼을 붙입니다.")
+@app_commands.describe(
+    역할="버튼을 누르면 지급/제거할 역할입니다.",
+    라벨="버튼에 표시할 이름입니다. 비우면 역할 이름을 사용합니다.",
+    이모지="버튼 이모지입니다. 비우면 🎭 를 사용합니다.",
+    색상="gray/green/red/blue 또는 회색/초록/빨강/파랑",
+    message_id="특정 봇 임베드 메시지 ID입니다. 비우면 현재 채널의 최근 봇 임베드를 찾습니다.",
+)
+async def embed_group_custom_role_button_attach(
+    interaction: discord.Interaction,
+    역할: discord.Role,
+    라벨: str = "",
+    이모지: str = "🎭",
+    색상: str = "gray",
+    message_id: str = "",
+):
+    await attach_custom_role_button_to_recent_embed(interaction, 역할, 라벨, 이모지, 색상, message_id)
+
+
+@embed_group.command(name="역할버튼제거", description="현재 채널의 최근 봇 임베드에서 직접 역할 버튼을 제거합니다.")
+@app_commands.describe(
+    역할="제거할 역할 버튼입니다.",
+    message_id="특정 봇 임베드 메시지 ID입니다. 비우면 현재 채널의 최근 봇 임베드를 찾습니다.",
+)
+async def embed_group_custom_role_button_remove(
+    interaction: discord.Interaction,
+    역할: discord.Role,
+    message_id: str = "",
+):
+    await remove_custom_role_button_from_recent_embed(interaction, 역할, message_id)
+
 
 
 @embed_group.command(name="규칙", description="자동 생성되는 규칙 임베드를 만들고 수정합니다.")
@@ -23843,7 +28146,17 @@ def build_ultimate_home_embed(guild: discord.Guild):
         value="📦 서버세팅  🎛️ 패널  🧩 임베드/버튼  🛡️ 관리/보안\n💰 경제/상점/주식  🎉 이벤트  🎵 뮤직/TTS  🎂 생일",
         inline=False,
     )
-    embed.set_footer(text="만능 봇 | Ultimate Sky Blue Upgrade")
+    embed.add_field(
+        name="✨ 최신 편의 업그레이드",
+        value=(
+            "• 전용 채널 없이 현재 채널에서 상점/뮤직/TTS 사용 가능\n"
+            "• `/입장` `/퇴장` 으로 TTS 바로 사용\n"
+            "• `/로그 상태` `/로그 채널설정` `/로그 켜기` `/로그 끄기` 로 로그 직접 관리\n"
+            "• 직접 만든 역할도 `/임베드 역할버튼붙이기` 로 버튼 연결"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="만능 봇 | Ultimate Sky Blue Upgrade v220")
     return embed
 
 
@@ -23868,7 +28181,7 @@ def build_ultimate_section_embed(guild: discord.Guild, section_key: str):
     elif section_key == "event":
         embed.add_field(name="🎉 이벤트", value="`/이벤트 패널` `/이벤트 목록` `/이벤트 종료` `/이벤트 개인보상` `/이벤트 팀보상`\n`/커뮤니티 투표` `/커뮤니티 추첨` `/커뮤니티 미션`", inline=False)
     elif section_key == "voice":
-        embed.add_field(name="🎵 뮤직/TTS", value="`/음성 입장` `/음성 퇴장` `/음성 목소리변경` `/음성 목소리목록`\n뮤직 버튼 패널과 TTS 채널 자동 생성도 지원합니다.", inline=False)
+        embed.add_field(name="🎵 뮤직/TTS", value="`/입장` `/퇴장` 또는 `/음성 입장` `/음성 퇴장`\n음성채널에 들어간 상태로 채팅하면 TTS가 자동으로 들어와 읽습니다.\n`사클: 제목` `유튜브: 제목` 은 원하는 채널에서 음악 요청으로 사용할 수 있어요.", inline=False)
     elif section_key == "birthday":
         embed.add_field(name="🎂 생일", value="`/생일 패널` `/생일 등록` `/생일 수정` `/생일 확인` `/생일 목록` `/생일 삭제`\n버튼으로 등록/수정/삭제하고 생일기록 채널을 자동 정리합니다.", inline=False)
     elif section_key == "health":
@@ -23975,10 +28288,10 @@ def build_ultimate_command_guide_embed():
     embed.add_field(
         name="🎵 음성 / 뮤직 / TTS",
         value=ultimate_box("음성 기능", [
-            "`/음성 입장`  · TTS 봇 음성채널 입장",
-            "`/음성 퇴장`  · TTS 봇 퇴장",
-            "`/음성 목소리변경`  · TTS 목소리 변경",
-            "`/만능 빠른패널 종류:뮤직`  · 뮤직 패널 열기",
+            "`/입장` 또는 `/음성 입장`  · TTS 봇 음성채널 입장",
+            "`/퇴장` 또는 `/음성 퇴장`  · TTS 봇 퇴장",
+            "채팅 입력  · 내가 있는 음성방으로 자동 TTS",
+            "`사클: 제목` `유튜브: 제목`  · 어느 채널에서든 음악 요청",
         ], "🎵"),
         inline=False,
     )
@@ -25034,6 +29347,58 @@ async def ultimate_group_errors(interaction: discord.Interaction):
 @ultimate_group.command(name="서버리포트", description="서버 상태와 누락 채널을 TXT 리포트로 생성합니다.")
 async def ultimate_group_report(interaction: discord.Interaction):
     await send_maneung_server_report(interaction)
+
+
+def build_maneung_latest_comfort_embed(guild: discord.Guild):
+    """v220: 최근 요청으로 바뀐 편의 기능만 한눈에 보여줍니다."""
+    embed = discord.Embed(
+        title="✨ 만능 봇 최신 편의 업그레이드",
+        description="전용 채널을 강제하지 않고, 서버 상황에 맞게 편하게 쓰는 모드가 적용되어 있어요.",
+        color=COLOR_SOFT_SKY,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    embed.add_field(
+        name="📍 채널 자유 모드",
+        value=(
+            f"전체 자유 모드: **{'켜짐 ✅' if MNB_FREE_CHANNEL_MODE else '꺼짐 ❌'}**\n"
+            f"상점 현재 채널: **{'켜짐 ✅' if MNB_SHOP_CURRENT_CHANNEL_MODE else '꺼짐 ❌'}**\n"
+            f"음악 명시 요청 자유채널: **{'켜짐 ✅' if MNB_MUSIC_EXPLICIT_ANY_CHANNEL else '꺼짐 ❌'}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔊 TTS",
+        value=(
+            f"자동 TTS: **{'켜짐 ✅' if MNB_TTS_AUTO_ALL_CHANNELS else '꺼짐 ❌'}**\n"
+            f"자동 TTS 쿨타임: `{MNB_TTS_AUTO_COOLDOWN_SECONDS:g}초`\n"
+            "사용법: 음성방 입장 → 아무 채팅방에 채팅 / 직접 부르기: `/입장` `/퇴장`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🧾 로그",
+        value="`/로그 상태` 로 확인하고, `/로그 채널설정` `/로그 켜기` `/로그 끄기` 로 직접 관리합니다.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎭 직접 역할 버튼",
+        value="관리자가 만든 역할도 `/임베드 역할버튼붙이기` 로 현재 채널의 봇 임베드에 붙일 수 있습니다.",
+        inline=False,
+    )
+    if guild:
+        embed.set_footer(text=f"{guild.name} | v220 comfort upgrade")
+    else:
+        embed.set_footer(text="만능 봇 | v220 comfort upgrade")
+    return embed
+
+
+@ultimate_group.command(name="최신편의", description="채널 자유 모드, TTS, 로그, 역할 버튼 업그레이드 상태를 봅니다.")
+async def ultimate_group_latest_comfort(interaction: discord.Interaction):
+    if await reject_if_not_ultimate_manager(interaction, "/만능 최신편의"):
+        return
+    await safe_interaction_send(interaction, embed=build_maneung_latest_comfort_embed(interaction.guild), ephemeral=True)
 
 
 # =========================
@@ -26449,49 +30814,60 @@ SHOP_AUTOPANEL_CHANNEL_NAMES = [
 ]
 
 
-async def ensure_integrated_shop_panel_for_guild(guild: discord.Guild, *, create_missing: bool = True):
-    """서버의 상점 채널에 /통합상점 패널을 자동 생성/갱신합니다."""
+async def ensure_integrated_shop_panel_for_guild(guild: discord.Guild, *, create_missing: bool = True, target_channel: discord.TextChannel = None):
+    """서버의 통합상점 패널을 생성/갱신합니다.
+
+    v218: target_channel이 있으면 상점 전용 채널을 만들지 않고 현재 채널에 패널을 유지합니다.
+    기존처럼 전용 상점 채널을 쓰고 싶으면 MNB_SHOP_CURRENT_CHANNEL_MODE=0으로 끌 수 있습니다.
+    """
     result = {
         "channel": None,
         "created_channel": False,
         "panel_changed": False,
+        "used_current_channel": False,
     }
     if guild is None:
         return result
 
-    saved_shop_channel_id = get_saved_channel_id(guild.id, "shop_channel_id")
-    shop_channel = get_channel_by_id_or_name(
-        guild,
-        saved_shop_channel_id,
-        SHOP_AUTOPANEL_CHANNEL_NAMES,
-        "text",
-    )
+    shop_channel = target_channel if target_channel and callable(getattr(target_channel, "send", None)) else None
+    if shop_channel is not None:
+        result["used_current_channel"] = True
+    else:
+        saved_shop_channel_id = get_saved_channel_id(guild.id, "shop_channel_id")
+        shop_channel = get_channel_by_id_or_name(
+            guild,
+            saved_shop_channel_id,
+            SHOP_AUTOPANEL_CHANNEL_NAMES,
+            "text",
+        )
 
-    if shop_channel is None and create_missing:
-        shop_category = await get_or_create_category_under_rule(guild, SHOP_CATEGORY_NAME)
-        await apply_member_category_permissions(guild, shop_category)
-        shop_channel = await get_or_create_text_channel(guild, SHOP_CHANNEL_NAME, shop_category)
-        result["created_channel"] = True
-    elif shop_channel is not None and create_missing and shop_channel.category is None:
-        # 상점 채널이 카테고리 밖에 있으면 보기 좋게 상점 카테고리로 정리합니다.
-        try:
+        if shop_channel is None and create_missing:
             shop_category = await get_or_create_category_under_rule(guild, SHOP_CATEGORY_NAME)
-            await shop_channel.edit(category=shop_category, reason="통합상점 자동 패널 채널 정리")
-        except discord.HTTPException:
-            pass
+            await apply_member_category_permissions(guild, shop_category)
+            shop_channel = await get_or_create_text_channel(guild, SHOP_CHANNEL_NAME, shop_category)
+            result["created_channel"] = True
+        elif shop_channel is not None and create_missing and shop_channel.category is None:
+            # 상점 채널이 카테고리 밖에 있으면 보기 좋게 상점 카테고리로 정리합니다.
+            try:
+                shop_category = await get_or_create_category_under_rule(guild, SHOP_CATEGORY_NAME)
+                await shop_channel.edit(category=shop_category, reason="통합상점 자동 패널 채널 정리")
+            except discord.HTTPException:
+                pass
 
     if shop_channel is None:
         return result
 
     result["channel"] = shop_channel
-    try:
-        save_guild_channel_ids(
-            guild,
-            shop_channel_id=shop_channel,
-            shop_category_id=shop_channel.category if shop_channel.category else 0,
-        )
-    except Exception:
-        pass
+    # 현재 채널 모드에서는 대시보드/서버 설정의 상점 채널을 덮어쓰지 않습니다.
+    if not result.get("used_current_channel"):
+        try:
+            save_guild_channel_ids(
+                guild,
+                shop_channel_id=shop_channel,
+                shop_category_id=shop_channel.category if shop_channel.category else 0,
+            )
+        except Exception:
+            pass
 
     # 예전 안내 임베드는 정리하고, 실제 구매 버튼이 붙은 통합상점 패널만 1개 유지합니다.
     lock = SHOP_AUTOPANEL_LOCKS.setdefault(guild.id, asyncio.Lock())
@@ -26499,7 +30875,6 @@ async def ensure_integrated_shop_panel_for_guild(guild: discord.Guild, *, create
         await delete_shop_point_auto_embeds(shop_channel)
         result["panel_changed"] = await send_integrated_shop_panel_to_channel(shop_channel, refresh_existing=True)
     return result
-
 
 def is_latest_shop_panel_message(message: discord.Message) -> bool:
     """v210 이후 실제 상점 채널에 남길 최신 통합상점 패널인지 확인합니다."""
@@ -26588,22 +30963,27 @@ async def mnb_shop_open_channel_panel_response(interaction: discord.Interaction)
         return await safe_interaction_send(interaction, embed=embed, ephemeral=True)
 
     try:
-        result = await ensure_integrated_shop_panel_for_guild(interaction.guild, create_missing=True)
+        target_channel = interaction.channel if (MNB_FREE_CHANNEL_MODE and MNB_SHOP_CURRENT_CHANNEL_MODE and isinstance(interaction.channel, discord.TextChannel)) else None
+        result = await ensure_integrated_shop_panel_for_guild(
+            interaction.guild,
+            create_missing=(target_channel is None),
+            target_channel=target_channel,
+        )
         channel = result.get("channel")
         if channel is None:
             embed = discord.Embed(
                 title="⚠️ 상점 채널 확인 실패",
-                description="상점 채널을 찾거나 만들지 못했어요. 봇에게 채널 관리 권한이 있는지 확인해주세요.",
+                description="상점 패널을 보낼 채널을 찾지 못했어요. 원하는 텍스트 채널에서 다시 실행하거나 봇의 메시지 보내기 권한을 확인해주세요.",
                 color=COLOR_WARNING,
             )
             return await safe_interaction_send(interaction, embed=embed, ephemeral=True)
 
         embed = discord.Embed(
-            title="✅ 통합상점 정리 완료",
+            title="✅ 통합상점 사용 준비 완료",
             description=(
                 f"{channel.mention} 채널에 **최신 통합상점 패널 1개만** 남겨뒀어요.\n"
                 "구버전 안내 임베드와 중복 상점 패널은 자동 정리됩니다.\n\n"
-                "상점 이용은 상점 채널에 있는 버튼/선택 메뉴로 하면 됩니다."
+                "이제 전용 상점 채널을 만들지 않아도, 원하는 채널에 패널을 열어서 바로 사용할 수 있습니다."
             ),
             color=COLOR_MINT,
         )
@@ -27496,12 +31876,18 @@ async def prefix_mnb_integrated_shop(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
     try:
-        result = await ensure_integrated_shop_panel_for_guild(ctx.guild, create_missing=True)
+        target_channel = ctx.channel if (MNB_FREE_CHANNEL_MODE and MNB_SHOP_CURRENT_CHANNEL_MODE and isinstance(ctx.channel, discord.TextChannel)) else None
+        result = await ensure_integrated_shop_panel_for_guild(
+            ctx.guild,
+            create_missing=(target_channel is None),
+            target_channel=target_channel,
+        )
         channel = result.get("channel") if isinstance(result, dict) else None
         embed = discord.Embed(
-            title="✅ 통합상점 정리 완료",
+            title="✅ 통합상점 사용 준비 완료",
             description=(
-                f"{channel.mention if channel else '#상점'} 채널에 최신 통합상점 패널을 1개만 남겨뒀어요.\n"
+                f"{channel.mention if channel else '#현재채널'} 채널에 최신 통합상점 패널을 1개만 남겨뒀어요.\n"
+                "전용 상점 채널을 만들지 않아도 원하는 채널에서 바로 사용할 수 있어요.\n"
                 "슬래시가 아직 안 보이면 `!편의`, `!추가기능`, `!사용`으로 바로 쓸 수 있어요."
             ),
             color=COLOR_GREEN,
@@ -27510,6 +31896,303 @@ async def prefix_mnb_integrated_shop(ctx: commands.Context):
         await ctx.reply(embed=embed, mention_author=False)
     except Exception as e:
         await ctx.reply(f"❌ 통합상점 정리 실패: `{str(e)[:500]}`", mention_author=False)
+
+
+
+# =========================
+# v227 최소 접두사 패널 / 레벨업 채널 지정
+# =========================
+# 사용자가 요청한 패널만 !명령어로 현재 채널에 생성합니다.
+# - !생일패널
+# - !티켓패널
+# - !게임역할
+# - !역할받기
+# 관리/보안/검열 같은 패널은 접두사 자동 생성 명령으로 추가하지 않습니다.
+
+async def mnb_prefix_require_setup_manager(ctx: commands.Context) -> bool:
+    if ctx.guild is None or not isinstance(ctx.author, discord.Member):
+        await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
+        return False
+    if not await can_use_setup_commands(ctx.author):
+        await ctx.reply("❌ 관리자 또는 봇 설정 권한이 있는 역할만 사용할 수 있습니다.", mention_author=False)
+        return False
+    return True
+
+
+@bot.command(name="생일패널", aliases=["생일등록패널"])
+async def prefix_birthday_panel_current_channel(ctx: commands.Context):
+    if not await mnb_prefix_require_setup_manager(ctx):
+        return
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.reply("❌ 텍스트 채널에서만 사용할 수 있습니다.", mention_author=False)
+    ok = await send_birthday_register_panel_once(ctx.channel)
+    if ok:
+        await ctx.reply(f"✅ 생일패널을 {ctx.channel.mention} 에 생성했어요.", mention_author=False)
+    else:
+        await ctx.reply(f"✅ 생일패널을 {ctx.channel.mention} 에 갱신했거나 이미 준비되어 있어요.", mention_author=False)
+
+
+@bot.command(name="티켓패널", aliases=["문의패널"])
+async def prefix_ticket_panel_current_channel(ctx: commands.Context):
+    if not await mnb_prefix_require_setup_manager(ctx):
+        return
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.reply("❌ 텍스트 채널에서만 사용할 수 있습니다.", mention_author=False)
+    embed = create_embed(
+        "🎫 만능 봇 통합 티켓 패널",
+        "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n"
+        "🎫 **일반 문의**\n"
+        "🛠️ **오류 문의**\n"
+        "🚨 **신고 문의**\n\n"
+        "관리자에게만 보이는 개인 채널이 생성됩니다."
+    )
+    await ctx.channel.send(embed=embed, view=UnifiedTicketView(), allowed_mentions=discord.AllowedMentions.none())
+    await ctx.reply(f"✅ 티켓패널을 {ctx.channel.mention} 에 생성했어요.", mention_author=False)
+
+
+@bot.command(name="게임역할", aliases=["게임역할패널", "게임역할받기"])
+async def prefix_game_role_panel_current_channel(ctx: commands.Context):
+    if not await mnb_prefix_require_setup_manager(ctx):
+        return
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.reply("❌ 텍스트 채널에서만 사용할 수 있습니다.", mention_author=False)
+    embed = apply_custom_panel_embed(ctx.guild, "game_role", build_game_role_embed())
+    await ctx.channel.send(embed=embed, view=GameRoleView(), allowed_mentions=discord.AllowedMentions.none())
+    await ctx.reply(f"✅ 게임역할 패널을 {ctx.channel.mention} 에 생성했어요.", mention_author=False)
+
+
+@bot.command(name="역할받기", aliases=["역할패널", "프로필역할", "역할선택"])
+async def prefix_profile_role_panel_current_channel(ctx: commands.Context):
+    if not await mnb_prefix_require_setup_manager(ctx):
+        return
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.reply("❌ 텍스트 채널에서만 사용할 수 있습니다.", mention_author=False)
+
+    embed = discord.Embed(
+        title="🎭 프로필 역할 선택",
+        description=(
+            "아래 선택 박스를 눌러서 프로필 역할을 받을 수 있어요.\n\n"
+            "선택 가능 역할\n"
+            "• 남성 / 여성\n"
+            "• 20대 / 10대\n\n"
+            "다시 선택하면 역할을 바꿀 수 있습니다."
+        ),
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="🌸 원하는 채널에 바로 생성되는 역할 선택 패널")
+    await ctx.channel.send(embed=embed, view=ProfileRoleSelectView(), allowed_mentions=discord.AllowedMentions.none())
+
+    creator_embed = discord.Embed(
+        title="🎬 크리에이터 역할 선택",
+        description="스트리머, 유튜버, 디자이너, 개발자 역할을 선택할 수 있습니다.",
+        color=BOT_COLOR
+    )
+    await ctx.channel.send(embed=creator_embed, view=CreatorRoleSelectView(), allowed_mentions=discord.AllowedMentions.none())
+
+    friend_embed = discord.Embed(
+        title="🤝 할사람 역할 선택",
+        description="친구할사람?, 우프할사람?, 게임할사람? 역할을 선택할 수 있습니다.",
+        color=BOT_COLOR
+    )
+    await ctx.channel.send(embed=friend_embed, view=FriendWantedRoleSelectView(), allowed_mentions=discord.AllowedMentions.none())
+    await ctx.reply(f"✅ 역할받기 패널을 {ctx.channel.mention} 에 생성했어요.", mention_author=False)
+
+
+@bot.command(name="레벨로그", aliases=["레벨채널", "레벨업로그", "레벨업채널", "레벨로그설정"])
+async def prefix_levelup_log_channel_setting(ctx: commands.Context, channel: discord.TextChannel = None):
+    if not await mnb_prefix_require_setup_manager(ctx):
+        return
+    target_channel = channel or ctx.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        return await ctx.reply("❌ 텍스트 채널만 지정할 수 있습니다.", mention_author=False)
+
+    save_guild_channel_ids(ctx.guild, level_channel_id=target_channel)
+    set_log_setting(ctx.guild.id, "levelup", enabled=True, channel_id=target_channel.id, updated_by=ctx.author.id)
+    await ctx.reply(
+        f"✅ 채팅/음성 레벨업이 {target_channel.mention} 에 뜨게 설정했어요.\n"
+        f"이제 채팅 레벨업이랑 음성 레벨업 둘 다 이 채널을 먼저 사용합니다.",
+        mention_author=False
+    )
+
+
+@bot.command(name="레벨로그끄기", aliases=["레벨채널끄기", "레벨업로그끄기"])
+async def prefix_levelup_log_disable(ctx: commands.Context):
+    if not await mnb_prefix_require_setup_manager(ctx):
+        return
+    set_log_setting(ctx.guild.id, "levelup", enabled=False, updated_by=ctx.author.id)
+    await ctx.reply("✅ 채팅/음성 레벨업 표시를 껐어요. 다시 켜려면 `!레벨로그` 또는 `!레벨채널`을 사용하세요.", mention_author=False)
+
+
+
+
+# =========================
+# v229 간단 슬래시 패널 / 레벨업 채널 지정
+# =========================
+# ! 명령어 대신 / 로도 원하는 채널에 바로 생성할 수 있게 추가합니다.
+# - /생일패널
+# - /티켓패널
+# - /게임역할
+# - /역할받기
+# - /레벨로그
+# - /레벨로그끄기
+
+@bot.tree.command(name="생일패널", description="현재 채널에 버튼형 생일 등록 패널을 생성합니다.")
+async def slash_birthday_panel_current_channel(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+
+    await safe_interaction_defer(interaction, ephemeral=True)
+    ok = await send_birthday_register_panel_once(interaction.channel)
+    if ok:
+        await interaction.followup.send(f"✅ 생일패널을 {interaction.channel.mention} 에 생성했어요.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"✅ 생일패널을 {interaction.channel.mention} 에 갱신했거나 이미 준비되어 있어요.", ephemeral=True)
+
+
+@bot.tree.command(name="티켓패널", description="현재 채널에 티켓 문의 패널을 생성합니다.")
+async def slash_ticket_panel_current_channel(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+
+    embed = create_embed(
+        "🎫 만능 봇 통합 티켓 패널",
+        "아래 버튼을 눌러 필요한 티켓을 열어주세요.\n\n"
+        "🎫 **일반 문의**\n"
+        "🛠️ **오류 문의**\n"
+        "🚨 **신고 문의**\n\n"
+        "관리자에게만 보이는 개인 채널이 생성됩니다."
+    )
+    await interaction.channel.send(embed=embed, view=UnifiedTicketView(), allowed_mentions=discord.AllowedMentions.none())
+    await safe_interaction_send(interaction, f"✅ 티켓패널을 {interaction.channel.mention} 에 생성했어요.", ephemeral=True)
+
+
+@bot.tree.command(name="게임역할", description="현재 채널에 게임 역할 선택 패널을 생성합니다.")
+async def slash_game_role_panel_current_channel(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+
+    embed = apply_custom_panel_embed(interaction.guild, "game_role", build_game_role_embed())
+    await interaction.channel.send(embed=embed, view=GameRoleView(), allowed_mentions=discord.AllowedMentions.none())
+    await safe_interaction_send(interaction, f"✅ 게임역할 패널을 {interaction.channel.mention} 에 생성했어요.", ephemeral=True)
+
+
+@bot.tree.command(name="역할받기", description="현재 채널에 프로필/크리에이터/할사람 역할 선택 패널을 생성합니다.")
+async def slash_profile_role_panel_current_channel(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🎭 프로필 역할 선택",
+        description=(
+            "아래 선택 박스를 눌러서 프로필 역할을 받을 수 있어요.\n\n"
+            "선택 가능 역할\n"
+            "• 남성 / 여성\n"
+            "• 20대 / 10대\n\n"
+            "다시 선택하면 역할을 바꿀 수 있습니다."
+        ),
+        color=BOT_COLOR
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="🌸 원하는 채널에 바로 생성되는 역할 선택 패널")
+    await interaction.channel.send(embed=embed, view=ProfileRoleSelectView(), allowed_mentions=discord.AllowedMentions.none())
+
+    creator_embed = discord.Embed(
+        title="🎬 크리에이터 역할 선택",
+        description="스트리머, 유튜버, 디자이너, 개발자 역할을 선택할 수 있습니다.",
+        color=BOT_COLOR
+    )
+    await interaction.channel.send(embed=creator_embed, view=CreatorRoleSelectView(), allowed_mentions=discord.AllowedMentions.none())
+
+    friend_embed = discord.Embed(
+        title="🤝 할사람 역할 선택",
+        description="친구할사람?, 우프할사람?, 게임할사람? 역할을 선택할 수 있습니다.",
+        color=BOT_COLOR
+    )
+    await interaction.channel.send(embed=friend_embed, view=FriendWantedRoleSelectView(), allowed_mentions=discord.AllowedMentions.none())
+    await safe_interaction_send(interaction, f"✅ 역할받기 패널을 {interaction.channel.mention} 에 생성했어요.", ephemeral=True)
+
+
+@bot.tree.command(name="레벨로그", description="채팅/음성 레벨업이 올라갈 채널을 현재 채널 또는 선택한 채널로 고정합니다.")
+@app_commands.describe(채널="비워두면 현재 채널로 설정됩니다.")
+async def slash_levelup_log_channel_setting(interaction: discord.Interaction, 채널: discord.TextChannel = None):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    target_channel = 채널 or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널만 지정할 수 있습니다.", ephemeral=True)
+
+    save_guild_channel_ids(interaction.guild, level_channel_id=target_channel)
+    set_log_setting(interaction.guild.id, "levelup", enabled=True, channel_id=target_channel.id, updated_by=interaction.user.id)
+    await safe_interaction_send(
+        interaction,
+        f"✅ 채팅/음성 레벨업을 {target_channel.mention} 에 고정했어요.\n이제 채팅 레벨업이랑 음성 레벨업 둘 다 이 채널을 먼저 사용합니다.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="레벨로그끄기", description="채팅/음성 레벨업 표시를 끕니다.")
+async def slash_levelup_log_disable(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    set_log_setting(interaction.guild.id, "levelup", enabled=False, updated_by=interaction.user.id)
+    await safe_interaction_send(interaction, "✅ 채팅/음성 레벨업 표시를 껐어요. 다시 켜려면 `/레벨로그` 또는 `/레벨채널`을 사용하세요.", ephemeral=True)
+
+
+
+
+@bot.tree.command(name="레벨채널", description="채팅/음성 레벨업이 올라갈 채널을 현재 채널 또는 선택한 채널로 고정합니다.")
+@app_commands.describe(채널="비워두면 현재 채널로 설정됩니다.")
+async def slash_levelup_channel_setting_alias(interaction: discord.Interaction, 채널: discord.TextChannel = None):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    target_channel = 채널 or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        return await safe_interaction_send(interaction, "❌ 텍스트 채널만 지정할 수 있습니다.", ephemeral=True)
+
+    save_guild_channel_ids(interaction.guild, level_channel_id=target_channel)
+    set_log_setting(interaction.guild.id, "levelup", enabled=True, channel_id=target_channel.id, updated_by=interaction.user.id)
+    await safe_interaction_send(
+        interaction,
+        f"✅ 채팅/음성 레벨업을 {target_channel.mention} 에 고정했어요.\n"
+        f"이제 채팅 레벨업이랑 음성 레벨업 둘 다 이 채널을 먼저 사용합니다.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="레벨채널끄기", description="채팅/음성 레벨업 표시를 끕니다.")
+async def slash_levelup_channel_disable_alias(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+    if await reject_if_not_setup_manager(interaction):
+        return
+    set_log_setting(interaction.guild.id, "levelup", enabled=False, updated_by=interaction.user.id)
+    await safe_interaction_send(interaction, "✅ 채팅/음성 레벨업 표시를 껐어요. 다시 켜려면 `/레벨채널`을 사용하세요.", ephemeral=True)
+
 
 
 @bot.command(name="슬래시복구", aliases=["명령어복구", "명령어동기화", "중복정리", "명령어중복정리", "경제정리", "경제하위명령정리"])
@@ -27588,7 +32271,7 @@ MNB_V210_REQUIRED_COMMAND_SPECS = [
     ("편의", "25개 편의 기능을 통합 패널 하나로 엽니다.", mnb_v210_utility_callback),
     ("추가기능", "새 기능 여러 개를 한묶음 통합 패널로 엽니다.", mnb_v210_extra_callback),
     ("사용", "/통합상점에서 구매한 아이템을 박스형 패널로 사용합니다.", mnb_v210_use_callback),
-    ("통합상점", "상점 채널에 통합상점 패널을 1개만 자동 생성/갱신합니다.", mnb_v210_shop_callback),
+    ("통합상점", "현재 채널에 통합상점 패널을 1개만 생성/갱신합니다.", mnb_v210_shop_callback),
     ("잔액", "내 포인트 또는 다른 유저의 포인트를 확인합니다.", mnb_v211_balance_callback),
     ("인벤토리", "/통합상점에서 구매한 아이템을 확인합니다.", mnb_v211_inventory_callback),
 ]
@@ -27679,6 +32362,21 @@ for _group in [
     except app_commands.CommandAlreadyRegistered:
         pass
 
+
+
+
+# v227: 이전 테스트 버전에서 너무 많은 !패널류 명령이 등록되어 있으면 제거합니다.
+# 여기서 지우는 건 접두사 명령만이며, /명령어는 건드리지 않습니다.
+MNB_REMOVE_EXTRA_PREFIX_PANEL_COMMANDS = {
+    "패널", "패널목록", "미션패널", "쿠폰패널", "칭호패널", "이벤트패널", "이벤트종료패널",
+    "보안패널", "검열패널", "경고패널", "관리자패널", "관리도구", "임베드패널", "역할만들기",
+    "알림패널", "커스텀봇",
+}
+for _mnb_cmd_name in list(MNB_REMOVE_EXTRA_PREFIX_PANEL_COMMANDS):
+    try:
+        bot.remove_command(_mnb_cmd_name)
+    except Exception:
+        pass
 
 
 # =========================
@@ -27948,6 +32646,7 @@ def mnb_v213_register_persistent_views_once():
         BirthdayPanelCompatView,
         UltimateCenterView,
         ShopView,
+        MNBAlertPanelView,
         DevAlertRoleView,
     ]:
         try:
@@ -27959,6 +32658,10 @@ def mnb_v213_register_persistent_views_once():
             bot.add_view(CustomMusicPanelView(_custom_music_slot))
         except Exception:
             pass
+    try:
+        mnb_register_custom_role_button_views_once()
+    except Exception:
+        pass
 
 
 def mnb_v213_start_background_loops_once():
@@ -28023,7 +32726,7 @@ async def on_ready():
                 continue
             MNB_V213_SHOP_PANEL_GUILDS.add(guild.id)
             try:
-                shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=True)
+                shop_result = await ensure_integrated_shop_panel_for_guild(guild, create_missing=not (MNB_FREE_CHANNEL_MODE and MNB_SHOP_CURRENT_CHANNEL_MODE))
                 if shop_result.get("panel_changed"):
                     channel = shop_result.get("channel")
                     # v214: 통합상점 자동 생성/갱신 성공 로그는 숨깁니다.
@@ -28058,6 +32761,38 @@ async def on_ready():
 # 최종 group 등록 이후 required command를 다시 1번 정리해서, 이전 데코레이터/구버전 등록이 남지 않게 합니다.
 mnb_v210_register_required_commands(force=True)
 
+async def start_discord_client_safely(label: str, client: discord.Client, token: str, *, required: bool = False):
+    """한 보조봇 토큰이 틀려도 전체 봇이 죽지 않도록 안전하게 로그인합니다."""
+    if not token:
+        if required:
+            raise RuntimeError(f"{label} 토큰이 비어있습니다.")
+        print(f"⚠️ {label} 토큰 없음: 이 봇은 건너뜁니다.")
+        return
+
+    try:
+        await client.start(token)
+    except discord.LoginFailure:
+        print(f"❌ {label} 로그인 실패: 토큰이 틀렸거나 Reset된 토큰입니다. 해당 환경변수만 다시 확인하세요.")
+        if required:
+            raise
+    except discord.HTTPException as e:
+        print(f"❌ {label} Discord HTTP 오류: {e}")
+        if required:
+            raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"❌ {label} 실행 중 오류: {type(e).__name__} - {e}")
+        if required:
+            raise
+    finally:
+        try:
+            if hasattr(client, "is_closed") and not client.is_closed():
+                await client.close()
+        except Exception:
+            pass
+
+
 async def start_all_discord_clients():
     tasks = []
 
@@ -28065,33 +32800,48 @@ async def start_all_discord_clients():
         if token:
             client = CustomVoiceBotClient(slot)
             CUSTOM_BOT_CLIENTS[slot] = client
-            tasks.append(asyncio.create_task(client.start(token)))
+            tasks.append(asyncio.create_task(
+                start_discord_client_safely(f"커스텀봇{slot}", client, token, required=False)
+            ))
 
     if TTS_BOT_TOKEN:
-        tasks.append(asyncio.create_task(tts_sub_bot.start(TTS_BOT_TOKEN)))
+        tasks.append(asyncio.create_task(
+            start_discord_client_safely("TTS봇", tts_sub_bot, TTS_BOT_TOKEN, required=False)
+        ))
 
-    tasks.append(asyncio.create_task(bot.start(TOKEN)))
+    # 메인봇은 필수입니다. 메인봇 토큰이 틀리면 여기서만 정확히 알려주고 종료합니다.
+    tasks.append(asyncio.create_task(
+        start_discord_client_safely("메인봇", bot, TOKEN, required=True)
+    ))
+
     await asyncio.gather(*tasks)
 
 # =========================
 # 실행
 # =========================
 
-# 안전 실행 방식입니다.
-# 1) Render에서는 환경변수 DISCORD_TOKEN에 토큰을 넣으면 됩니다.
-# 2) 로컬에서는 start_bot.bat를 실행하면 토큰을 붙여넣을 수 있습니다.
-if not TOKEN:
+# Render에서는 input()을 기다리면 안 되므로 환경변수만 사용합니다.
+# 로컬에서만 토큰이 없을 때 수동 입력을 허용합니다.
+if not TOKEN and not is_running_on_render():
     try:
-        TOKEN = input("봇 토큰을 붙여넣고 Enter를 눌러주세요: ").strip()
+        TOKEN = normalize_discord_token(input("봇 토큰을 붙여넣고 Enter를 눌러주세요: "))
     except EOFError:
         TOKEN = ""
 
 if not TOKEN:
-    print("❌ 봇 토큰이 비어있습니다. Render Environment에 DISCORD_TOKEN 또는 DISCORD_BOT_TOKEN을 넣어주세요.")
+    print("❌ 메인봇 토큰이 비어있거나 형식이 이상합니다.")
+    print("   Render Environment에는 DISCORD_TOKEN 이름으로 메인봇 토큰을 넣는 것을 권장합니다.")
+    print("   서브봇은 CUSTOM_BOT_TOKEN_1, CUSTOM_BOT_TOKEN_2, CUSTOM_BOT_TOKEN_3, TTS_BOT_TOKEN을 넣으면 됩니다.")
+    print("   BOT_TOKEN 값이 길이 5처럼 짧으면 자동 무시됩니다. 토큰 원문은 절대 콘솔에 출력하지 않습니다.")
 else:
     if not acquire_mnb_mainbot_single_instance_lock():
         raise SystemExit(0)
     if any(CUSTOM_BOT_TOKENS.values()) or TTS_BOT_TOKEN:
         asyncio.run(start_all_discord_clients())
     else:
-        bot.run(TOKEN)
+        try:
+            bot.run(TOKEN)
+        except discord.LoginFailure:
+            print("❌ 메인봇 로그인 실패: Render Environment의 DISCORD_TOKEN/DISCORD_BOT_TOKEN/MAIN_BOT_TOKEN/BOT_TOKEN 값이 틀렸거나 Reset된 토큰입니다.")
+        except discord.HTTPException as e:
+            print(f"❌ 메인봇 Discord HTTP 오류: {e}")
