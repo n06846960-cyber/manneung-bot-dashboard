@@ -1,6 +1,5 @@
 
 import os
-import re
 import sqlite3
 import requests
 from functools import wraps
@@ -554,8 +553,41 @@ def dashboard(guild_id):
     custom_achievements = con.execute("SELECT * FROM custom_achievements WHERE guild_id=? ORDER BY created_at DESC", (guild_id,)).fetchall()
     security_logs = con.execute("SELECT * FROM security_logs WHERE guild_id=? ORDER BY log_id DESC LIMIT 15", (guild_id,)).fetchall()
     stock_logs = con.execute("SELECT * FROM stock_logs WHERE guild_id=? ORDER BY created_at DESC LIMIT 15", (guild_id,)).fetchall()
+
+    # ── 상단 요약 통계 ─────────────────────────────
+    def _scalar(sql, params, default=0):
+        try:
+            row = con.execute(sql, params).fetchone()
+            val = row[0] if row else None
+            return val if val is not None else default
+        except sqlite3.OperationalError:
+            return default
+
+    total_points = _scalar("SELECT COALESCE(SUM(point),0) FROM users WHERE guild_id=?", (guild_id,))
+    total_members = _scalar("SELECT COUNT(*) FROM users WHERE guild_id=?", (guild_id,))
+    active_members = _scalar("SELECT COUNT(*) FROM users WHERE guild_id=? AND point > 0", (guild_id,))
+    active_coupons = _scalar("SELECT COUNT(*) FROM coupon_codes WHERE guild_id=? AND is_active=1", (guild_id,))
+    security_events_7d = _scalar(
+        "SELECT COUNT(*) FROM security_logs WHERE guild_id=? AND created_at >= datetime('now','localtime','-7 day')",
+        (guild_id,),
+    )
+    mission_users = (mission_today["users"] if mission_today and mission_today["users"] else 0)
+    mission_claimed = (mission_today["claimed"] if mission_today and mission_today["claimed"] else 0)
+
+    stats = {
+        "total_points": total_points,
+        "total_members": total_members,
+        "active_members": active_members,
+        "active_coupons": active_coupons,
+        "security_events_7d": security_events_7d,
+        "mission_users": mission_users,
+        "mission_claimed": mission_claimed,
+        "titles": len(title_shop),
+        "stocks": len(stocks),
+        "events": len(events),
+    }
     con.close()
-    return render_template("dashboard.html", guild_id=guild_id, guild=guild, welcome=dict(welcome) if welcome else WELCOME_DEFAULT, security=dict(security), security_fields=SECURITY_FIELDS, security_labels=SECURITY_LABELS, embeds=embeds, embed_types=EMBED_TYPES, channels=channels, text_channels=text_channels(channels), guild_settings=dict(guild_settings) if guild_settings else {}, tts=dict(tts) if tts else {"lang":"ko"}, tts_langs=TTS_LANGS, recruit=recruit, recruit_items=RECRUIT_ITEMS, stocks=stocks, events=events, filter_words=filter_words, bad_users=bad_users, top_points=top_points, coupons=coupons, mission_settings=dict(mission_settings), mission_today=dict(mission_today) if mission_today else {}, title_shop=title_shop, custom_achievements=custom_achievements, devlog=dict(devlog) if devlog else {}, support=dict(support) if support else {"support_invite": SUPPORT_SERVER_INVITE, "dashboard_url": PUBLIC_DASHBOARD_URL}, clean=dict(clean) if clean else {"max_delete":0,"batch_size":100,"delay_seconds":1.0,"log_enabled":1}, security_logs=security_logs, stock_logs=stock_logs, channel_setting_groups=CHANNEL_SETTING_GROUPS, main_bot_invite_url=get_bot_invite_url(guild_id), custom_bot_invites=get_custom_bot_invites(guild_id), custom_bot_env_status=get_custom_bot_env_status())
+    return render_template("dashboard.html", guild_id=guild_id, guild=guild, welcome=dict(welcome) if welcome else WELCOME_DEFAULT, security=dict(security), security_fields=SECURITY_FIELDS, security_labels=SECURITY_LABELS, embeds=embeds, embed_types=EMBED_TYPES, channels=channels, text_channels=text_channels(channels), guild_settings=dict(guild_settings) if guild_settings else {}, tts=dict(tts) if tts else {"lang":"ko"}, tts_langs=TTS_LANGS, recruit=recruit, recruit_items=RECRUIT_ITEMS, stocks=stocks, events=events, filter_words=filter_words, bad_users=bad_users, top_points=top_points, coupons=coupons, mission_settings=dict(mission_settings), mission_today=dict(mission_today) if mission_today else {}, title_shop=title_shop, custom_achievements=custom_achievements, devlog=dict(devlog) if devlog else {}, support=dict(support) if support else {"support_invite": SUPPORT_SERVER_INVITE, "dashboard_url": PUBLIC_DASHBOARD_URL}, clean=dict(clean) if clean else {"max_delete":0,"batch_size":100,"delay_seconds":1.0,"log_enabled":1}, security_logs=security_logs, stock_logs=stock_logs, channel_setting_groups=CHANNEL_SETTING_GROUPS, stats=stats)
 
 CHANNEL_SETTINGS_PAGE_TEMPLATE = """
 {% extends "base.html" %}
@@ -1266,7 +1298,7 @@ CUSTOM_BOTS_PAGE_TEMPLATE = """
     {% if invite_urls.get(slot) %}
       <a class="custom-btn custom-ghost" href="{{ invite_urls.get(slot) }}" target="_blank">➕ {{ slot }}번 보조 봇 서버에 초대</a>
     {% else %}
-      <p class="custom-note">아직 초대 버튼이 준비되지 않았어요.</p>
+      <p class="custom-note">초대 버튼을 쓰려면 Render 환경변수 <b>CUSTOM_BOT_CLIENT_ID_{{ slot }}</b>도 넣어주세요.</p>
     {% endif %}
   </section>
 {% endfor %}
@@ -1389,43 +1421,18 @@ def delete_custom_bot_slot(guild_id, slot):
 # =========================
 # 봇 초대 링크 / 서버 추가 버튼
 # =========================
-# Discord OAuth2 봇 초대 링크 / 보조봇 초대 업그레이드
-# =========================
-# 메인 봇:
-#   DISCORD_BOT_CLIENT_ID=메인봇 Application ID
-#   DISCORD_BOT_INVITE_PERMISSIONS=8
-# 보조봇:
-#   CUSTOM_BOT_CLIENT_ID_1=1번 보조봇 Application ID
-#   CUSTOM_BOT_CLIENT_ID_2=2번 보조봇 Application ID
-#   CUSTOM_BOT_CLIENT_ID_3=3번 보조봇 Application ID
-# 선택 사항:
-#   CUSTOM_BOT_NAME_1=만능 봇 뮤직 1
-#   CUSTOM_BOT_PERMISSIONS_1=8
-#   CUSTOM_BOT_MAX_SLOTS=3
+# Discord OAuth2 봇 초대 링크입니다.
+# permissions=8 은 관리자 권한입니다. 권한을 줄이고 싶으면 Discord Permission Calculator 값으로 바꾸세요.
 DISCORD_BOT_CLIENT_ID = os.getenv("DISCORD_BOT_CLIENT_ID", "1510625526300278879").strip()
 DISCORD_BOT_INVITE_PERMISSIONS = os.getenv("DISCORD_BOT_INVITE_PERMISSIONS", "8").strip()
-CUSTOM_BOT_MAX_SLOTS = max(1, min(as_int(os.getenv("CUSTOM_BOT_MAX_SLOTS", "3"), 3), 10))
 
 
-def clean_discord_client_id(value):
-    """Discord Application ID는 숫자만 사용합니다."""
-    value = (value or "").strip()
-    return value if value.isdigit() else ""
-
-
-def make_discord_invite_url(client_id, permissions="8", guild_id=None):
-    client_id = clean_discord_client_id(client_id)
-    permissions = str(permissions or "8").strip()
-    if not permissions.isdigit():
-        permissions = "8"
-    if not client_id:
-        return ""
-
+def get_bot_invite_url(guild_id=None):
     base = "https://discord.com/oauth2/authorize"
     scope = "bot%20applications.commands"
     url = (
-        f"{base}?client_id={client_id}"
-        f"&permissions={permissions}"
+        f"{base}?client_id={DISCORD_BOT_CLIENT_ID}"
+        f"&permissions={DISCORD_BOT_INVITE_PERMISSIONS}"
         f"&integration_type=0"
         f"&scope={scope}"
     )
@@ -1434,211 +1441,59 @@ def make_discord_invite_url(client_id, permissions="8", guild_id=None):
     return url
 
 
-def get_bot_invite_url(guild_id=None):
-    return make_discord_invite_url(
-        DISCORD_BOT_CLIENT_ID,
-        DISCORD_BOT_INVITE_PERMISSIONS,
-        guild_id,
-    )
-
-
-def get_custom_bot_invites(guild_id=None):
-    """Render 환경변수에 등록한 보조봇 초대 버튼 목록을 만듭니다."""
-    bots = []
-    for slot in range(1, CUSTOM_BOT_MAX_SLOTS + 1):
-        client_id = clean_discord_client_id(os.getenv(f"CUSTOM_BOT_CLIENT_ID_{slot}", ""))
-        if not client_id:
-            continue
-
-        name = (os.getenv(f"CUSTOM_BOT_NAME_{slot}") or f"보조봇 {slot}").strip()
-        permissions = (os.getenv(f"CUSTOM_BOT_PERMISSIONS_{slot}") or DISCORD_BOT_INVITE_PERMISSIONS or "8").strip()
-        invite_url = make_discord_invite_url(client_id, permissions, guild_id)
-        bots.append({
-            "slot": slot,
-            "name": name,
-            "client_id": client_id,
-            "client_id_masked": f"••••{client_id[-4:]}",
-            "permissions": permissions,
-            "invite_url": invite_url,
-        })
-    return bots
-
-
-def get_custom_bot_env_status():
-    """환경변수 등록 상태 확인용. 토큰/시크릿은 절대 표시하지 않습니다."""
-    status = []
-    for slot in range(1, CUSTOM_BOT_MAX_SLOTS + 1):
-        raw = (os.getenv(f"CUSTOM_BOT_CLIENT_ID_{slot}") or "").strip()
-        clean = clean_discord_client_id(raw)
-        status.append({
-            "slot": slot,
-            "key": f"CUSTOM_BOT_CLIENT_ID_{slot}",
-            "exists": bool(raw),
-            "valid": bool(clean),
-            "masked": f"••••{clean[-4:]}" if clean else "",
-            "name": (os.getenv(f"CUSTOM_BOT_NAME_{slot}") or f"보조봇 {slot}").strip(),
-        })
-    return status
-
-
-@app.context_processor
-def inject_bot_invite_context():
-    custom_bot_invites = get_custom_bot_invites()
-    return {
-        "main_bot_invite_url": get_bot_invite_url(),
-        "custom_bot_invites": custom_bot_invites,
-        "custom_bot_env_status": get_custom_bot_env_status(),
-        "has_custom_bot_invites": bool(custom_bot_invites),
-    }
-
-
 @app.route("/invite")
 def invite_bot():
     guild_id = request.args.get("guild_id", "").strip()
     return redirect(get_bot_invite_url(guild_id or None))
 
 
-@app.route("/custom-bot-invite/<int:slot>")
-def custom_bot_invite(slot):
-    guild_id = request.args.get("guild_id", "").strip()
-    for bot in get_custom_bot_invites(guild_id or None):
-        if bot["slot"] == slot:
-            return redirect(bot["invite_url"])
-    flash(f"보조봇 {slot} Application ID가 Render 환경변수에 없어요.")
-    return redirect(url_for("bot_invite_page"))
-
-
-@app.route("/check-custom-bots")
-def check_custom_bots():
-    return render_template_string(
-        """
-        <!doctype html>
-        <html lang="ko">
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>보조봇 환경변수 확인</title>
-          <style>
-            body{margin:0;min-height:100vh;font-family:Arial,'Malgun Gothic',sans-serif;background:#11111b;color:white;padding:28px;box-sizing:border-box;}
-            .wrap{max-width:850px;margin:0 auto}.card{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);border-radius:20px;padding:22px;margin:14px 0}.ok{color:#9be28f}.bad{color:#ff9a9a}code{background:rgba(0,0,0,.35);padding:3px 7px;border-radius:8px}.btn{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:12px;background:#ff8bd1;color:#111;font-weight:800;text-decoration:none}
-          </style>
-        </head>
-        <body>
-          <div class="wrap">
-            <h1>🤖 보조봇 환경변수 확인</h1>
-            <p>Application ID가 등록됐는지만 확인하는 페이지예요. 토큰/시크릿은 표시하지 않습니다.</p>
-            {% for item in custom_bot_env_status %}
-              <div class="card">
-                <h2>{{ item.name }}</h2>
-                <p><code>{{ item.key }}</code></p>
-                {% if item.valid %}
-                  <p class="ok">✅ 정상 등록됨 · {{ item.masked }}</p>
-                  <a class="btn" href="{{ url_for('custom_bot_invite', slot=item.slot) }}">초대 테스트</a>
-                {% elif item.exists %}
-                  <p class="bad">⚠️ 값은 있지만 숫자 형식이 아니에요. Application ID 숫자만 넣어주세요.</p>
-                {% else %}
-                  <p class="bad">❌ 아직 등록되지 않았어요.</p>
-                {% endif %}
-              </div>
-            {% endfor %}
-            <a class="btn" href="{{ url_for('bot_invite_page') }}">초대 페이지로 이동</a>
-          </div>
-        </body>
-        </html>
-        """,
-        custom_bot_env_status=get_custom_bot_env_status(),
-    )
-
-
 @app.route("/bot-invite")
 def bot_invite_page():
     invite_url = get_bot_invite_url()
-    custom_bots = get_custom_bot_invites()
-    return render_template_string(
-        """
-        <!doctype html>
-        <html lang="ko">
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>만능 봇 서버 추가</title>
-            <style>
-                body {
-                    margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-                    font-family: Arial, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
-                    background: radial-gradient(circle at top, #ffd7ee 0, #151521 45%, #0b0b12 100%);
-                    color:white; padding:26px; box-sizing:border-box;
-                }
-                .wrap { width:min(920px, 100%); }
-                .card {
-                    padding:30px; border-radius:28px;
-                    background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.18);
-                    box-shadow:0 24px 70px rgba(0,0,0,.35); backdrop-filter: blur(16px);
-                    text-align:center; margin:14px 0;
-                }
-                .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
-                h1 { margin:0 0 12px; font-size:32px; }
-                p { color:#e9e9f5; line-height:1.7; margin:0 0 18px; }
-                .btn {
-                    display:inline-block; padding:14px 20px; border-radius:999px;
-                    background:linear-gradient(135deg, #ff7ac8, #8c7bff);
-                    color:white; font-weight:800; text-decoration:none;
-                    box-shadow:0 14px 28px rgba(255,122,200,.28); border:0; cursor:pointer;
-                }
-                .ghost { background:rgba(255,255,255,.12); box-shadow:none; }
-                .sub { margin-top:14px; font-size:13px; color:#cfcfe6; }
-                .bot-card { text-align:left; }
-                .bot-card h3 { margin:0 0 8px; }
-                .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
-                .back { display:inline-block; margin-top:18px; color:#fff; opacity:.78; text-decoration:none; }
-                code { background:rgba(0,0,0,.3); padding:3px 7px; border-radius:8px; }
-            </style>
-        </head>
-        <body>
-            <div class="wrap">
-                <div class="card">
-                    <h1>🤖 만능 봇 서버 추가</h1>
-                    <p>아래 버튼을 누르면 디스코드 서버 선택 화면으로 이동합니다.<br>서버에 추가하려면 해당 서버의 <b>서버 관리 권한</b>이 필요합니다.</p>
-                    {% if invite_url %}
-                      <a class="btn" href="{{ invite_url }}">➕ 메인 봇 서버에 추가하기</a>
-                    {% else %}
-                      <p>메인 봇 Application ID가 설정되지 않았어요.</p>
-                    {% endif %}
-                    <div class="sub">초대 후 대시보드에서 서버를 다시 선택하면 설정할 수 있어요.</div>
-                </div>
-
-                <div class="card">
-                    <h1>🎵 보조봇 초대</h1>
-                    {% if custom_bots %}
-                      <div class="grid">
-                        {% for bot in custom_bots %}
-                          <div class="card bot-card">
-                            <h3>🤖 {{ bot.name }}</h3>
-                            <div class="actions">
-                              <a class="btn" href="{{ bot.invite_url }}">초대하기</a>
-                              <button class="btn ghost" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
-                            </div>
-                          </div>
-                        {% endfor %}
-                      </div>
-                    {% else %}
-                      <p>아직 등록된 보조봇이 없어요.</p>
-                    {% endif %}
-                    <a class="back" href="{{ url_for('check_custom_bots') }}">환경변수 확인하기</a>
-                </div>
-
-                <div style="text-align:center;">
-                    <a class="back" href="{{ url_for('index') }}">← 처음 화면</a>
-                    <span style="opacity:.45;margin:0 8px;">/</span>
-                    <a class="back" href="{{ url_for('servers') }}">서버 목록</a>
-                </div>
-            </div>
-        </body>
-        </html>
-        """,
-        invite_url=invite_url,
-        custom_bots=custom_bots,
-    )
+    return f"""
+    <!doctype html>
+    <html lang="ko">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>만능 봇 서버 추가</title>
+        <style>
+            body {
+                margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+                font-family: Arial, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+                background: radial-gradient(circle at top, #ffd7ee 0, #151521 45%, #0b0b12 100%);
+                color:white;
+            }
+            .card {
+                width:min(560px, calc(100% - 36px));
+                padding:34px; border-radius:28px;
+                background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.18);
+                box-shadow:0 24px 70px rgba(0,0,0,.35); backdrop-filter: blur(16px);
+                text-align:center;
+            }
+            h1 { margin:0 0 12px; font-size:32px; }
+            p { color:#e9e9f5; line-height:1.7; margin:0 0 24px; }
+            .btn {
+                display:inline-block; padding:15px 24px; border-radius:999px;
+                background:linear-gradient(135deg, #ff7ac8, #8c7bff);
+                color:white; font-weight:800; text-decoration:none;
+                box-shadow:0 14px 28px rgba(255,122,200,.28);
+            }
+            .sub { margin-top:18px; font-size:13px; color:#cfcfe6; }
+            .back { display:inline-block; margin-top:18px; color:#fff; opacity:.78; text-decoration:none; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🤖 만능 봇 서버 추가</h1>
+            <p>아래 버튼을 누르면 디스코드 서버 선택 화면으로 이동합니다.<br>서버에 추가하려면 해당 서버의 <b>서버 관리 권한</b>이 필요합니다.</p>
+            <a class="btn" href="{invite_url}">➕ 봇을 서버에 추가하기</a>
+            <div class="sub">초대 후 대시보드에서 서버를 다시 선택하면 설정할 수 있어요.</div>
+            <a class="back" href="/servers">← 서버 목록으로 돌아가기</a>
+        </div>
+    </body>
+    </html>
+    """
 
 
 if __name__ == "__main__":
