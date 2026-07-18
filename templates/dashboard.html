@@ -3,12 +3,32 @@
 <style>
   .dash-wrap{max-width:1200px;margin:0 auto;padding:10px 0 40px;}
   .hero{padding:22px;border:1px solid rgba(255,255,255,.12);border-radius:20px;margin-bottom:18px;background:rgba(255,255,255,.04)}
-  .tabs{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 22px}.tabs a{padding:9px 12px;border-radius:999px;text-decoration:none;background:rgba(255,255,255,.08)}
-  .card{padding:18px;border:1px solid rgba(255,255,255,.12);border-radius:18px;margin:16px 0;background:rgba(255,255,255,.035)}
+  .tabs{position:sticky;top:0;z-index:40;display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 22px;padding:10px;border-radius:16px;background:rgba(20,10,26,.82);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1)}.tabs a{padding:9px 12px;border-radius:999px;text-decoration:none;background:rgba(255,255,255,.08);font-size:.9em;font-weight:700;transition:background .15s}.tabs a:hover{background:rgba(255,111,179,.28)}
+  .card{padding:18px;border:1px solid rgba(255,255,255,.12);border-radius:18px;margin:16px 0;background:rgba(255,255,255,.035);transition:border-color .18s,transform .18s}
+  .card:hover{border-color:rgba(255,182,213,.32)}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
   label{display:block;font-weight:700}input,textarea,select{width:100%;box-sizing:border-box;margin-top:6px;margin-bottom:10px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.22);color:inherit}textarea{min-height:100px}button{padding:10px 14px;border-radius:12px;border:0;font-weight:800;cursor:pointer}.mini{font-size:.88em;opacity:.75}.list{padding:10px;border-radius:12px;background:rgba(0,0,0,.16);margin:8px 0}.danger{background:#ff6b6b;color:#111}.ok{background:#9be28f;color:#111}.wide{grid-column:1/-1}.preview{white-space:pre-wrap;padding:12px;border-radius:12px;background:rgba(0,0,0,.22)}.button-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.send{background:#8ecbff;color:#111}
 
-  .invite-card{position:relative;overflow:hidden}.invite-card:before{content:"";position:absolute;inset:-80px auto auto -80px;width:180px;height:180px;background:rgba(255,182,193,.16);border-radius:50%;pointer-events:none}.invite-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.invite-btn{display:inline-block;padding:10px 13px;border-radius:12px;text-decoration:none;font-weight:800;background:#ff9ed8;color:#111}.invite-copy{padding:10px 13px;border-radius:12px;border:0;font-weight:800;background:rgba(255,255,255,.16);color:inherit}.env-ok{color:#9be28f;font-weight:800}.env-bad{color:#ff9a9a;font-weight:800}
+  /* ── 개요 통계 ── */
+  .overview{margin:0 0 8px}
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+  .stat-card{position:relative;overflow:hidden;padding:18px 18px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(160deg,rgba(255,111,179,.14),rgba(183,140,255,.08) 60%,rgba(255,255,255,.02));transition:transform .18s,box-shadow .18s}
+  .stat-card:hover{transform:translateY(-3px);box-shadow:0 18px 40px rgba(255,111,179,.16)}
+  .stat-card .label{display:flex;align-items:center;gap:7px;font-size:.86em;font-weight:700;opacity:.82;letter-spacing:.2px}
+  .stat-card .value{font-size:2em;font-weight:900;line-height:1.05;margin-top:8px;font-variant-numeric:tabular-nums}
+  .stat-card .sub{font-size:.78em;opacity:.62;margin-top:4px}
+  .stat-card .spark{position:absolute;right:-6px;bottom:-10px;font-size:3.4em;opacity:.10;transform:rotate(-8deg)}
+
+  /* ── TOP10 바 차트 ── */
+  .chart{display:grid;gap:9px;margin-top:6px}
+  .bar-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:10px;font-size:.9em}
+  .bar-row .who{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+  .bar-track{height:22px;border-radius:8px;background:rgba(0,0,0,.28);overflow:hidden}
+  .bar-fill{height:100%;border-radius:8px;background:linear-gradient(90deg,#ff6fb3,#b78cff);min-width:3px;transition:width .5s cubic-bezier(.2,.7,.3,1)}
+  .bar-row .amt{font-weight:800;font-variant-numeric:tabular-nums;opacity:.9}
+  .rank{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:7px;background:rgba(255,255,255,.1);font-size:.78em;font-weight:900;margin-right:6px}
+  .rank.g1{background:linear-gradient(135deg,#ffd66f,#ff9f43);color:#3a2600}.rank.g2{background:linear-gradient(135deg,#e6e6e6,#b9b9c8);color:#2a2a33}.rank.g3{background:linear-gradient(135deg,#e6a76f,#c77b3f);color:#331c07}
+
 </style>
 <div class="dash-wrap">
   <div class="hero">
@@ -18,48 +38,35 @@
   </div>
 
   <div class="tabs">
-    <a href="#custom-bots">🤖 보조봇 초대</a><a href="#guild-settings">📦 전체 채널</a><a href="#welcome">🌸 환영</a><a href="#security">🛡️ 보안</a><a href="#embeds">🧩 임베드</a><a href="#recruit">🌸 구인구직</a><a href="#economy">💰 경제</a><a href="#mission">🎯 미션</a><a href="#coupon">🎟️ 쿠폰</a><a href="#title">🏷️ 칭호</a><a href="#devlog">📈 개발로그</a><a href="#support">💬 지원서버</a><a href="#clean">🧹 청소</a><a href="#event">🎉 이벤트</a>
+    <a href="#overview">📊 개요</a><a href="#guild-settings">📦 전체 채널</a><a href="#welcome">🌸 환영</a><a href="#security">🛡️ 보안</a><a href="#embeds">🧩 임베드</a><a href="#recruit">🌸 구인구직</a><a href="#economy">💰 경제</a><a href="#mission">🎯 미션</a><a href="#coupon">🎟️ 쿠폰</a><a href="#title">🏷️ 칭호</a><a href="#devlog">📈 개발로그</a><a href="#support">💬 지원서버</a><a href="#clean">🧹 청소</a><a href="#event">🎉 이벤트</a>
   </div>
 
-  <section id="custom-bots" class="card invite-card">
-    <h2>🤖 보조봇 초대하기</h2>
-    <div class="button-row" style="margin-bottom:12px;">
-      <a class="invite-btn" href="{{ url_for('bot_invite_page') }}" target="_blank">초대 전용 페이지 열기</a>
-      <a class="invite-btn" href="{{ url_for('check_custom_bots') }}" target="_blank">환경변수 확인</a>
-      {% if main_bot_invite_url %}<a class="invite-btn" href="{{ main_bot_invite_url }}" target="_blank">메인 봇 초대</a>{% endif %}
+  <section id="overview" class="card overview">
+    <h2>📊 서버 개요</h2>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="label">💰 총 보유 포인트</div><div class="value">{{ "{:,}".format(stats.total_points) }}</div><div class="sub">활성 유저 {{ stats.active_members }} / 전체 {{ stats.total_members }}명</div><div class="spark">💰</div></div>
+      <div class="stat-card"><div class="label">🎯 오늘 미션</div><div class="value">{{ stats.mission_claimed }}</div><div class="sub">참여 {{ stats.mission_users }}명 중 달성</div><div class="spark">🎯</div></div>
+      <div class="stat-card"><div class="label">🎟️ 활성 쿠폰</div><div class="value">{{ stats.active_coupons }}</div><div class="sub">발급된 쿠폰 코드</div><div class="spark">🎟️</div></div>
+      <div class="stat-card"><div class="label">🛡️ 보안 이벤트</div><div class="value">{{ stats.security_events_7d }}</div><div class="sub">최근 7일 감지</div><div class="spark">🛡️</div></div>
+      <div class="stat-card"><div class="label">🧩 운영 콘텐츠</div><div class="value">{{ stats.titles + stats.stocks }}</div><div class="sub">칭호 {{ stats.titles }} · 주식 {{ stats.stocks }} · 이벤트 {{ stats.events }}</div><div class="spark">🧩</div></div>
     </div>
 
-    {% if custom_bot_invites %}
-      <div class="grid">
-        {% for bot in custom_bot_invites %}
-          <div class="card">
-            <h3>🎵 {{ bot.name }}</h3>
-            <div class="invite-actions">
-              <a class="invite-btn" href="{{ bot.invite_url }}" target="_blank">초대하기</a>
-              <button class="invite-copy" type="button" onclick="navigator.clipboard.writeText('{{ bot.invite_url }}'); this.innerText='복사 완료';">링크 복사</button>
-            </div>
-          </div>
-        {% endfor %}
+    <h3 style="margin:22px 0 4px">🏆 포인트 TOP 10</h3>
+    {% if top_points %}
+    {% set maxp = top_points[0].point if top_points[0].point and top_points[0].point > 0 else 1 %}
+    <div class="chart">
+      {% for p in top_points %}
+      <div class="bar-row">
+        <div class="who"><span class="rank {% if loop.index==1 %}g1{% elif loop.index==2 %}g2{% elif loop.index==3 %}g3{% endif %}">{{ loop.index }}</span>{{ p.user_id }}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:{{ (p.point / maxp * 100)|round(1) if p.point else 0 }}%"></div></div>
+        <div class="amt">{{ "{:,}".format(p.point or 0) }}P</div>
       </div>
-    {% else %}
-      <p class="mini">아직 등록된 보조봇이 없어요.</p>
-    {% endif %}
-
-    <div class="grid" style="margin-top:12px;">
-      {% for item in custom_bot_env_status %}
-        <div class="list">
-          <b>{{ item.name }}</b><br>
-          <code>{{ item.key }}</code><br>
-          {% if item.valid %}
-            <span class="env-ok">✅ 정상</span> <span class="mini">{{ item.masked }}</span>
-          {% elif item.exists %}
-            <span class="env-bad">⚠️ 숫자 형식 아님</span>
-          {% else %}
-            <span class="env-bad">❌ 미등록</span>
-          {% endif %}
-        </div>
       {% endfor %}
     </div>
+    <p class="mini" style="margin-top:10px">출석·연속출석 등 상세는 아래 💰 경제 탭에서 확인하세요.</p>
+    {% else %}
+    <p class="mini">아직 포인트 기록이 없어요. 유저가 활동을 시작하면 여기에 순위가 표시돼요.</p>
+    {% endif %}
   </section>
 
   <section id="guild-settings" class="card">
