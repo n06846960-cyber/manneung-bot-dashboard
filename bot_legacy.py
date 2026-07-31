@@ -701,6 +701,14 @@ CREATE TABLE IF NOT EXISTS ticket_panel_config (
 )
 """)
 
+# 티켓 담당 역할 / 카테고리를 서버가 직접 지정할 수 있도록 컬럼을 추가합니다.
+for _tpc_col, _tpc_type in [("staff_role_id", "INTEGER DEFAULT 0"), ("category_id", "INTEGER DEFAULT 0")]:
+    try:
+        c.execute(f"ALTER TABLE ticket_panel_config ADD COLUMN {_tpc_col} {_tpc_type}")
+    except sqlite3.OperationalError:
+        pass  # 이미 있으면 무시
+conn.commit()
+
 # 역할 백업: 만든 역할들의 이름/색/권한/옵션을 JSON으로 저장해두고 나중에 복구
 c.execute("""
 CREATE TABLE IF NOT EXISTS role_maker_backups (
@@ -22777,7 +22785,8 @@ def get_ticket_panel_config(guild_id: int):
     """서버별 티켓 패널 임베드 설정. 없으면 기본값."""
     with DB_MUTEX:
         row = c.execute(
-            "SELECT title, description, color, image_url, footer FROM ticket_panel_config WHERE guild_id=?",
+            "SELECT title, description, color, image_url, footer, "
+            "COALESCE(staff_role_id,0), COALESCE(category_id,0) FROM ticket_panel_config WHERE guild_id=?",
             (guild_id,),
         ).fetchone()
     if not row:
@@ -22787,18 +22796,71 @@ def get_ticket_panel_config(guild_id: int):
             "color": "BDEBFF",
             "image_url": "",
             "footer": "",
+            "staff_role_id": 0,
+            "category_id": 0,
         }
-    return {"title": row[0], "description": row[1], "color": row[2], "image_url": row[3], "footer": row[4]}
+    return {"title": row[0], "description": row[1], "color": row[2], "image_url": row[3], "footer": row[4],
+            "staff_role_id": row[5] or 0, "category_id": row[6] or 0}
 
 
-def save_ticket_panel_config(guild_id: int, *, title, description, color, image_url, footer):
+def save_ticket_panel_config(guild_id: int, *, title, description, color, image_url, footer,
+                             staff_role_id=None, category_id=None):
+    # 역할/카테고리는 넘기지 않으면 기존 값 유지
+    prev = get_ticket_panel_config(guild_id)
+    if staff_role_id is None:
+        staff_role_id = prev.get("staff_role_id", 0)
+    if category_id is None:
+        category_id = prev.get("category_id", 0)
     with DB_MUTEX:
         c.execute(
-            "INSERT OR REPLACE INTO ticket_panel_config (guild_id, title, description, color, image_url, footer) "
-            "VALUES (?,?,?,?,?,?)",
-            (guild_id, title, description, color, image_url, footer),
+            "INSERT OR REPLACE INTO ticket_panel_config "
+            "(guild_id, title, description, color, image_url, footer, staff_role_id, category_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (guild_id, title, description, color, image_url, footer, int(staff_role_id or 0), int(category_id or 0)),
         )
         conn.commit()
+
+
+def save_ticket_staff_role(guild_id: int, role_id: int):
+    prev = get_ticket_panel_config(guild_id)
+    save_ticket_panel_config(
+        guild_id,
+        title=prev["title"], description=prev["description"], color=prev["color"],
+        image_url=prev["image_url"], footer=prev["footer"],
+        staff_role_id=int(role_id or 0), category_id=prev.get("category_id", 0),
+    )
+
+
+def save_ticket_category(guild_id: int, category_id: int):
+    prev = get_ticket_panel_config(guild_id)
+    save_ticket_panel_config(
+        guild_id,
+        title=prev["title"], description=prev["description"], color=prev["color"],
+        image_url=prev["image_url"], footer=prev["footer"],
+        staff_role_id=prev.get("staff_role_id", 0), category_id=int(category_id or 0),
+    )
+
+
+def resolve_ticket_staff_role(guild):
+    """티켓 담당 역할을 찾습니다. 우선순위: 서버가 지정한 역할 → 기존 이름 매칭 → None."""
+    cfg = get_ticket_panel_config(guild.id)
+    rid = cfg.get("staff_role_id", 0)
+    if rid:
+        role = guild.get_role(int(rid))
+        if role:
+            return role
+    return get_role_by_id_or_name(guild, STAFF_ROLE_ID, ["총관리자", "부관리자", "대표", "부대표", "운영진", "관리자", "스태프", "staff"])
+
+
+def resolve_ticket_category(guild):
+    """티켓 카테고리를 찾습니다. 우선순위: 서버 지정 → 기존 상수 → 이름 매칭 → 새로 생성."""
+    cfg = get_ticket_panel_config(guild.id)
+    cid = cfg.get("category_id", 0)
+    if cid:
+        cat = guild.get_channel(int(cid))
+        if isinstance(cat, discord.CategoryChannel):
+            return cat
+    return None
 
 
 def build_ticket_panel_embed(guild):
@@ -22906,15 +22968,28 @@ class UnifiedTicketView(discord.ui.View):
         user = interaction.user
         ticket_type = t["label"]
         emoji = t.get("emoji") or "🎫"
-        category = guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
+
+        # 카테고리: 서버 지정 → 기존 상수 → 이름 매칭 → 새로 생성
+        category = resolve_ticket_category(guild)
+        if category is None and TICKET_CATEGORY_ID:
+            category = guild.get_channel(TICKET_CATEGORY_ID)
         if category is None:
             category = mnb_find_category_loose(guild, "🎫 티켓")
         if category is None:
-            category = await guild.create_category("🎫 티켓")
+            try:
+                category = await guild.create_category("🎫 티켓")
+            except discord.Forbidden:
+                category = None
 
-        staff_role = get_role_by_id_or_name(guild, STAFF_ROLE_ID, ["총관리자", "부관리자", "대표", "부대표"])
+        # 담당 역할: 서버 지정 → 이름 매칭 → 관리자 권한 역할 자동 폴백
+        staff_role = resolve_ticket_staff_role(guild)
         if staff_role is None:
-            return await safe_interaction_send(interaction, "❌ 관리자 역할을 찾을 수 없어요. 먼저 `/친목섭` 또는 `/역할자동생성`을 실행해주세요.", ephemeral=True)
+            staff_role = next(
+                (r for r in guild.roles if not r.is_default() and not r.managed and r.permissions.administrator),
+                None,
+            )
+        # 그래도 없으면 역할 없이 진행 (생성자+봇+관리자 권한 보유자만 접근)
+
         channel_name = f"{t['type_key']}-{user.id}".lower().replace(" ", "-")
         existing = discord.utils.get(guild.text_channels, name=channel_name)
         if existing:
@@ -22922,10 +22997,14 @@ class UnifiedTicketView(discord.ui.View):
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            staff_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
         }
-        channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites, topic=f"{ticket_type} 티켓 | 생성자: {user.id}", reason=f"{user} {ticket_type} 티켓 생성")
+        if staff_role is not None:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+        try:
+            channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites, topic=f"{ticket_type} 티켓 | 생성자: {user.id}", reason=f"{user} {ticket_type} 티켓 생성")
+        except discord.Forbidden:
+            return await safe_interaction_send(interaction, "❌ 채널을 만들 권한이 없어요. 봇에게 '채널 관리' 권한을 주세요.", ephemeral=True)
         intro_title = t.get("intro_title") or f"{emoji} {ticket_type} 티켓"
         intro_desc = t.get("intro_description") or f"{user.mention}님, 내용을 자세히 적어주세요.\n\n관리자가 확인 후 답변드릴게요."
         try:
@@ -22933,7 +23012,8 @@ class UnifiedTicketView(discord.ui.View):
         except Exception:
             pass
         embed = create_embed(intro_title, intro_desc[:4096])
-        await channel.send(content=f"{user.mention} {staff_role.mention}", embed=embed, view=TicketControlView())
+        mention = f"{user.mention} {staff_role.mention}" if staff_role is not None else user.mention
+        await channel.send(content=mention, embed=embed, view=TicketControlView())
         await send_ticket_log(guild, f"{emoji} `{ticket_type}` 티켓 생성: {channel.mention} / 생성자: {user.mention}")
         await safe_interaction_send(interaction, f"{emoji} 티켓이 생성되었어요: {channel.mention}", ephemeral=True)
 
@@ -22999,15 +23079,23 @@ def build_ticket_admin_home_embed(guild):
     else:
         note = ""
     body = "\n".join(lines) if lines else "등록된 문의 종류가 없습니다. `종류 추가`로 만들어주세요."
+    cfg = get_ticket_panel_config(guild.id)
+    staff_role = guild.get_role(cfg.get("staff_role_id", 0)) if cfg.get("staff_role_id") else None
+    category = guild.get_channel(cfg.get("category_id", 0)) if cfg.get("category_id") else None
+    staff_txt = staff_role.mention if staff_role else "자동 감지 (관리자 역할)"
+    cat_txt = category.name if category else "자동 (🎫 티켓)"
     embed = create_embed(
         "🎫 티켓 패널 관리",
         "티켓툴처럼 문의 버튼과 안내문을 직접 꾸밀 수 있어요.\n\n"
         f"**현재 문의 종류 ({len(types)}개)**\n{body}{note}\n\n"
+        f"🛡️ **담당 역할**: {staff_txt}\n"
+        f"📂 **카테고리**: {cat_txt}\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "• `종류 추가` — 새 문의 버튼 만들기\n"
         "• `종류 편집` — 라벨·이모지·버튼색·안내문 수정\n"
         "• `종류 삭제` — 문의 버튼 제거\n"
         "• `패널 꾸미기` — 패널 임베드 제목·내용·색 수정\n"
+        "• `담당 역할 설정` / `카테고리 설정` — 티켓 접근 역할·생성 위치 지정\n"
         "• `미리보기` / `채널에 전송` — 실제 패널 확인·게시"
     )
     return embed
@@ -23193,6 +23281,70 @@ class TicketAdminHomeView(discord.ui.View):
             pass
         await interaction.channel.send(embed=embed, view=UnifiedTicketView(self.guild_id))
         await safe_interaction_send(interaction, "✅ 이 채널에 티켓 패널을 전송했어요.", ephemeral=True)
+
+    @discord.ui.button(label="담당 역할 설정", emoji="🛡️", style=discord.ButtonStyle.blurple, row=2)
+    async def set_staff_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = get_ticket_panel_config(self.guild_id)
+        cur = interaction.guild.get_role(cfg.get("staff_role_id", 0)) if cfg.get("staff_role_id") else None
+        desc = f"티켓을 볼 수 있는 담당(관리) 역할을 골라주세요.\n현재: {cur.mention if cur else '자동 감지'}"
+        await safe_interaction_edit(interaction, embed=create_embed("🛡️ 티켓 담당 역할 설정", desc), view=TicketStaffRoleSelectView(self.guild_id))
+
+    @discord.ui.button(label="카테고리 설정", emoji="📂", style=discord.ButtonStyle.gray, row=2)
+    async def set_category(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = get_ticket_panel_config(self.guild_id)
+        cur = interaction.guild.get_channel(cfg.get("category_id", 0)) if cfg.get("category_id") else None
+        desc = f"티켓 채널이 생성될 카테고리를 골라주세요.\n현재: {cur.mention if cur else '자동(🎫 티켓)'}"
+        await safe_interaction_edit(interaction, embed=create_embed("📂 티켓 카테고리 설정", desc), view=TicketCategorySelectView(self.guild_id))
+
+
+class TicketStaffRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, guild_id: int):
+        super().__init__(placeholder="담당 역할을 선택하세요", min_values=1, max_values=1)
+        self.guild_id = guild_id
+
+    async def callback(self, interaction: discord.Interaction):
+        role = self.values[0]
+        save_ticket_staff_role(self.guild_id, role.id)
+        await safe_interaction_edit(
+            interaction,
+            embed=build_ticket_admin_home_embed(interaction.guild),
+            view=TicketAdminHomeView(self.guild_id),
+        )
+        await safe_interaction_send(interaction, f"✅ 담당 역할을 {role.mention} 로 설정했어요.", ephemeral=True)
+
+
+class TicketStaffRoleSelectView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.add_item(TicketStaffRoleSelect(guild_id))
+        self.add_item(TicketAdminBackButton(guild_id))
+
+
+class TicketCategorySelect(discord.ui.ChannelSelect):
+    def __init__(self, guild_id: int):
+        super().__init__(
+            placeholder="티켓 카테고리를 선택하세요",
+            min_values=1, max_values=1,
+            channel_types=[discord.ChannelType.category],
+        )
+        self.guild_id = guild_id
+
+    async def callback(self, interaction: discord.Interaction):
+        cat = self.values[0]
+        save_ticket_category(self.guild_id, cat.id)
+        await safe_interaction_edit(
+            interaction,
+            embed=build_ticket_admin_home_embed(interaction.guild),
+            view=TicketAdminHomeView(self.guild_id),
+        )
+        await safe_interaction_send(interaction, f"✅ 티켓 카테고리를 **{cat.name}** 로 설정했어요.", ephemeral=True)
+
+
+class TicketCategorySelectView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.add_item(TicketCategorySelect(guild_id))
+        self.add_item(TicketAdminBackButton(guild_id))
 
 
 async def open_ticket_admin(interaction: discord.Interaction):
@@ -63878,8 +64030,9 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
             except Exception as e:
                 print(f"❌ {guild.name} v213 서버 슬래시 정리 실패: {e}")
 
-        # 원격 전역 슬래시는 한 번만 비워서 서버 명령어와 2개씩 보이는 문제를 막습니다.
-        if not MNB_V213_GLOBAL_COMMANDS_CLEARED and MNB_SYNC_MODE in {"guild", "guild_only", "server", "server_only"}:
+        # 원격 전역 슬래시를 비워서 서버 명령어와 2개씩 보이는 문제를 막습니다.
+        # 수동 동기화(manual) 시에는 플래그와 무관하게 매번 확실히 비웁니다.
+        if MNB_SYNC_MODE in {"guild", "guild_only", "server", "server_only"} and (manual or not MNB_V213_GLOBAL_COMMANDS_CLEARED):
             try:
                 bot.tree.clear_commands(guild=None)
                 cleared = await bot.tree.sync(guild=None)
