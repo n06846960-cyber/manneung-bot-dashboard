@@ -57346,21 +57346,53 @@ async def prefix_mnb_extra_panel(ctx: commands.Context):
 async def prefix_sync_slash(ctx: commands.Context):
     """슬래시 명령이 안 보일 때 채팅으로 강제 재동기화합니다. (관리자/서버 관리 권한)
     사용법: !싱크  또는  .싱크"""
+    global MNB_V212_LAST_SYNC_TS
     if ctx.guild is None:
         return await ctx.reply("❌ 서버에서만 사용할 수 있습니다.", mention_author=False)
     if not (ctx.author.guild_permissions.administrator or await bot.is_owner(ctx.author)):
         return await ctx.reply("❌ 관리자만 사용할 수 있어요.", mention_author=False)
     msg = await ctx.reply("🔄 슬래시 명령어를 이 서버에 강제 동기화하는 중...", mention_author=False)
+
+    # 진단: 로컬 tree에 /서버 그룹과 티켓관리 서브커맨드가 실제로 있는지 확인
+    diag = []
+    try:
+        server_grp = None
+        for cmd in bot.tree.get_commands(guild=None):
+            if getattr(cmd, "name", "") == "서버":
+                server_grp = cmd
+                break
+        if server_grp is None:
+            diag.append("⚠️ 로컬에 `/서버` 그룹이 없어요 → 최신 코드가 봇에 반영 안 됐을 가능성이 커요.")
+        else:
+            subs = [c.name for c in server_grp.walk_commands()]
+            diag.append(f"로컬 `/서버` 서브명령 {len(subs)}개 · 티켓관리 포함: {'✅' if '티켓관리' in subs else '❌'}")
+    except Exception as e:
+        diag.append(f"진단 실패: {e}")
+
+    # 6초 쿨다운 우회
+    try:
+        MNB_V212_LAST_SYNC_TS = 0
+    except Exception:
+        pass
+
     try:
         MNB_V213_SYNCED_GUILDS.discard(ctx.guild.id)
         results = await mnb_sync_commands_guild_only(reason="manual", target_guild_id=ctx.guild.id)
+        body = "\n".join(diag)
         if results:
             _name, count, _check = results[0]
-            await msg.edit(content=f"✅ {count}개의 슬래시 명령어를 이 서버에 동기화했어요.\n`/서버 티켓관리` 가 안 보이면 디스코드 앱을 완전히 재시작해주세요.")
+            await msg.edit(content=(
+                f"✅ {count}개의 슬래시 명령어를 이 서버에 동기화했어요.\n{body}\n\n"
+                "`/서버 티켓관리` 가 안 보이면 **디스코드를 완전히 종료 후 재시작**해주세요. "
+                "(모바일: 앱 종료 / PC: Ctrl+R)"
+            ))
         else:
-            await msg.edit(content="ℹ️ 직전 동기화 직후에는 6초간 대기해요. 잠시 후 다시 시도해주세요.")
+            await msg.edit(content=(
+                f"⚠️ 동기화 결과가 비어 있어요.\n{body}\n\n"
+                "봇에 최신 코드가 반영되지 않았거나, 이 서버가 sync 대상이 아닐 수 있어요."
+            ))
     except Exception as e:
-        await msg.edit(content=f"❌ 동기화 실패: {e}")
+        await msg.edit(content=f"❌ 동기화 실패: {e}\n" + "\n".join(diag))
 
 
 @bot.command(name="사용", aliases=["아이템사용", "아이템"])
