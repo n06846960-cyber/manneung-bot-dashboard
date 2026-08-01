@@ -48176,6 +48176,7 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_ready():
+    print(f"🟢 [진단] on_ready 진입: {bot.user} / 서버 {len(bot.guilds)}개")
     global MNB_V213_READY_DONE, MNB_V212_BOOTSTRAPPED, MNB_ON_READY_RAN_ONCE
     async with mnb_v213_get_ready_lock():
         if MNB_V213_READY_DONE:
@@ -48185,11 +48186,16 @@ async def on_ready():
         MNB_V212_BOOTSTRAPPED = True
         MNB_ON_READY_RAN_ONCE = True
 
+        print("🟢 [진단] 1/4 필수 명령어 등록 시작...")
         mnb_v210_register_required_commands(force=True)
+        print("🟢 [진단] 2/4 persistent view 등록 시작...")
         mnb_v213_register_persistent_views_once()
+        print("🟢 [진단] 3/4 백그라운드 루프 시작...")
         mnb_v213_start_background_loops_once()
+        print("🟢 [진단] 4/4 슬래시 명령어 동기화 시작...")
 
         sync_results = await mnb_sync_commands_guild_only("startup_v214")
+        print("🟢 [진단] 슬래시 명령어 동기화 반환됨.")
 
         # v215: 시작 동기화 후에도 원격에 슬래시가 0개인 서버는 강제로 다시 동기화합니다.
         #       on_ready를 막지 않도록 백그라운드로 실행하고, 서버별 타임아웃을 겁니다.
@@ -48595,6 +48601,7 @@ async def start_discord_client_safely(label: str, client: discord.Client, token:
         return
 
     try:
+        print(f"🔵 [진단] {label} 로그인 시도 중...")
         await client.start(token)
     except discord.LoginFailure:
         print(f"❌ {label} 로그인 실패: 토큰이 틀렸거나 Reset된 토큰입니다. 해당 환경변수만 다시 확인하세요.")
