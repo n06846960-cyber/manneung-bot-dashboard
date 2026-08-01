@@ -48046,9 +48046,11 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
             pass
 
         results = []
-        for guild in target_guilds:
+        total_guilds = len(target_guilds)
+        for _idx, guild in enumerate(target_guilds, start=1):
             guild_object = discord.Object(id=guild.id)
             try:
+                print(f"🟡 [진단] ({_idx}/{total_guilds}) {guild.name} 동기화 시작...")
                 bot.tree.clear_commands(guild=guild_object)
                 added_names = set()
                 for command in staging_commands:
@@ -48063,22 +48065,33 @@ async def mnb_sync_commands_guild_only(reason: str = "auto", target_guild_id: in
                     except Exception as e:
                         print(f"⚠️ {guild.name} v213 명령어 복사 실패 /{name}: {e}")
 
-                synced = await bot.tree.sync(guild=guild_object)
+                # 한 서버 sync가 rate limit로 오래 걸려도 전체가 멈추지 않게 타임아웃을 겁니다.
+                try:
+                    synced = await asyncio.wait_for(bot.tree.sync(guild=guild_object), timeout=30)
+                except discord.HTTPException as http_err:
+                    # 특정 서버에서만 실패하는 원인을 정확히 보기 위해 상세 에러를 출력합니다.
+                    print(f"❌ [진단] {guild.name} sync HTTP 오류: status={getattr(http_err, 'status', '?')} code={getattr(http_err, 'code', '?')} / {http_err}")
+                    raise
                 synced_names = {cmd.name for cmd in synced}
                 check_text = ", ".join(f"/{name}" for name in sorted(set(MNB_REQUIRED_COMMAND_NAMES) & synced_names))
                 results.append((guild.name, len(synced), check_text))
                 MNB_V213_SYNCED_GUILDS.add(guild.id)
-                # v214: 서버별 동기화 성공 로그는 한 줄 요약으로만 출력합니다.
+                print(f"🟡 [진단] ({_idx}/{total_guilds}) {guild.name} 완료: {len(synced)}개")
+            except asyncio.TimeoutError:
+                print(f"⏱️ ({_idx}/{total_guilds}) {guild.name} 동기화 60초 초과 → 건너뜀 (다음 시작 때 재시도)")
             except Exception as e:
                 print(f"❌ {guild.name} v213 서버 슬래시 정리 실패: {e}")
+            # rate limit 방어: 서버 사이에 짧게 쉽니다.
+            await asyncio.sleep(2)
 
         # 원격 전역 슬래시는 한 번만 비워서 서버 명령어와 2개씩 보이는 문제를 막습니다.
         if not MNB_V213_GLOBAL_COMMANDS_CLEARED and MNB_SYNC_MODE in {"guild", "guild_only", "server", "server_only"}:
             try:
+                print("🟡 [진단] 전역 슬래시 정리(clear) 시작...")
                 bot.tree.clear_commands(guild=None)
                 cleared = await bot.tree.sync(guild=None)
                 MNB_V213_GLOBAL_COMMANDS_CLEARED = True
-                # v214: 전역 슬래시 정리 성공 로그는 숨깁니다.
+                print("🟡 [진단] 전역 슬래시 정리 완료.")
             except Exception as e:
                 print(f"⚠️ v213 원격 전역 슬래시 정리 실패: {e}")
             finally:
