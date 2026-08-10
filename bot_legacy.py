@@ -19992,54 +19992,151 @@ def rpg_get_image(category: str, key: str):
     return _rpg_image_cache.get((category, str(key)))
 
 
+# ==========================================================
+# 🖼️ RPG 이미지 시스템
+# ==========================================================
+
+def rpg_get_image(category: str, key: str):
+    """등록된 이미지 URL을 가져옵니다."""
+
+    if not _rpg_image_cache_loaded:
+        rpg_load_image_cache()
+
+    category = str(category).strip()
+    key = str(key).strip()
+
+    # 1차: 완전 일치
+    url = _rpg_image_cache.get((category, key))
+
+    if url:
+        return str(url).strip()
+
+    # 2차: 공백 제거 후 비교
+    normalized_key = " ".join(key.split())
+
+    for (cached_category, cached_key), cached_url in _rpg_image_cache.items():
+
+        if str(cached_category).strip() != category:
+            continue
+
+        cached_key_normalized = " ".join(
+            str(cached_key).strip().split()
+        )
+
+        if cached_key_normalized == normalized_key:
+
+            if cached_url:
+                return str(cached_url).strip()
+
+    return None
+
+
 def rpg_set_image(category: str, key: str, url: str):
-    """이미지 URL을 등록/수정합니다. url이 빈 문자열이면 삭제."""
-    key = str(key)
+    """이미지 URL을 등록/수정합니다."""
+
+    category = str(category).strip()
+    key = str(key).strip()
+    url = str(url).strip()
+
     with DB_MUTEX:
+
         if url:
-            c.execute("INSERT OR REPLACE INTO rpg_images (category, key, url) VALUES (?, ?, ?)", (category, key, url))
+
+            c.execute(
+                """
+                INSERT OR REPLACE INTO rpg_images
+                (category, key, url)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    category,
+                    key,
+                    url
+                )
+            )
+
         else:
-            c.execute("DELETE FROM rpg_images WHERE category=? AND key=?", (category, key))
+
+            c.execute(
+                """
+                DELETE FROM rpg_images
+                WHERE category=? AND key=?
+                """,
+                (
+                    category,
+                    key
+                )
+            )
+
         conn.commit()
+
+    # 캐시 즉시 갱신
     if url:
-        _rpg_image_cache[(category, key)] = url
+
+        _rpg_image_cache[
+            (
+                category,
+                key
+            )
+        ] = url
+
     else:
-        _rpg_image_cache.pop((category, key), None)
+
+        _rpg_image_cache.pop(
+            (
+                category,
+                key
+            ),
+            None
+        )
 
 
-def rpg_apply_image(embed: "discord.Embed", category: str, key: str, thumbnail: bool = False):
-    """임베드에 등록된 이미지가 있으면 붙입니다. (thumbnail=True면 작은 썸네일)"""
-    url = rpg_get_image(category, key)
+def rpg_apply_image(
+    embed: "discord.Embed",
+    category: str,
+    key: str,
+    thumbnail: bool = False
+):
+    """등록된 이미지를 임베드에 적용합니다."""
+
+    category = str(category).strip()
+    key = str(key).strip()
+
+    url = rpg_get_image(
+        category,
+        key
+    )
+
+    print("=" * 60)
+    print("[RPG IMAGE APPLY]")
+    print(f"category = {category!r}")
+    print(f"key      = {key!r}")
+    print(f"url      = {url!r}")
+    print("=" * 60)
+
     if url:
+
+        url = str(url).strip()
+
         if thumbnail:
-            embed.set_thumbnail(url=url)
+
+            embed.set_thumbnail(
+                url=url
+            )
+
         else:
-            embed.set_image(url=url)
+
+            embed.set_image(
+                url=url
+            )
+
+        print("✅ 이미지가 Embed에 적용되었습니다.")
+
+    else:
+
+        print("❌ 등록된 이미지를 찾지 못했습니다.")
+
     return embed
-
-
-def rpg_image_keys(category: str):
-    """카테고리별 등록 가능한 (표시이름, key) 목록을 돌려줍니다."""
-    if category == "monster":
-        return [(m["name"], m["name"]) for m in RPG_MONSTERS]
-    if category == "boss":
-        return [(b["name"], b["name"]) for b in RPG_BOSSES]
-    if category == "pet":
-        keys = []
-        for entry in RPG_PET_POOL:
-            for pet in entry["pets"]:
-                keys.append((pet, pet))
-        return keys
-    if category == "relic":
-        return [(piece["name"], rid) for rid, (piece, _s) in RPG_RELIC_BY_ID.items()]
-    if category == "accessory":
-        return [(r["name"], r["id"]) for r in RPG_FORGE_RECIPES if r["kind"] == "accessory"]
-    if category == "raid":
-        return [(cfg["name"], diff) for diff, cfg in RPG_RAID_BOSSES.items()]
-    if category == "worldboss":
-        return [(f"{emoji} {name}", name) for emoji, name, _tier in RPG_WORLDBOSS_POOL]
-    return []
-
 
 # =========================
 # 세공석으로 무기/방어구에 부가옵션을 부여합니다. 장비당 최대 3개, 수치는 범위 내 랜덤.
@@ -54796,36 +54893,645 @@ class RPGDexDetailSelect(discord.ui.Select):
     def __init__(self, category: str):
         self.category = category
         options = []
+
         if category == "monster":
             for i, m in enumerate(RPG_MONSTERS[:25]):
-                options.append(discord.SelectOption(label=m["name"][:100], value=str(i), emoji=None))
+                options.append(
+                    discord.SelectOption(
+                        label=m["name"][:100],
+                        value=str(i),
+                        emoji=m.get("emoji")
+                    )
+                )
+
         elif category == "boss":
             for i, b in enumerate(RPG_BOSSES[:25]):
-                options.append(discord.SelectOption(label=b["name"][:100], value=str(i)))
+                options.append(
+                    discord.SelectOption(
+                        label=b["name"][:100],
+                        value=str(i),
+                        emoji=b.get("emoji")
+                    )
+                )
+
         elif category == "raid":
             for i, (diff, cfg) in enumerate(RPG_RAID_BOSSES.items()):
-                options.append(discord.SelectOption(label=f"{cfg['name']} ({diff})"[:100], value=str(i)))
+                options.append(
+                    discord.SelectOption(
+                        label=f"{cfg['name']} ({diff})"[:100],
+                        value=str(i),
+                        emoji=cfg.get("emoji")
+                    )
+                )
+
         elif category == "relic":
             for i, s in enumerate(RPG_RELIC_SETS[:25]):
-                options.append(discord.SelectOption(label=s["set_name"][:100], value=str(i)))
+                options.append(
+                    discord.SelectOption(
+                        label=s["set_name"][:100],
+                        value=str(i),
+                        emoji="🧿"
+                    )
+                )
+
         elif category == "job":
             for i, l in enumerate(RPG_JOB_LINES[:25]):
-                options.append(discord.SelectOption(label=l["line_name"][:100], value=str(i)))
+                options.append(
+                    discord.SelectOption(
+                        label=l["line_name"][:100],
+                        value=str(i),
+                        emoji="🎓"
+                    )
+                )
+
+class RPGDexDetailSelect(discord.ui.Select):
+    def __init__(self, category: str):
+        self.category = category
+        options = []
+
+        # ==========================================================
+        # 👹 몬스터
+        # ==========================================================
+        if category == "monster":
+            for i, m in enumerate(RPG_MONSTERS[:25]):
+                options.append(
+                    discord.SelectOption(
+                        label=m["name"][:100],
+                        value=str(i),
+                        emoji=m.get("emoji")
+                    )
+                )
+
+        # ==========================================================
+        # 👑 보스
+        # ==========================================================
+        elif category == "boss":
+            for i, b in enumerate(RPG_BOSSES[:25]):
+                options.append(
+                    discord.SelectOption(
+                        label=b["name"][:100],
+                        value=str(i),
+                        emoji=b.get("emoji")
+                    )
+                )
+
+        # ==========================================================
+        # 🔥 레이드
+        # ==========================================================
+        elif category == "raid":
+            for i, (diff, cfg) in enumerate(RPG_RAID_BOSSES.items()):
+                options.append(
+                    discord.SelectOption(
+                        label=f"{cfg['name']} ({diff})"[:100],
+                        value=str(i),
+                        emoji=cfg.get("emoji")
+                    )
+                )
+
+        # ==========================================================
+        # 🧿 유물
+        # ==========================================================
+        elif category == "relic":
+            for i, s in enumerate(RPG_RELIC_SETS[:25]):
+                options.append(
+                    discord.SelectOption(
+                        label=s["set_name"][:100],
+                        value=str(i)
+                    )
+                )
+
+        # ==========================================================
+        # 🎓 직업
+        # ==========================================================
+        elif category == "job":
+            for i, l in enumerate(RPG_JOB_LINES[:25]):
+                options.append(
+                    discord.SelectOption(
+                        label=l["line_name"][:100],
+                        value=str(i)
+                    )
+                )
+
+        # ==========================================================
+        # 🐾 펫
+        # → 여기서는 펫 이름이 아니라 "등급"을 선택
+        # ==========================================================
         elif category == "pet":
-            for i, e in enumerate(RPG_PET_POOL[:25]):
-                t = rpg_rarity_tier(e["rarity_index"])
-                options.append(discord.SelectOption(label=f"{t['name']} 등급", value=str(i)))
+
+            pet_rarity_options = [
+                (0, "일반", "⚪"),
+                (1, "희귀", "🔵"),
+                (2, "에픽", "🟣"),
+                (3, "전설", "🟠"),
+                (4, "신화", "🔴"),
+                (5, "신", "✨"),
+                (6, "???", "❓"),
+            ]
+
+            for rarity_index, rarity_name, emoji in pet_rarity_options:
+
+                pet_count = sum(
+                    len(entry["pets"])
+                    for entry in RPG_PET_POOL
+                    if entry["rarity_index"] == rarity_index
+                )
+
+                if pet_count > 0:
+                    options.append(
+                        discord.SelectOption(
+                            label=f"{rarity_name} 펫",
+                            value=f"pet_rarity:{rarity_index}",
+                            description=f"{pet_count}종의 펫",
+                            emoji=emoji
+                        )
+                    )
+
+        # ==========================================================
+        # 항목 없음
+        # ==========================================================
         if not options:
-            options = [discord.SelectOption(label="항목 없음", value="__none__")]
-        super().__init__(placeholder="상세히 볼 항목 선택", min_values=1, max_values=1, options=options, row=1)
+            options = [
+                discord.SelectOption(
+                    label="항목 없음",
+                    value="__none__"
+                )
+            ]
+
+        super().__init__(
+            placeholder="상세히 볼 항목 선택",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "__none__":
-            return await interaction.response.defer()
-        idx = int(self.values[0])
-        embed = rpg_build_dex_detail_embed(self.category, idx)
-        await interaction.response.edit_message(embed=embed, view=self.view)
 
+        selected = self.values[0]
+
+        if selected == "__none__":
+            return await interaction.response.defer()
+
+        # ==========================================================
+        # 🐾 펫 등급 선택
+        # ==========================================================
+        if self.category == "pet" and selected.startswith("pet_rarity:"):
+
+            rarity_index = int(selected.split(":")[1])
+            tier = rpg_rarity_tier(rarity_index)
+
+            pet_options = []
+
+            for entry_index, entry in enumerate(RPG_PET_POOL):
+
+                if entry["rarity_index"] != rarity_index:
+                    continue
+
+                for pet_index, pet_name in enumerate(entry["pets"]):
+
+                    pet_options.append(
+                        discord.SelectOption(
+                            label=pet_name[:100],
+                            value=f"pet:{entry_index}:{pet_index}",
+                            description=(
+                                f"{tier['emoji']} {tier['name']} "
+                                f"· 전투력 +{entry['power_bonus']}"
+                            )[:100],
+                            emoji="🐾"
+                        )
+                    )
+
+            # Discord Select 하나당 최대 25개
+            pet_options = pet_options[:25]
+
+            embed = discord.Embed(
+                title=f"{tier['emoji']} {tier['name']} 펫 도감",
+                description=(
+                    f"**{tier['name']}** 등급의 펫 목록입니다.\n\n"
+                    f"🐾 총 **{len(pet_options)}종**\n\n"
+                    "아래 메뉴에서 펫을 선택하면 상세정보를 볼 수 있어요."
+                ),
+                color=discord.Color.magenta()
+            )
+
+            embed.set_footer(
+                text="만능 봇 | RPG 펫 도감"
+            )
+
+            view = self.view
+            view.clear_items()
+
+            # 카테고리 선택
+            view.add_item(
+                RPGDexCategorySelect()
+            )
+
+            # 등급 선택
+            view.add_item(
+                RPGPetRaritySelect()
+            )
+
+            # 펫 선택
+            if pet_options:
+                view.add_item(
+                    RPGPetSelect(
+                        rarity_index,
+                        pet_options
+                    )
+                )
+
+            await interaction.response.edit_message(
+                embed=embed,
+                view=view
+            )
+
+            return
+
+        # ==========================================================
+        # 👹 일반 도감
+        # ==========================================================
+        try:
+
+            idx = int(selected)
+
+            embed = rpg_build_dex_detail_embed(
+                self.category,
+                idx
+            )
+
+            await interaction.response.edit_message(
+                embed=embed,
+                view=self.view
+            )
+
+        except (ValueError, IndexError, KeyError):
+
+            await interaction.response.send_message(
+                "❌ 도감 정보를 불러오는 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+# ==============================================================
+# 🐾 펫 선택 메뉴
+# ==============================================================
+
+class RPGPetSelect(discord.ui.Select):
+
+    def __init__(self, rarity_index: int, options):
+        self.rarity_index = rarity_index
+
+        super().__init__(
+            placeholder="🐾 상세히 볼 펫을 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        selected = self.values[0]
+
+        try:
+
+            # pet:entry_index:pet_index
+            prefix, entry_index, pet_index = selected.split(":")
+
+            if prefix != "pet":
+                raise ValueError("잘못된 펫 선택값")
+
+            entry_index = int(entry_index)
+            pet_index = int(pet_index)
+
+            embed = rpg_build_dex_pet_detail_embed(
+                entry_index,
+                pet_index
+            )
+
+            await interaction.response.edit_message(
+                embed=embed,
+                view=self.view
+            )
+
+        except (ValueError, IndexError, KeyError):
+
+            await interaction.response.send_message(
+                "❌ 펫 정보를 불러오는 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+# ==============================================================
+# 🐾 펫 등급 선택 메뉴
+# ==============================================================
+
+class RPGPetRaritySelect(discord.ui.Select):
+
+    def __init__(self):
+
+        options = []
+
+        for rarity_index in range(7):
+
+            tier = rpg_rarity_tier(rarity_index)
+
+            pet_count = sum(
+                len(entry["pets"])
+                for entry in RPG_PET_POOL
+                if entry["rarity_index"] == rarity_index
+            )
+
+            if pet_count <= 0:
+                continue
+
+            options.append(
+                discord.SelectOption(
+                    label=tier["name"],
+                    value=str(rarity_index),
+                    emoji=tier["emoji"],
+                    description=f"{pet_count}종의 펫을 확인합니다."
+                )
+            )
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="펫 없음",
+                    value="__none__"
+                )
+            ]
+
+        super().__init__(
+            placeholder="🐾 펫 등급을 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        selected = self.values[0]
+
+        if selected == "__none__":
+            return await interaction.response.defer()
+
+        rarity_index = int(selected)
+
+        tier = rpg_rarity_tier(rarity_index)
+
+        # ==========================================================
+        # 해당 등급 펫만 가져오기
+        # ==========================================================
+
+        pet_options = []
+
+        for entry_index, entry in enumerate(RPG_PET_POOL):
+
+            if entry["rarity_index"] != rarity_index:
+                continue
+
+            for pet_index, pet_name in enumerate(entry["pets"]):
+
+                pet_options.append(
+                    discord.SelectOption(
+                        label=pet_name[:100],
+                        value=f"pet:{entry_index}:{pet_index}",
+                        description=(
+                            f"{tier['emoji']} {tier['name']} "
+                            f"· 전투력 +{entry['power_bonus']}"
+                        )[:100],
+                        emoji="🐾"
+                    )
+                )
+
+        # 최대 25개
+        pet_options = pet_options[:25]
+
+        # ==========================================================
+        # 임베드
+        # ==========================================================
+
+        embed = discord.Embed(
+            title=f"{tier['emoji']} {tier['name']} 펫 도감",
+            description=(
+                f"**{tier['name']}** 등급의 펫 목록입니다.\n\n"
+                f"🐾 총 **{len(pet_options)}종**\n\n"
+                "아래 메뉴에서 펫을 선택하면 상세정보를 볼 수 있어요."
+            ),
+            color=discord.Color.magenta()
+        )
+
+        embed.set_footer(
+            text="만능 봇 | RPG 펫 도감"
+        )
+
+        # ==========================================================
+        # View 재구성
+        # ==========================================================
+
+        view = self.view
+        view.clear_items()
+
+        # 1️⃣ 카테고리
+        view.add_item(
+            RPGDexCategorySelect()
+        )
+
+        # 2️⃣ 펫 등급
+        view.add_item(
+            RPGPetRaritySelect()
+        )
+
+        # 3️⃣ 해당 등급 펫
+        if pet_options:
+            view.add_item(
+                RPGPetSelect(
+                    rarity_index,
+                    pet_options
+                )
+            )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=view
+        )
+
+
+# ==========================================================
+# 🐾 펫 상세정보
+# ==========================================================
+
+def rpg_build_dex_pet_detail_embed(
+    entry_index: int,
+    pet_index: int
+) -> discord.Embed:
+
+    # ------------------------------------------------------
+    # 펫 데이터
+    # ------------------------------------------------------
+
+    entry = RPG_PET_POOL[entry_index]
+
+    pet_name = str(
+        entry["pets"][pet_index]
+    ).strip()
+
+    tier = rpg_rarity_tier(
+        entry["rarity_index"]
+    )
+
+    # ------------------------------------------------------
+    # 임베드
+    # ------------------------------------------------------
+
+    embed = discord.Embed(
+        title=f"🐾 {pet_name}",
+        description=(
+            f"{tier['emoji']} **등급:** {tier['name']}\n"
+            f"⚔️ **전투력 보너스:** +{entry['power_bonus']}\n"
+            f"🎲 **획득 확률:** "
+            f"{entry['rate'] * 100:g}%"
+        ),
+        color=discord.Color.magenta()
+    )
+
+    # ------------------------------------------------------
+    # 🤖 봇 썸네일
+    # ------------------------------------------------------
+
+    if bot.user:
+
+        embed.set_thumbnail(
+            url=bot.user.display_avatar.url
+        )
+
+    # ------------------------------------------------------
+    # 📖 펫 정보
+    # ------------------------------------------------------
+
+    embed.add_field(
+        name="📖 펫 정보",
+        value=(
+            f"이름: **{pet_name}**\n"
+            f"등급: **{tier['name']}**\n"
+            f"전투력: **+{entry['power_bonus']}**\n"
+            f"획득 확률: "
+            f"**{entry['rate'] * 100:g}%**"
+        ),
+        inline=False
+    )
+
+    # ------------------------------------------------------
+    # ⚔️ 펫 능력치
+    # ------------------------------------------------------
+
+    pet_hp = entry.get(
+        "hp",
+        0
+    )
+
+    pet_attack = entry.get(
+        "attack",
+        entry.get(
+            "power_bonus",
+            0
+        )
+    )
+
+    pet_defense = entry.get(
+        "defense",
+        0
+    )
+
+    pet_agility = entry.get(
+        "agility",
+        0
+    )
+
+    pet_luck = entry.get(
+        "luck",
+        0
+    )
+
+    embed.add_field(
+        name="⚔️ 펫 능력치",
+        value=(
+            f"❤️ HP: **+{pet_hp:,}**\n"
+            f"⚔️ 공격력: **+{pet_attack:,}**\n"
+            f"🛡️ 방어력: **+{pet_defense:,}**\n"
+            f"💨 민첩: **+{pet_agility:,}**\n"
+            f"🍀 럭: **+{pet_luck:,}**"
+        ),
+        inline=False
+    )
+
+    # ------------------------------------------------------
+    # ✨ 펫 스킬
+    # ------------------------------------------------------
+
+    pet_skill = entry.get(
+        "skill",
+        "아직 알려진 펫 스킬이 없습니다."
+    )
+
+    embed.add_field(
+        name="✨ 펫 스킬",
+        value=f"**{pet_skill}**",
+        inline=False
+    )
+
+    # ------------------------------------------------------
+    # 🖼️ 펫 이미지
+    # ------------------------------------------------------
+
+    image_key = str(
+        pet_name
+    ).strip()
+
+    print("=" * 60)
+    print("[RPG PET IMAGE]")
+    print(f"펫 이름     : {pet_name!r}")
+    print(f"이미지 키   : {image_key!r}")
+
+    image_url = rpg_get_image(
+        category="pet",
+        key=image_key
+    )
+
+    print(f"이미지 URL  : {image_url!r}")
+    print("=" * 60)
+
+    if image_url:
+
+        image_url = str(
+            image_url
+        ).strip()
+
+        embed.set_image(
+            url=image_url
+        )
+
+        print(
+            f"✅ 펫 이미지 적용: {image_url}"
+        )
+
+    else:
+
+        print(
+            f"❌ 펫 이미지 없음: {image_key!r}"
+        )
+
+    # ------------------------------------------------------
+    # 하단
+    # ------------------------------------------------------
+
+    embed.set_footer(
+        text="만능 봇 | RPG 펫 도감"
+    )
+
+    return embed
 
 def rpg_build_dex_detail_embed(category: str, idx: int) -> discord.Embed:
     if category == "monster":
@@ -54899,6 +55605,94 @@ class RPGDexView(discord.ui.View):
         self.add_item(RPGDexCategorySelect())
         if self.category:
             self.add_item(RPGDexDetailSelect(self.category))
+
+class RPGPetSelect(discord.ui.Select):
+
+    def __init__(self, rarity_index: int, options):
+        self.rarity_index = rarity_index
+
+        super().__init__(
+            placeholder="🐾 상세히 볼 펫을 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        selected = self.values[0]
+
+        try:
+            # pet:entry_index:pet_index
+            prefix, entry_index, pet_index = selected.split(":")
+
+            if prefix != "pet":
+                raise ValueError("잘못된 펫 선택값")
+
+            entry_index = int(entry_index)
+            pet_index = int(pet_index)
+
+            embed = rpg_build_dex_pet_detail_embed(
+                entry_index,
+                pet_index
+            )
+
+            await interaction.response.edit_message(
+                embed=embed,
+                view=self.view
+            )
+
+        except (ValueError, IndexError, KeyError):
+
+            await interaction.response.send_message(
+                "❌ 펫 정보를 불러오는 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+def rpg_build_dex_pet_detail_embed(
+    entry_index: int,
+    pet_index: int
+) -> discord.Embed:
+
+    entry = RPG_PET_POOL[entry_index]
+    pet_name = entry["pets"][pet_index]
+
+    tier = rpg_rarity_tier(
+        entry["rarity_index"]
+    )
+
+    embed = discord.Embed(
+        title=f"🐾 {pet_name}",
+        description=(
+            f"{tier['emoji']} **등급:** {tier['name']}\n"
+            f"⚔️ **전투력 보너스:** +{entry['power_bonus']}\n"
+            f"🎲 **획득 확률:** {entry['rate'] * 100:g}%"
+        ),
+        color=discord.Color.magenta()
+    )
+
+    if bot.user:
+        embed.set_thumbnail(
+            url=bot.user.display_avatar.url
+        )
+
+    embed.add_field(
+        name="📖 펫 정보",
+        value=(
+            f"이름: **{pet_name}**\n"
+            f"등급: **{tier['name']}**\n"
+            f"전투력: **+{entry['power_bonus']}**\n"
+            f"획득 확률: **{entry['rate'] * 100:g}%**"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="만능 봇 | RPG 펫 도감"
+    )
+
+    return embed
 
 
 @rpg_group.command(name="랭킹", description="이 서버의 RPG 랭킹 TOP 10을 확인합니다. (레벨/PvP)")
@@ -58513,7 +59307,7 @@ async def ops_group_channel_info(interaction: discord.Interaction, 채널: disco
     embed.add_field(name="📅 생성일", value=ch.created_at.strftime("%Y-%m-%d"), inline=True)
     if isinstance(ch, discord.TextChannel):
         embed.add_field(name="🐌 슬로우모드", value=f"{ch.slowmode_delay}초" if ch.slowmode_delay else "없음", inline=True)
-        embed.add_field(name="🔞 NSFW", value="예" if ch.is_nsfw() else "아니오", inline=True)
+        embed.add_field(name="🔞 nsfw", value="예" if ch.is_nsfw() else "아니오", inline=True)
         if ch.topic:
             embed.add_field(name="📝 주제", value=ch.topic[:1024], inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -58844,7 +59638,7 @@ async def tools_group_slowmode(interaction: discord.Interaction, 초: int, 채�
     await interaction.followup.send(f"🐌 {ch.mention}의 슬로우모드를 {'해제' if delay == 0 else f'{delay}초'}로 설정했어요.", ephemeral=True)
 
 
-@tools_group.command(name="nsfw설정", description="채널의 NSFW(연령 제한) 여부를 설정합니다. (관리자)")
+@tools_group.command(name="nsfw설정", description="채널의 nsfw(연령 제한) 여부를 설정합니다. (관리자)")
 @app_commands.describe(상태="켜기=True / 끄기=False", 채널="대상 채널 (비우면 현재 채널)")
 async def tools_group_set_nsfw(interaction: discord.Interaction, 상태: bool, 채널: discord.TextChannel = None):
     if interaction.guild is None:
@@ -58854,10 +59648,10 @@ async def tools_group_set_nsfw(interaction: discord.Interaction, 상태: bool, �
     await safe_interaction_defer(interaction, ephemeral=True)
     ch = 채널 or interaction.channel
     try:
-        await ch.edit(nsfw=상태, reason=f"NSFW 설정 by {interaction.user}")
+        await ch.edit(nsfw=상태, reason=f"nsfw 설정 by {interaction.user}")
     except (discord.Forbidden, discord.HTTPException):
-        return await interaction.followup.send("⚠️ NSFW 설정 중 오류가 났어요.", ephemeral=True)
-    await interaction.followup.send(f"🔞 {ch.mention}의 NSFW를 {'켰' if 상태 else '껐'}어요.", ephemeral=True)
+        return await interaction.followup.send("⚠️ nsfw 설정 중 오류가 났어요.", ephemeral=True)
+    await interaction.followup.send(f"🔞 {ch.mention}의 nsfw를 {'켰' if 상태 else '껐'}어요.", ephemeral=True)
 
 
 @tools_group.command(name="카테고리이동", description="채널을 다른 카테고리로 옮깁니다. (관리자)")
@@ -71951,8 +72745,30 @@ async def start_all_discord_clients():
 server_setup_group = app_commands.Group(name="서버설정", description="서버 유저 및 권한 관리 명령어입니다.")
 bot.tree.add_command(server_setup_group)
 
+# Discord는 하나의 슬래시 그룹에 최대 25개의 직접 하위 명령어만 허용합니다.
+# 역할/음성 관리 명령어를 하위 그룹으로 묶어 25개 제한을 넘지 않도록 합니다.
+server_role_manage_group = app_commands.Group(
+    name="역할",
+    description="서버 역할 관리 명령어입니다.",
+    parent=server_setup_group,
+)
+server_voice_manage_group = app_commands.Group(
+    name="음성",
+    description="서버 음성 채널 관리 명령어입니다.",
+    parent=server_setup_group,
+)
+
 channel_tools_group = app_commands.Group(name="채널도구", description="채널 상태 및 공지 관리 명령어입니다.")
 bot.tree.add_command(channel_tools_group)
+
+# =========================
+# 음성채널 관리 하위 그룹
+# =========================
+
+voice_channel_tools_group = app_commands.Group(
+    name="음성채널",
+    description="음성 채널 관리 기능"
+)
 
 @channel_tools_group.command(name="청소", description="현재 채널의 메시지를 지정된 개수만큼 삭제합니다.")
 @app_commands.describe(개수="삭제할 메시지 개수 (1-100)")
@@ -72034,7 +72850,10 @@ async def admin_check_warnings(interaction: discord.Interaction, 유저: discord
 # 커뮤니티 명령어 그룹
 # =========================
 community_group = app_commands.Group(name="커뮤니티", description="커뮤니티 활동 명령어입니다.")
-bot.tree.add_command(community_group)
+try:
+    bot.tree.add_command(community_group)
+except app_commands.CommandAlreadyRegistered:
+    pass
 
 @community_group.command(name="투표", description="이모지 반응을 이용한 투표를 생성합니다.")
 @app_commands.describe(주제="투표 주제", 항목들="쉼표로 구분된 투표 항목들 (최대 10개)")
@@ -72233,7 +73052,7 @@ async def server_nickname(interaction: discord.Interaction, 유저: discord.Memb
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 별명 변경 중 오류가 발생했습니다: {e}", ephemeral=True)
 
-@server_setup_group.command(name="역할관리", description="유저에게 역할을 부여하거나 제거합니다.")
+@server_role_manage_group.command(name="역할관리", description="유저에게 역할을 부여하거나 제거합니다.")
 @app_commands.describe(유저="대상 유저", 역할="부여/제거할 역할", 작업="수행할 작업")
 @app_commands.choices(작업=[
     app_commands.Choice(name="부여", value="add"),
@@ -72457,7 +73276,7 @@ async def server_reset_all_nicks(interaction: discord.Interaction):
             except: continue
     await safe_interaction_send(interaction, f"✅ 총 {count}명의 별명을 초기화했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="역할생성", description="새로운 역할을 생성합니다.")
+@server_role_manage_group.command(name="역할생성", description="새로운 역할을 생성합니다.")
 @app_commands.describe(이름="역할 이름", 색상="색상 코드 (예: #FF0000)")
 @app_commands.default_permissions(manage_roles=True)
 async def server_create_role(interaction: discord.Interaction, 이름: str, 색상: str = "#9ADCFB"):
@@ -72468,7 +73287,7 @@ async def server_create_role(interaction: discord.Interaction, 이름: str, 색�
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 생성 실패: {e}", ephemeral=True)
 
-@server_setup_group.command(name="역할삭제", description="역할을 삭제합니다.")
+@server_role_manage_group.command(name="역할삭제", description="역할을 삭제합니다.")
 @app_commands.describe(역할="삭제할 역할")
 @app_commands.default_permissions(manage_roles=True)
 async def server_delete_role(interaction: discord.Interaction, 역할: discord.Role):
@@ -72478,7 +73297,7 @@ async def server_delete_role(interaction: discord.Interaction, 역할: discord.R
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 삭제 실패: {e}", ephemeral=True)
 
-@server_setup_group.command(name="역할색상변경", description="역할의 색상을 변경합니다.")
+@server_role_manage_group.command(name="역할색상변경", description="역할의 색상을 변경합니다.")
 @app_commands.describe(역할="대상 역할", 색상="새로운 색상 코드")
 @app_commands.default_permissions(manage_roles=True)
 async def server_role_color(interaction: discord.Interaction, 역할: discord.Role, 색상: str):
@@ -72489,7 +73308,7 @@ async def server_role_color(interaction: discord.Interaction, 역할: discord.Ro
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 변경 실패: {e}", ephemeral=True)
 
-@server_setup_group.command(name="역할순서변경", description="역할의 순서(위치)를 변경합니다.")
+@server_role_manage_group.command(name="역할순서변경", description="역할의 순서(위치)를 변경합니다.")
 @app_commands.describe(역할="대상 역할", 위치="새로운 위치 (숫자가 높을수록 상단)")
 @app_commands.default_permissions(manage_roles=True)
 async def server_role_position(interaction: discord.Interaction, 역할: discord.Role, 위치: int):
@@ -72499,7 +73318,7 @@ async def server_role_position(interaction: discord.Interaction, 역할: discord
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 변경 실패: {e}", ephemeral=True)
 
-@server_setup_group.command(name="전체뮤트", description="서버의 모든 음성 채널 유저를 뮤트합니다.")
+@server_voice_manage_group.command(name="전체뮤트", description="서버의 모든 음성 채널 유저를 뮤트합니다.")
 @app_commands.default_permissions(mute_members=True)
 async def server_mute_all(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -72512,7 +73331,7 @@ async def server_mute_all(interaction: discord.Interaction):
             except: continue
     await safe_interaction_send(interaction, f"✅ 총 {count}명의 음성을 뮤트했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="전체뮤트해제", description="서버의 모든 음성 채널 유저 뮤트를 해제합니다.")
+@server_voice_manage_group.command(name="전체뮤트해제", description="서버의 모든 음성 채널 유저 뮤트를 해제합니다.")
 @app_commands.default_permissions(mute_members=True)
 async def server_unmute_all(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -72525,7 +73344,7 @@ async def server_unmute_all(interaction: discord.Interaction):
             except: continue
     await safe_interaction_send(interaction, f"✅ 총 {count}명의 음성 뮤트를 해제했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="전체이동", description="현재 내가 있는 음성 채널로 서버의 모든 음성 유저를 이동시킵니다.")
+@server_voice_manage_group.command(name="전체이동", description="현재 내가 있는 음성 채널로 서버의 모든 음성 유저를 이동시킵니다.")
 @app_commands.default_permissions(move_members=True)
 async def server_move_all(interaction: discord.Interaction):
     if not interaction.user.voice: return await safe_interaction_send(interaction, "❌ 음성 채널에 먼저 입장해주세요.", ephemeral=True)
@@ -72733,17 +73552,52 @@ async def channel_move_messages(interaction: discord.Interaction, 개수: int, �
             await 채널.send(embed=embed)
     await safe_interaction_send(interaction, f"✅ {len(messages)}개의 메시지를 {채널.mention} 채널로 복사했습니다.", ephemeral=True)
 
-@channel_tools_group.command(name="음성채널생성", description="새로운 음성 채널을 생성합니다.")
-@app_commands.describe(이름="채널 이름", 인원제한="최대 인원 (0은 무제한)")
+@voice_channel_tools_group.command(
+    name="생성",
+    description="새로운 음성 채널을 생성합니다."
+)
+@app_commands.describe(
+    이름="채널 이름",
+    인원제한="최대 인원 (0은 무제한)"
+)
 @app_commands.default_permissions(manage_channels=True)
-async def channel_create_voice(interaction: discord.Interaction, 이름: str, 인원제한: int = 0):
+async def channel_create_voice(
+    interaction: discord.Interaction,
+    이름: str,
+    인원제한: int = 0
+):
     try:
-        channel = await interaction.guild.create_voice_channel(name=이름, user_limit=인원제한)
-        await safe_interaction_send(interaction, f"✅ 음성 채널 {channel.mention}을 생성했습니다.", ephemeral=True)
-    except Exception as e:
-        await safe_interaction_send(interaction, f"❌ 생성 실패: {e}", ephemeral=True)
+        if 인원제한 < 0 or 인원제한 > 99:
+            return await safe_interaction_send(
+                interaction,
+                "❌ 인원 제한은 0~99명 사이로 설정해주세요.",
+                ephemeral=True
+            )
 
-@channel_tools_group.command(name="NSFW설정", description="채널의 NSFW(연령 제한) 설정을 변경합니다.")
+        channel = await interaction.guild.create_voice_channel(
+            name=이름,
+            user_limit=인원제한
+        )
+
+        await safe_interaction_send(
+            interaction,
+            f"✅ 음성 채널 {channel.mention}을 생성했습니다.",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await safe_interaction_send(
+            interaction,
+            "❌ 음성 채널을 생성할 권한이 없습니다.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        await safe_interaction_send(
+            interaction,
+            f"❌ 생성 실패: {e}",
+            ephemeral=True
+        )@channel_tools_group.command(name="nsfw설정", description="채널의 nsfw(연령 제한) 설정을 변경합니다.")
 @app_commands.describe(설정="켜기/끄기")
 @app_commands.choices(설정=[
     app_commands.Choice(name="켜기", value=1),
@@ -72755,7 +73609,7 @@ async def channel_nsfw(interaction: discord.Interaction, 설정: int):
     try:
         await interaction.channel.edit(nsfw=bool(설정))
         status = "켜짐" if 설정 else "꺼짐"
-        await safe_interaction_send(interaction, f"✅ 채널의 NSFW 설정을 **{status}**(으)로 변경했습니다.", ephemeral=True)
+        await safe_interaction_send(interaction, f"✅ 채널의 nsfw 설정을 **{status}**(으)로 변경했습니다.", ephemeral=True)
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 설정 실패: {e}", ephemeral=True)
 
