@@ -72203,9 +72203,13 @@ async def start_all_discord_clients():
 # =========================
 server_setup_group = app_commands.Group(name="서버설정", description="서버 유저 및 권한 관리 명령어입니다.")
 bot.tree.add_command(server_setup_group)
+server_setup_misc_group = app_commands.Group(name="기타", description="서버설정의 추가 관리 명령어입니다.")
+server_setup_group.add_command(server_setup_misc_group)
 
 channel_tools_group = app_commands.Group(name="채널도구", description="채널 상태 및 공지 관리 명령어입니다.")
 bot.tree.add_command(channel_tools_group)
+channel_tools_misc_group = app_commands.Group(name="기타", description="채널도구의 추가 관리 명령어입니다.")
+channel_tools_group.add_command(channel_tools_misc_group)
 
 @channel_tools_group.command(name="청소", description="현재 채널의 메시지를 지정된 개수만큼 삭제합니다.")
 @app_commands.describe(개수="삭제할 메시지 개수 (1-100)")
@@ -72284,39 +72288,10 @@ async def admin_check_warnings(interaction: discord.Interaction, 유저: discord
 
 
 # =========================
-# 커뮤니티 명령어 그룹
+# 커뮤니티 추가 명령어
 # =========================
-community_group = app_commands.Group(name="커뮤니티", description="커뮤니티 활동 명령어입니다.")
-bot.tree.add_command(community_group)
-
-@community_group.command(name="투표", description="이모지 반응을 이용한 투표를 생성합니다.")
-@app_commands.describe(주제="투표 주제", 항목들="쉼표로 구분된 투표 항목들 (최대 10개)")
-async def community_poll(interaction: discord.Interaction, 주제: str, 항목들: str):
-    if interaction.guild is None:
-        return await safe_interaction_send(interaction, "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
-
-    options = [item.strip() for item in 항목들.split(',') if item.strip()]
-    if not (2 <= len(options) <= 10):
-        return await safe_interaction_send(interaction, "❌ 투표 항목은 최소 2개, 최대 10개까지 가능합니다.", ephemeral=True)
-
-    emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
-    description = f"**{주제}**\n\n"
-    for i, option in enumerate(options):
-        description += f"{emojis[i]} {option}\n"
-
-    embed = discord.Embed(
-        title="📊 새로운 투표가 시작되었습니다!",
-        description=description,
-        color=COLOR_SKY
-    )
-    embed.set_footer(text=f"투표 생성자: {interaction.user.display_name}")
-
-    await interaction.response.send_message(embed=embed)
-    message = await interaction.original_response()
-
-    for i in range(len(options)):
-        await message.add_reaction(emojis[i])
-
+# `community_group`은 앞에서 이미 생성/등록되어 있으므로 여기서 다시 만들거나
+# bot.tree.add_command()로 재등록하지 않습니다.
 
 @community_group.command(name="프로필", description="자신의 서버 내 정보를 보여줍니다.")
 async def community_profile(interaction: discord.Interaction, 유저: discord.Member = None):
@@ -72765,7 +72740,7 @@ async def server_mute_all(interaction: discord.Interaction):
             except: continue
     await safe_interaction_send(interaction, f"✅ 총 {count}명의 음성을 뮤트했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="전체뮤트해제", description="서버의 모든 음성 채널 유저 뮤트를 해제합니다.")
+@server_setup_misc_group.command(name="전체뮤트해제", description="서버의 모든 음성 채널 유저 뮤트를 해제합니다.")
 @app_commands.default_permissions(mute_members=True)
 async def server_unmute_all(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -72778,7 +72753,7 @@ async def server_unmute_all(interaction: discord.Interaction):
             except: continue
     await safe_interaction_send(interaction, f"✅ 총 {count}명의 음성 뮤트를 해제했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="전체이동", description="현재 내가 있는 음성 채널로 서버의 모든 음성 유저를 이동시킵니다.")
+@server_setup_misc_group.command(name="전체이동", description="현재 내가 있는 음성 채널로 서버의 모든 음성 유저를 이동시킵니다.")
 @app_commands.default_permissions(move_members=True)
 async def server_move_all(interaction: discord.Interaction):
     if not interaction.user.voice: return await safe_interaction_send(interaction, "❌ 음성 채널에 먼저 입장해주세요.", ephemeral=True)
@@ -72794,7 +72769,7 @@ async def server_move_all(interaction: discord.Interaction):
             except: continue
     await safe_interaction_send(interaction, f"✅ 총 {count}명을 {target_vc.name} 채널로 이동시켰습니다.", ephemeral=True)
 
-@server_setup_group.command(name="초대링크전체삭제", description="서버의 모든 초대 링크를 삭제합니다.")
+@server_setup_misc_group.command(name="초대링크전체삭제", description="서버의 모든 초대 링크를 삭제합니다.")
 @app_commands.default_permissions(manage_guild=True)
 async def server_delete_all_invites(interaction: discord.Interaction):
     invites = await interaction.guild.invites()
@@ -72803,7 +72778,7 @@ async def server_delete_all_invites(interaction: discord.Interaction):
         except: continue
     await safe_interaction_send(interaction, f"✅ 총 {len(invites)}개의 초대 링크를 삭제했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="서버백업", description="현재 서버의 채널 및 역할 구조를 텍스트로 백업합니다.")
+@server_setup_misc_group.command(name="서버백업", description="현재 서버의 채널 및 역할 구조를 텍스트로 백업합니다.")
 @app_commands.default_permissions(manage_guild=True)
 async def server_backup_structure(interaction: discord.Interaction):
     data = f"--- {interaction.guild.name} 구조 백업 ---\n\n[역할]\n"
@@ -72819,7 +72794,7 @@ async def server_backup_structure(interaction: discord.Interaction):
     file = discord.File(io.BytesIO(data.encode()), filename=f"backup_{interaction.guild.id}.txt")
     await safe_interaction_send(interaction, "✅ 서버 구조 백업 파일입니다.", file=file, ephemeral=True)
 
-@server_setup_group.command(name="유저추방일괄", description="특정 역할을 가진 유저들을 일괄 추방합니다.")
+@server_setup_misc_group.command(name="유저추방일괄", description="특정 역할을 가진 유저들을 일괄 추방합니다.")
 @app_commands.describe(역할="추방할 유저들의 역할", 사유="추방 사유")
 @app_commands.default_permissions(administrator=True)
 async def server_mass_kick(interaction: discord.Interaction, 역할: discord.Role, 사유: str = "일괄 추방"):
@@ -72832,7 +72807,7 @@ async def server_mass_kick(interaction: discord.Interaction, 역할: discord.Rol
         except: continue
     await safe_interaction_send(interaction, f"✅ **{역할.name}** 역할을 가진 {count}명의 유저를 추방했습니다.", ephemeral=True)
 
-@server_setup_group.command(name="활동로그", description="서버의 최근 감사 로그(Audit Log)를 확인합니다.")
+@server_setup_misc_group.command(name="활동로그", description="서버의 최근 감사 로그(Audit Log)를 확인합니다.")
 @app_commands.describe(개수="확인할 로그 개수 (최대 20)")
 @app_commands.default_permissions(view_audit_log=True)
 async def server_audit_logs(interaction: discord.Interaction, 개수: app_commands.Range[int, 1, 20] = 5):
@@ -72842,7 +72817,7 @@ async def server_audit_logs(interaction: discord.Interaction, 개수: app_comman
     embed = discord.Embed(title="📜 최근 감사 로그", description="\n".join(logs), color=COLOR_SKY)
     await safe_interaction_send(interaction, embed=embed, ephemeral=True)
 
-@server_setup_group.command(name="슬래시동기화", description="서버의 슬래시 명령어를 즉시 동기화합니다.")
+@server_setup_misc_group.command(name="슬래시동기화", description="서버의 슬래시 명령어를 즉시 동기화합니다.")
 @app_commands.default_permissions(administrator=True)
 async def server_sync_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -73082,7 +73057,7 @@ async def channel_clear_all(interaction: discord.Interaction):
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 삭제 실패: {e}", ephemeral=True)
 
-@channel_tools_group.command(name="채널웹후크생성", description="현재 채널에 새로운 웹후크를 생성합니다.")
+@channel_tools_misc_group.command(name="채널웹후크생성", description="현재 채널에 새로운 웹후크를 생성합니다.")
 @app_commands.describe(이름="웹후크 이름")
 @app_commands.default_permissions(manage_webhooks=True)
 async def channel_create_webhook(interaction: discord.Interaction, 이름: str):
@@ -73092,7 +73067,7 @@ async def channel_create_webhook(interaction: discord.Interaction, 이름: str):
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 생성 실패: {e}", ephemeral=True)
 
-@channel_tools_group.command(name="음성채널인원변경", description="음성 채널의 인원 제한을 변경합니다.")
+@channel_tools_misc_group.command(name="음성채널인원변경", description="음성 채널의 인원 제한을 변경합니다.")
 @app_commands.describe(인원="최대 인원 (0은 무제한)")
 @app_commands.default_permissions(manage_channels=True)
 async def channel_voice_limit(interaction: discord.Interaction, 인원: int):
