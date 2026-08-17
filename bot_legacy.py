@@ -30903,7 +30903,7 @@ async def tts_channel_setting_command(interaction: discord.Interaction, 채널: 
     await send_log(interaction.guild, f"🔊 TTS 채널 설정\n채널: {채널.mention}\n관리자: {interaction.user.mention}", "voice")
 
 
-@bot.command(name="TTS채널설정", aliases=["tts채널설정", "티티에스채널설정", "TTS설정", "티티에스설정"])
+@bot.command(name="tts채널설정", aliases=["tts채널설정", "티티에스채널설정", "TTS설정", "티티에스설정"])
 @commands.has_permissions(manage_guild=True)
 async def prefix_tts_channel_setting(ctx: commands.Context, channel: discord.TextChannel = None):
     """!TTS채널설정 [#채널] 로 TTS 채팅 채널을 바로 지정합니다."""
@@ -72971,7 +72971,7 @@ async def channel_create_voice(interaction: discord.Interaction, 이름: str, �
     except Exception as e:
         await safe_interaction_send(interaction, f"❌ 생성 실패: {e}", ephemeral=True)
 
-@channel_tools_group.command(name="NSFW설정", description="채널의 NSFW(연령 제한) 설정을 변경합니다.")
+@channel_tools_group.command(name="nsfw설정", description="채널의 NSFW(연령 제한) 설정을 변경합니다.")
 @app_commands.describe(설정="켜기/끄기")
 @app_commands.choices(설정=[
     app_commands.Choice(name="켜기", value=1),
